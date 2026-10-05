@@ -118,6 +118,7 @@ fn main() -> ExitCode {
     };
     match run(command) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.is::<net::Interrupted>() => ExitCode::from(130),
         Err(e) => {
             eprintln!("minipaw: {e}");
             ExitCode::FAILURE

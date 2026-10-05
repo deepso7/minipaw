@@ -1,6 +1,8 @@
 //! Endpoint setup and teardown shared by both modes.
 
 use std::error::Error;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use minip2p::{
@@ -9,7 +11,7 @@ use minip2p::{
 };
 
 use crate::pipe::Link;
-use crate::wire::PROTOCOL;
+use crate::wire::{Frame, PROTOCOL};
 
 const AGENT: &str = concat!("minipaw/", env!("CARGO_PKG_VERSION"));
 
@@ -22,6 +24,9 @@ pub const DEFAULT_RELAY: &str =
 pub const RESUME_TIMEOUT: Duration = Duration::from_secs(60);
 /// After finishing, how long we wait for the peer to finish too.
 pub const LINGER: Duration = Duration::from_secs(2);
+/// After Ctrl-C mid-migration, how long we wait for the session's stream to
+/// come back so the peer can be told, rather than left waiting to resume.
+pub const ABORT_GRACE: Duration = Duration::from_secs(3);
 
 pub fn default_relay() -> Option<PeerAddr> {
     DEFAULT_RELAY.parse().ok()
@@ -158,4 +163,57 @@ pub fn linger_and_close(mut endpoint: Endpoint, link: Option<Link>) {
     if let Err(e) = endpoint.close() {
         crate::debug!("close endpoint: {e}");
     }
+}
+
+/// How a session loop ended without an error.
+pub enum Exit {
+    /// Both directions finished and were acknowledged.
+    Done,
+    /// Everything arrived and our `Fin` went out, but the stream is gone;
+    /// nothing is left to linger on.
+    PeerGone,
+    /// Ctrl-C: tell the peer, then stop.
+    Interrupted,
+}
+
+/// The error `main` turns into exit status 130, silently.
+#[derive(Debug)]
+pub struct Interrupted;
+
+impl fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("interrupted")
+    }
+}
+
+impl Error for Interrupted {}
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// Routes Ctrl-C to the event loop: the first sets [`interrupted`] and wakes
+/// `wait`; a second exits on the spot.
+pub fn handle_interrupt(wake: minip2p::WaitHandle) -> Result<(), Box<dyn Error>> {
+    ctrlc::set_handler(move || {
+        if INTERRUPTED.swap(true, Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+        wake.interrupt();
+    })
+    .map_err(|e| format!("installing the Ctrl-C handler: {e}"))?;
+    Ok(())
+}
+
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
+
+/// Ends the session after a local action rather than a quiet disconnect,
+/// so the peer exits now instead of waiting out [`RESUME_TIMEOUT`].
+pub fn abort(mut endpoint: Endpoint, link: Option<Link>, reason: &str) {
+    if let Some(link) = &link
+        && let Err(e) = link.send(&mut endpoint, &Frame::Error(reason.into()))
+    {
+        crate::debug!("abort not sent: {e}");
+    }
+    linger_and_close(endpoint, link);
 }

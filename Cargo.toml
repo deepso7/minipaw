@@ -5,5 +5,6 @@ edition = "2024"
 
 [dependencies]
 base64 = "0.23"
+ctrlc = "3"
 getrandom = "0.4"
 minip2p-rs = { version = "0.7.2", features = ["nat"] }

@@ -175,7 +175,7 @@ impl Pipe {
                     self.out.close();
                 }
             }
-            Frame::Error(message) => return Err(format!("peer error: {message}")),
+            Frame::Error(message) => return Err(format!("peer ended the session: {message}")),
             Frame::Hello { .. } | Frame::Welcome { .. } => {
                 return Err("unexpected handshake frame mid-session".into());
             }
@@ -286,8 +286,8 @@ impl Pipe {
         self.peer_finished() && self.out.fin_sent_ever
     }
 
-    /// Flushes stdout and stops the writer.
-    pub fn finish(mut self) {
+    /// Flushes stdout and stops the writer. Idempotent.
+    pub fn finish(&mut self) {
         self.stdout = None;
         if let Some(writer) = self.writer.take()
             && writer.join().is_err()

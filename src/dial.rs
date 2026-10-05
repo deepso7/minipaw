@@ -10,7 +10,7 @@ use minip2p::{
     NatEvent, PeerId, StreamId,
 };
 
-use crate::net::{self, RESUME_TIMEOUT};
+use crate::net::{self, ABORT_GRACE, Exit, RESUME_TIMEOUT};
 use crate::pipe::{Link, Pipe};
 use crate::ticket::Ticket;
 use crate::wire::{Frame, PROTOCOL, SessionId};
@@ -42,12 +42,15 @@ struct Client {
     backoff: Duration,
     /// Since when we have had no working stream (`None` while up).
     lost_since: Option<Instant>,
-    /// Whether a stream was ever up, for error wording.
+    /// Whether a stream was ever up: the server then holds our session.
     was_up: bool,
+    /// Set by Ctrl-C between streams: give up waiting for one by then.
+    abort_by: Option<Instant>,
 }
 
 pub fn run(ticket: Ticket, relay: minip2p::PeerAddr) -> Result<(), Box<dyn Error>> {
     let endpoint = net::bind(&relay, false)?;
+    net::handle_interrupt(endpoint.wait_handle())?;
     let pipe = Pipe::new(&endpoint.wait_handle());
     let now = Instant::now();
     let mut client = Client {
@@ -59,52 +62,80 @@ pub fn run(ticket: Ticket, relay: minip2p::PeerAddr) -> Result<(), Box<dyn Error
         backoff: Duration::ZERO,
         lost_since: Some(now),
         was_up: false,
+        abort_by: None,
     };
 
-    loop {
-        client.on_timers()?;
-        let deadline = [client.pipe.deadline(), client.phase_deadline()]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(1))
-            // A past deadline makes `wait` return without polling anything.
-            .max(Instant::now() + Duration::from_millis(1));
-        if let EndpointWaitOutcome::Event(event) = client.endpoint.wait(deadline)? {
-            client.on_event(event)?;
-        }
-
-        let link = match &client.phase {
-            Phase::Up { link } => Some(link),
-            _ => None,
-        };
-        if let Err(e) = client.pipe.pump(&mut client.endpoint, link) {
-            client.lose(&format!("send failed: {e}"));
-        }
-        if client.pipe.done() {
-            let Client {
-                endpoint,
-                pipe,
-                phase,
-                ..
-            } = client;
-            pipe.finish();
-            let link = match phase {
-                Phase::Up { link } => Some(link),
-                _ => None,
-            };
-            net::linger_and_close(endpoint, link);
-            return Ok(());
-        }
-        if client.lost_since.is_some() && client.pipe.nearly_done() {
-            // The server saw our Fin and sent all of its data; it is gone.
-            client.pipe.finish();
-            return Ok(());
+    let exit = client.drive();
+    // Whatever arrived reaches stdout, however the session ended.
+    client.pipe.finish();
+    let link = client.take_link();
+    match exit? {
+        Exit::Done => net::linger_and_close(client.endpoint, link),
+        Exit::PeerGone => {}
+        Exit::Interrupted => {
+            net::abort(client.endpoint, link, "interrupted");
+            return Err(net::Interrupted.into());
         }
     }
+    Ok(())
 }
 
 impl Client {
+    fn drive(&mut self) -> Result<Exit, Box<dyn Error>> {
+        loop {
+            self.on_timers()?;
+            let deadline = [self.pipe.deadline(), self.phase_deadline(), self.abort_by]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(1))
+                // A past deadline makes `wait` return without polling anything.
+                .max(Instant::now() + Duration::from_millis(1));
+            if let EndpointWaitOutcome::Event(event) = self.endpoint.wait(deadline)? {
+                self.on_event(event)?;
+            }
+            if net::interrupted() && self.ready_to_abort() {
+                return Ok(Exit::Interrupted);
+            }
+
+            let link = match &self.phase {
+                Phase::Up { link } => Some(link),
+                _ => None,
+            };
+            if let Err(e) = self.pipe.pump(&mut self.endpoint, link) {
+                self.lose(&format!("send failed: {e}"));
+            }
+            if self.pipe.done() {
+                return Ok(Exit::Done);
+            }
+            if self.lost_since.is_some() && self.pipe.nearly_done() {
+                // The server saw our Fin and sent all of its data; it is gone.
+                return Ok(Exit::PeerGone);
+            }
+        }
+    }
+
+    /// Whether Ctrl-C can end the session now: a stream is up to carry the
+    /// news, or the server holds no session of ours, or the grace ran out.
+    fn ready_to_abort(&mut self) -> bool {
+        if matches!(self.phase, Phase::Up { .. }) || !self.was_up {
+            return true;
+        }
+        let by = *self.abort_by.get_or_insert_with(|| {
+            crate::debug!("interrupted between streams; waiting briefly to tell the server");
+            Instant::now() + ABORT_GRACE
+        });
+        Instant::now() >= by
+    }
+
+    /// The current stream, whether or not its handshake finished.
+    fn take_link(&mut self) -> Option<Link> {
+        match std::mem::replace(&mut self.phase, Phase::Idle { at: Instant::now() }) {
+            Phase::Handshaking { link, .. } | Phase::Up { link } => Some(link),
+            _ => None,
+        }
+    }
+
     fn peer(&self) -> &PeerId {
         &self.ticket.peer
     }
@@ -293,7 +324,7 @@ impl Client {
                     self.backoff = Duration::ZERO;
                     self.was_up = true;
                 }
-                (Frame::Error(message), _) => {
+                (Frame::Error(message), Phase::Handshaking { .. }) => {
                     return Err(format!("server refused: {message}").into());
                 }
                 (frame, Phase::Up { .. }) => self.pipe.on_frame(frame)?,

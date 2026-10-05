@@ -12,7 +12,7 @@ use minip2p::{
     StreamId,
 };
 
-use crate::net::{self, LINGER, RESUME_TIMEOUT};
+use crate::net::{self, ABORT_GRACE, Exit, LINGER, RESUME_TIMEOUT};
 use crate::pipe::{Link, Pipe};
 use crate::ticket::Ticket;
 use crate::wire::{Frame, FrameReader, PROTOCOL, SessionId, Token};
@@ -34,6 +34,9 @@ struct Server {
     pending: HashMap<StreamKey, FrameReader>,
     /// Since when an admitted client has had no stream.
     lost_since: Option<Instant>,
+    /// Set by Ctrl-C while the client is between streams: give up waiting
+    /// for it to resume by then.
+    abort_by: Option<Instant>,
 }
 
 pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
@@ -45,6 +48,7 @@ pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
         token,
         relay: embed.then(|| relay.clone()),
     };
+    net::handle_interrupt(endpoint.wait_handle())?;
     let pipe = Pipe::new(&endpoint.wait_handle());
     let mut server = Server {
         endpoint,
@@ -54,69 +58,81 @@ pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
         link: None,
         pending: HashMap::new(),
         lost_since: None,
+        abort_by: None,
     };
 
     eprintln!("# reserving a slot on relay {}…", relay.peer_id());
-    let started = Instant::now();
-    let mut announced = false;
-    let mut warned = false;
-    loop {
-        let deadline = [
-            server.pipe.deadline(),
-            (!announced && !warned).then(|| started + RESERVE_WARNING),
-            server.lost_since.map(|t| t + LINGER),
-        ]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or_else(|| Instant::now() + Duration::from_secs(1))
-        // A past deadline makes `wait` return without polling anything.
-        .max(Instant::now() + Duration::from_millis(1));
-
-        if let EndpointWaitOutcome::Event(event) = server.endpoint.wait(deadline)? {
-            if let EndpointEvent::Nat(NatEvent::RelayReserved { .. }) = &event
-                && !announced
-            {
-                announced = true;
-                eprintln!("# 🐾 listening; connect with:\nminipaw {ticket}");
-            }
-            if let EndpointEvent::Nat(NatEvent::RelayReservationLost { .. }) = &event {
-                eprintln!("# lost the relay reservation; reacquiring");
-            }
-            server.on_event(event)?;
-        }
-        if !announced && !warned && started.elapsed() >= RESERVE_WARNING {
-            warned = true;
-            eprintln!("# still no relay reservation; is the relay reachable over UDP?");
-        }
-
-        if let Err(e) = server.pipe.pump(&mut server.endpoint, server.link.as_ref()) {
-            server.lose(&format!("send failed: {e}"));
-        }
-        if server.pipe.done() {
-            let Server {
-                endpoint,
-                pipe,
-                link,
-                ..
-            } = server;
-            pipe.finish();
-            net::linger_and_close(endpoint, link);
-            return Ok(());
-        }
-        if let Some(since) = server.lost_since {
-            if server.pipe.nearly_done() && since.elapsed() >= LINGER {
-                server.pipe.finish();
-                return Ok(());
-            }
-            if since.elapsed() >= RESUME_TIMEOUT {
-                return Err("client disconnected and did not come back".into());
-            }
+    let exit = server.drive(&ticket);
+    // Whatever arrived reaches stdout, however the session ended.
+    server.pipe.finish();
+    let link = server.link.take();
+    match exit? {
+        Exit::Done => net::linger_and_close(server.endpoint, link),
+        Exit::PeerGone => {}
+        Exit::Interrupted => {
+            net::abort(server.endpoint, link, "interrupted");
+            return Err(net::Interrupted.into());
         }
     }
+    Ok(())
 }
 
 impl Server {
+    fn drive(&mut self, ticket: &Ticket) -> Result<Exit, Box<dyn Error>> {
+        let started = Instant::now();
+        let mut announced = false;
+        let mut warned = false;
+        loop {
+            let deadline = [
+                self.pipe.deadline(),
+                (!announced && !warned).then(|| started + RESERVE_WARNING),
+                self.lost_since.map(|t| t + LINGER),
+                self.abort_by,
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(1))
+            // A past deadline makes `wait` return without polling anything.
+            .max(Instant::now() + Duration::from_millis(1));
+
+            if let EndpointWaitOutcome::Event(event) = self.endpoint.wait(deadline)? {
+                if let EndpointEvent::Nat(NatEvent::RelayReserved { .. }) = &event
+                    && !announced
+                {
+                    announced = true;
+                    eprintln!("# 🐾 listening; connect with:\nminipaw {ticket}");
+                }
+                if let EndpointEvent::Nat(NatEvent::RelayReservationLost { .. }) = &event {
+                    eprintln!("# lost the relay reservation; reacquiring");
+                }
+                self.on_event(event)?;
+            }
+            if net::interrupted() && self.ready_to_abort() {
+                return Ok(Exit::Interrupted);
+            }
+            if !announced && !warned && started.elapsed() >= RESERVE_WARNING {
+                warned = true;
+                eprintln!("# still no relay reservation; is the relay reachable over UDP?");
+            }
+
+            if let Err(e) = self.pipe.pump(&mut self.endpoint, self.link.as_ref()) {
+                self.lose(&format!("send failed: {e}"));
+            }
+            if self.pipe.done() {
+                return Ok(Exit::Done);
+            }
+            if let Some(since) = self.lost_since {
+                if self.pipe.nearly_done() && since.elapsed() >= LINGER {
+                    return Ok(Exit::PeerGone);
+                }
+                if since.elapsed() >= RESUME_TIMEOUT {
+                    return Err("client disconnected and did not come back".into());
+                }
+            }
+        }
+    }
+
     fn on_event(&mut self, event: EndpointEvent) -> Result<(), Box<dyn Error>> {
         net::log_event(&event);
         match event {
@@ -245,6 +261,19 @@ impl Server {
         }
         self.link = Some(link);
         self.lost_since = None;
+    }
+
+    /// Whether Ctrl-C can end the session now: the client's stream is up to
+    /// carry the news, or there is no client, or the grace ran out.
+    fn ready_to_abort(&mut self) -> bool {
+        if self.link.is_some() || self.client.is_none() {
+            return true;
+        }
+        let by = *self.abort_by.get_or_insert_with(|| {
+            crate::debug!("interrupted between streams; waiting briefly to tell the client");
+            Instant::now() + ABORT_GRACE
+        });
+        Instant::now() >= by
     }
 
     fn refuse(&mut self, key: StreamKey, reason: &str) {
