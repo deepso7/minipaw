@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use minip2p::{
     ConnectId, ConnectOutcome, ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome,
-    NatEvent, PeerId, StreamId,
+    Multiaddr, NatEvent, PeerAddr, PeerId, StreamId,
 };
 
 use crate::net::{self, ABORT_GRACE, Exit, RESUME_TIMEOUT};
@@ -46,12 +46,27 @@ struct Client {
     was_up: bool,
     /// Set by Ctrl-C between streams: give up waiting for one by then.
     abort_by: Option<Instant>,
+    /// Test hook (`MINIPAW_DIRECT`): a server address to dial alongside the
+    /// relay, for benchmarks and paths hole punching cannot find.
+    direct: Option<PeerAddr>,
 }
 
-pub fn run(ticket: Ticket, relay: minip2p::PeerAddr) -> Result<(), Box<dyn Error>> {
+pub fn run(ticket: Ticket, relay: PeerAddr) -> Result<(), Box<dyn Error>> {
     let endpoint = net::bind(&relay, false)?;
     net::handle_interrupt(endpoint.wait_handle())?;
     let pipe = Pipe::new(&endpoint.wait_handle());
+    let direct = match std::env::var("MINIPAW_DIRECT") {
+        Ok(raw) => {
+            let addr: Multiaddr = raw
+                .parse()
+                .map_err(|e| format!("invalid MINIPAW_DIRECT '{raw}': {e}"))?;
+            Some(
+                PeerAddr::new(addr, ticket.peer.clone())
+                    .map_err(|e| format!("invalid MINIPAW_DIRECT '{raw}': {e}"))?,
+            )
+        }
+        Err(_) => None,
+    };
     let now = Instant::now();
     let mut client = Client {
         endpoint,
@@ -63,6 +78,7 @@ pub fn run(ticket: Ticket, relay: minip2p::PeerAddr) -> Result<(), Box<dyn Error
         lost_since: Some(now),
         was_up: false,
         abort_by: None,
+        direct,
     };
 
     let exit = client.drive();
@@ -178,8 +194,11 @@ impl Client {
         if self.endpoint.connection_id(self.peer()).is_some() {
             return self.open();
         }
-        let peer = self.peer().clone();
-        match self.endpoint.connect(peer) {
+        let attempt = match &self.direct {
+            Some(addr) => self.endpoint.connect(addr.clone()),
+            None => self.endpoint.connect(self.ticket.peer.clone()),
+        };
+        match attempt {
             Ok(id) => {
                 crate::debug!("connecting to {}", self.peer());
                 self.phase = Phase::Connecting { id };

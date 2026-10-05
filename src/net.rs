@@ -61,6 +61,8 @@ pub fn bind(relay: &PeerAddr, reserve: bool) -> Result<Endpoint, Box<dyn Error>>
         } else {
             ReservationPolicy::Never
         },
+        // Test hook: relay only, no direct dials or hole punching.
+        force_relay: std::env::var_os("MINIPAW_FORCE_RELAY").is_some(),
         ..NatConfig::default()
     };
     let mut endpoint = Endpoint::builder()
