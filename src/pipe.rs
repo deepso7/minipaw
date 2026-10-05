@@ -188,6 +188,11 @@ impl Pipe {
     pub fn pump(&mut self, endpoint: &mut Endpoint, link: Option<&Link>) -> Result<(), String> {
         self.pull_stdin();
         let Some(link) = link else {
+            // Send timers only matter with a link; a stale one would hand
+            // `Endpoint::wait` a past deadline, which returns at once
+            // without driving the endpoint.
+            self.ack_due = None;
+            self.blocked_until = None;
             return Ok(());
         };
         let now = Instant::now();

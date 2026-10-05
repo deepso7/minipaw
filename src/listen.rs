@@ -69,7 +69,9 @@ pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
         .into_iter()
         .flatten()
         .min()
-        .unwrap_or_else(|| Instant::now() + Duration::from_secs(1));
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(1))
+        // A past deadline makes `wait` return without polling anything.
+        .max(Instant::now() + Duration::from_millis(1));
 
         if let EndpointWaitOutcome::Event(event) = server.endpoint.wait(deadline)? {
             if let EndpointEvent::Nat(NatEvent::RelayReserved { .. }) = &event
