@@ -44,6 +44,8 @@ struct Client {
     lost_since: Option<Instant>,
     /// Whether a stream was ever up: the server then holds our session.
     was_up: bool,
+    /// The user has been told the session runs on a direct path.
+    told_direct: bool,
     /// Set by Ctrl-C between streams: give up waiting for one by then.
     abort_by: Option<Instant>,
     /// Test hook (`MINIPAW_DIRECT`): a server address to dial alongside the
@@ -77,6 +79,7 @@ pub fn run(ticket: Ticket, relay: PeerAddr) -> Result<(), Box<dyn Error>> {
         backoff: Duration::ZERO,
         lost_since: Some(now),
         was_up: false,
+        told_direct: false,
         abort_by: None,
         direct,
     };
@@ -292,6 +295,10 @@ impl Client {
                 ..
             } if self.carries(&peer_id, conn_id, None) => self.lose("connection closed"),
             EndpointEvent::Nat(NatEvent::PathUpgraded { peer, .. }) if peer == *self.peer() => {
+                if self.was_up && !self.told_direct {
+                    self.told_direct = true;
+                    eprintln!("# upgraded to a direct connection");
+                }
                 // The relayed circuit is closed under the upgrade; move the
                 // session onto the direct connection.
                 let current = self.endpoint.connection_id(&peer);
@@ -337,6 +344,10 @@ impl Client {
                     };
                     if self.was_up {
                         crate::debug!("session resumed");
+                    } else {
+                        let direct = net::is_direct(&self.endpoint, &self.ticket.peer);
+                        self.told_direct = direct;
+                        eprintln!("# connected ({})", net::path_label(direct));
                     }
                     self.phase = Phase::Up { link };
                     self.lost_since = None;

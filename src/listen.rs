@@ -34,6 +34,8 @@ struct Server {
     pending: HashMap<StreamKey, FrameReader>,
     /// Since when an admitted client has had no stream.
     lost_since: Option<Instant>,
+    /// The user has been told the client is on a direct path.
+    told_direct: bool,
     /// Set by Ctrl-C while the client is between streams: give up waiting
     /// for it to resume by then.
     abort_by: Option<Instant>,
@@ -58,6 +60,7 @@ pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
         link: None,
         pending: HashMap::new(),
         lost_since: None,
+        told_direct: false,
         abort_by: None,
     };
 
@@ -136,6 +139,13 @@ impl Server {
     fn on_event(&mut self, event: EndpointEvent) -> Result<(), Box<dyn Error>> {
         net::log_event(&event);
         match event {
+            EndpointEvent::Nat(NatEvent::InboundDirectUpgrade { peer })
+                if self.client.as_ref().is_some_and(|(client, _)| *client == peer)
+                    && !self.told_direct =>
+            {
+                self.told_direct = true;
+                eprintln!("# upgraded to a direct connection");
+            }
             EndpointEvent::StreamReady {
                 peer_id,
                 conn_id,
@@ -236,7 +246,9 @@ impl Server {
             }
             Some(_) => crate::debug!("client resumed at offset {recv}"),
             None => {
-                eprintln!("# connection from {peer}");
+                let direct = net::is_direct(&self.endpoint, peer);
+                self.told_direct = direct;
+                eprintln!("# connection from {peer} ({})", net::path_label(direct));
                 self.client = Some((peer.clone(), session));
             }
         }

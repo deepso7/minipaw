@@ -85,6 +85,15 @@ pub fn random16() -> Result<[u8; 16], Box<dyn Error>> {
     Ok(bytes)
 }
 
+/// Whether the endpoint's current connection to `peer` skips the relay.
+pub fn is_direct(endpoint: &Endpoint, peer: &minip2p::PeerId) -> bool {
+    !matches!(endpoint.path(peer), Some(Path::Relayed { .. }))
+}
+
+pub fn path_label(direct: bool) -> &'static str {
+    if direct { "direct" } else { "via relay" }
+}
+
 pub fn path_name(path: &Path) -> &'static str {
     match path {
         Path::DirectDialed => "direct",
