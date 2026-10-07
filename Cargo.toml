@@ -1,10 +1,22 @@
-[package]
-name = "minipaw"
+[workspace]
+resolver = "3"
+members = ["crates/minipaw-cli"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/deepso7/minipaw"
+authors = ["Deepso"]
 
-[dependencies]
+[workspace.dependencies]
 base64 = "0.23"
 ctrlc = "3"
 getrandom = "0.4"
 minip2p-rs = { version = "0.7.4", features = ["nat"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

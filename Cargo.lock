@@ -983,7 +983,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "minipaw"
+name = "minipaw-cli"
 version = "0.1.0"
 dependencies = [
  "base64",

@@ -20,7 +20,7 @@ RUNS=${3:-3}
 BIN=${BIN:-target/release/minipaw}
 REMOTE_BIN=${REMOTE_BIN:-minipaw}
 FORCE=${MINIPAW_FORCE_RELAY:-}
-[ -x "$BIN" ] || cargo build -q --release
+[ -x "$BIN" ] || cargo build -q --release -p minipaw-cli
 T=$(mktemp -d)
 trap 'ssh "$HOST" "pkill -f -- \"$REMOTE_BIN\" >/dev/null 2>&1" 2>/dev/null || true; rm -rf "$T"' EXIT
 
@@ -80,7 +80,7 @@ done
 mkdir -p bench
 [ -f bench/results.tsv ] ||
   printf 'date\tcommit\tmode\tmib\truns\tmedian_mib_s\tmin_mib_s\tmax_mib_s\tclient_cpu_s\tserver_cpu_s\thost\n' >bench/results.tsv
-commit=$(git rev-parse --short HEAD)$(git diff --quiet HEAD -- src Cargo.toml Cargo.lock || echo "+dirty")
+commit=$(git rev-parse --short HEAD)$(git diff --quiet HEAD -- crates Cargo.toml Cargo.lock || echo "+dirty")
 suffix=${FORCE:+-relayed}
 for dir in up down; do
   med=$(median <"$T/$dir")

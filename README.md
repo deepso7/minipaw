@@ -20,7 +20,7 @@ implementation in Rust.
 ## Install
 
 ```sh
-cargo install --git https://github.com/deepso7/minipaw
+cargo install --git https://github.com/deepso7/minipaw minipaw-cli
 ```
 
 ## Use
@@ -93,7 +93,7 @@ through, run it with
 ## Development
 
 ```sh
-cargo test                          # unit tests
+cargo test --workspace              # unit tests
 scripts/check.sh                    # end-to-end behaviour checks (~10s)
 scripts/bench.sh                    # loopback throughput, direct + relayed
 scripts/bench-remote.sh <ssh-host>  # real-network throughput

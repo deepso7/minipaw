@@ -29,7 +29,7 @@ BIN=${BIN:-target/release/minipaw}
 for mode in $MODES; do
   case "$mode" in direct | relayed) ;; *) echo "mode must be direct, relayed or both" >&2; exit 2 ;; esac
 done
-[ -x "$BIN" ] || cargo build -q --release
+[ -x "$BIN" ] || cargo build -q --release -p minipaw-cli
 
 T=$(mktemp -d)
 trap 'reap_all; stop_relay; rm -rf "$T"' EXIT
@@ -72,7 +72,7 @@ median() { sort -n | awk '{v[NR]=$1} END{print (NR%2 ? v[(NR+1)/2] : (v[NR/2]+v[
 mkdir -p bench
 [ -f bench/results.tsv ] ||
   printf 'date\tcommit\tmode\tmib\truns\tmedian_mib_s\tmin_mib_s\tmax_mib_s\tclient_cpu_s\tserver_cpu_s\thost\n' >bench/results.tsv
-commit=$(git rev-parse --short HEAD)$(git diff --quiet HEAD -- src Cargo.toml Cargo.lock || echo "+dirty")
+commit=$(git rev-parse --short HEAD)$(git diff --quiet HEAD -- crates Cargo.toml Cargo.lock || echo "+dirty")
 
 for mode in $MODES; do
   : >"$T/runs"
