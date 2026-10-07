@@ -84,6 +84,7 @@ pub fn run(launch: Launch) -> Result<Outcome, Error> {
             term::restore();
             handle.stop();
             let _ = join(session);
+            print_pending(&ui_rx);
             log::route_logs_to_stderr();
             return Err(Error::Other(format!("setting up the terminal: {e}")));
         }
