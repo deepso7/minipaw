@@ -31,10 +31,8 @@ reap_all() {
   return 0
 }
 
-# Starts the local relay unless RELAY is already set, and exports RELAY.
-# Pass extra relay flags to replace the no-limits defaults.
-ensure_relay() {
-  [ -n "${RELAY:-}" ] && return 0
+# Prints the path of a minip2p-relay binary; fails if there is none.
+relay_bin() {
   local bin=${MINIP2P_RELAY:-}
   if [ -z "$bin" ]; then
     bin=$(command -v minip2p-relay || true)
@@ -44,7 +42,15 @@ ensure_relay() {
     here=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
     bin=$here/minip2p/target/release/minip2p-relay
   fi
-  if [ ! -x "$bin" ]; then
+  [ -x "$bin" ] && echo "$bin"
+}
+
+# Starts the local relay unless RELAY is already set, and exports RELAY.
+# Pass extra relay flags to replace the no-limits defaults.
+ensure_relay() {
+  [ -n "${RELAY:-}" ] && return 0
+  local bin
+  if ! bin=$(relay_bin); then
     echo "no relay: set RELAY, or MINIP2P_RELAY to a minip2p-relay binary" >&2
     echo "  (build one: cd ../minip2p && cargo build --release -p minip2p-relay-server-example)" >&2
     exit 2

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end behaviour checks against a local relay.
+# End-to-end behaviour checks against a relay.
 #
 #   scripts/check.sh            # every check
 #   scripts/check.sh <name>...  # just these (see `scripts/check.sh list`)
@@ -47,6 +47,12 @@ fail() {
     for f in "$T"/*.err; do echo "--- $f"; tail -20 "$f"; done
   fi
 }
+# For a check that cannot run here; it neither passes nor fails the run.
+skip() {
+  [ -n "$RESULT" ] && return
+  RESULT=skip
+  printf 'SKIP  %-18s %s\n' "$CHECK" "$*"
+}
 elapsed() { echo $(($(date +%s) - $1)); }
 
 # A transfer both ways; data must arrive byte for byte and both exit 0.
@@ -74,9 +80,11 @@ check_forced_relay() {
 }
 
 # A relay with default circuit limits (128 KiB per direction) cuts the
-# circuit every few hundred KB; the session must resume each time.
+# circuit every few hundred KB; the session must resume each time. It needs
+# a local relay binary, since it runs its own relay with those limits.
 check_resume() {
   if [ -z "${LIMITED:-}" ]; then
+    relay_bin >/dev/null || { skip "no local minip2p-relay binary"; return; }
     local saved=$RELAY saved_pid=${RELAY_PID:-} saved_log=${RELAY_LOG:-}
     RELAY= RELAY_PID=
     ensure_relay --circuit-peer-rate off --circuit-ip-rate off
