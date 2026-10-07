@@ -9,17 +9,12 @@
 //! what the panel and chat build on.
 
 pub mod chat;
-#[allow(dead_code, reason = "the chat UI's channel I/O")]
 pub mod chat_io;
-#[allow(dead_code, reason = "used by the panel and chat UIs")]
 pub mod fmt;
-#[allow(dead_code, reason = "partly used by the panel and chat UIs only")]
 pub mod log;
 pub mod panel;
 pub mod plain;
-#[allow(dead_code, reason = "used by the panel and chat UIs")]
 pub mod state;
-#[allow(dead_code, reason = "partly used by the panel and chat UIs only")]
 pub mod term;
 
 use std::io::IsTerminal as _;
@@ -141,7 +136,6 @@ fn stdin_len() -> Option<u64> {
 /// over one channel: events from [`Session::on_event`] and log records
 /// from [`log::route_logs_to`].
 #[derive(Debug)]
-#[allow(dead_code, reason = "sent and read by the panel and chat UIs")]
 pub enum UiMsg {
     /// A session event.
     Event(Event),

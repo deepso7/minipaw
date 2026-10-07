@@ -112,11 +112,6 @@ impl RateMeter {
         #[allow(clippy::cast_precision_loss)]
         Some((b1 - b0) as f64 / span.as_secs_f64())
     }
-
-    /// The last total recorded, or 0.
-    pub fn total(&self) -> u64 {
-        self.samples.back().map_or(0, |&(_, total)| total)
-    }
 }
 
 /// A session as the UIs see it. Feed it every [`Event`] with
@@ -452,7 +447,6 @@ mod tests {
             meter.record(secs(t0, f64::from(i) / 10.0), 5000);
         }
         assert_eq!(meter.rate(), Some(0.0));
-        assert_eq!(meter.total(), 5000);
         // Samples older than the window are dropped.
         assert!(meter.samples.len() <= 22, "{}", meter.samples.len());
         // A counter that went backwards restarts the meter.
