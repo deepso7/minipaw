@@ -42,7 +42,15 @@ pub fn enable_raw_mode() -> io::Result<()> {
 /// before the session starts, so a terminal that refuses falls back to
 /// plain mode instead of ending a session already under way.
 pub fn raw_mode_works() -> bool {
-    terminal::enable_raw_mode().is_ok() && terminal::disable_raw_mode().is_ok()
+    if enable_raw_mode().is_err() {
+        return false;
+    }
+    // Recorded as on until it is off, so `restore` retries if this fails.
+    let off = terminal::disable_raw_mode().is_ok();
+    if off {
+        RAW_MODE.store(false, Ordering::SeqCst);
+    }
+    off
 }
 
 /// Switches stderr's terminal to the alternate screen, for [`restore`] to

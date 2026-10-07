@@ -42,7 +42,7 @@ const TICK: Duration = Duration::from_millis(100);
 /// Terminal events handled per refresh at most, so a big paste cannot
 /// starve the rest of the loop.
 const MAX_KEYS_PER_TICK: usize = 1024;
-/// Received bytes taken in per tick; see [`Chat::drain`].
+/// Received bytes taken in per tick while running; see [`Chat::drain`].
 const MAX_OUTPUT_PER_TICK: usize = 256 * 1024;
 
 /// The width of the `peer› ` label column.
@@ -340,7 +340,7 @@ impl Chat {
     ) -> thread::Result<Result<Outcome, Error>> {
         loop {
             self.read_keys();
-            self.drain(ui_rx, output_rx);
+            self.drain(ui_rx, output_rx, MAX_OUTPUT_PER_TICK);
             if session.is_finished() {
                 break;
             }
@@ -351,7 +351,8 @@ impl Chat {
             let _ = terminal.draw(|frame| self.draw(frame, now));
         }
         let result = session.join()?;
-        self.drain(ui_rx, output_rx);
+        // Everything the peer sent was acked once written here; keep it all.
+        self.drain(ui_rx, output_rx, usize::MAX);
         if let Some(line) = self.splitter.finish() {
             self.push(Who::Peer, line);
         }
@@ -388,8 +389,9 @@ impl Chat {
         }
     }
 
-    /// Takes in everything the session sent since the last tick.
-    fn drain(&mut self, ui_rx: &Receiver<UiMsg>, output_rx: &Receiver<Vec<u8>>) {
+    /// Takes in the session's events and logs, and up to `limit` bytes of
+    /// its output.
+    fn drain(&mut self, ui_rx: &Receiver<UiMsg>, output_rx: &Receiver<Vec<u8>>, limit: usize) {
         while let Ok(msg) = ui_rx.try_recv() {
             match msg {
                 UiMsg::Event(event) => {
@@ -409,7 +411,7 @@ impl Chat {
         // sanitise cannot starve keys and redraws; the rest waits in the
         // bounded channel, which slows the peer through acks.
         let mut taken = 0;
-        while taken < MAX_OUTPUT_PER_TICK
+        while taken < limit
             && let Ok(chunk) = output_rx.try_recv()
         {
             taken += chunk.len();
@@ -764,6 +766,24 @@ fn span_width(chars: &[char]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ticks_take_a_bounded_share_but_the_end_takes_everything() {
+        let launch = Launch::new(None, minipaw::Config::default(), false);
+        let (input_tx, _input_rx) = std::sync::mpsc::channel();
+        let mut chat = Chat::new(State::new(&launch, Instant::now()), input_tx, false);
+        let (_ui_tx, ui_rx) = std::sync::mpsc::channel::<UiMsg>();
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        // 1 MiB of 1 KiB lines, four times what a tick may take.
+        let line = format!("{}\n", "x".repeat(1023));
+        for _ in 0..1024 {
+            out_tx.send(line.clone().into_bytes()).unwrap();
+        }
+        chat.drain(&ui_rx, &out_rx, MAX_OUTPUT_PER_TICK);
+        assert_eq!(chat.entries.len(), MAX_OUTPUT_PER_TICK / 1024);
+        chat.drain(&ui_rx, &out_rx, usize::MAX);
+        assert_eq!(chat.entries.len(), 1024);
+    }
 
     #[test]
     fn text_wraps_at_spaces_and_inside_long_words() {
