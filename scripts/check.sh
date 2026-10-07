@@ -312,8 +312,61 @@ check_closed_reader() {
   pass "both exit 0"
 }
 
+# Runs a command with its stderr (only) on a fresh pseudo-terminal of the
+# given size, its controlling terminal, copying what it draws there to a
+# file; exits with the command's status. stdin and stdout pass through.
+#   python3 -c "$PTY_RUN" <capture> <cols> <rows> <cmd> [args...]
+PTY_RUN='
+import fcntl, os, struct, sys, termios
+out, cols, rows, cmd = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4:]
+master, slave = os.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+pid = os.fork()
+if pid == 0:
+    os.close(master)
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    os.dup2(slave, 2)
+    os.close(slave)
+    os.execvp(cmd[0], cmd)
+os.close(slave)
+with open(out, "wb") as f:
+    while True:
+        try:
+            data = os.read(master, 65536)
+        except OSError:
+            break
+        if not data:
+            break
+        f.write(data)
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status) % 256)
+'
+
+# With stderr on a terminal and stdout redirected, the client shows the
+# status panel; it draws on stderr only, so the data on stdout is intact.
+check_panel_stdout() {
+  head -c 5000000 /dev/urandom >"$T/up"
+  # No ESC bytes in the data, so any on the client's stdout are the panel's.
+  head -c 2000000 /dev/urandom | LC_ALL=C tr -d '\033' >"$T/down"
+  start_server "$T/down" "$T/server.out" "$T/server.err" || { fail "no ticket"; return; }
+  local client=0 server=0
+  TERM=xterm-256color python3 -c "$PTY_RUN" "$T/client.pty" 100 30 "$BIN" -v "$TICKET" \
+    <"$T/up" >"$T/client.out" &
+  track $!
+  wait_upto $! 120 || client=$?
+  wait_upto "$SERVER_PID" 30 || server=$?
+  cmp -s "$T/up" "$T/server.out" || { fail "upload differs"; return; }
+  cmp -s "$T/down" "$T/client.out" || { fail "download differs"; return; }
+  [ "$client$server" = 00 ] || { fail "exit codes client=$client server=$server"; return; }
+  LC_ALL=C grep -q $'\033' "$T/client.out" && { fail "escape sequences on stdout"; return; }
+  grep -q 'recv' "$T/client.pty" && grep -q '# done: ' "$T/client.pty" ||
+    { fail "no panel on the terminal: $(LC_ALL=C tr -cd '[:print:]\n' <"$T/client.pty" | tail -5)"; return; }
+  pass "5 MB up, 2 MB down with the panel on stderr"
+}
+
 ALL="transfer forced_relay resume heartbeat interrupt_client interrupt_server interrupt_blocked
-interrupt_both wrong_token busy squatters stdin_error stdout_error closed_reader"
+interrupt_both wrong_token busy squatters stdin_error stdout_error closed_reader panel_stdout"
 if [ "${1:-}" = list ]; then
   echo $ALL
   exit 0

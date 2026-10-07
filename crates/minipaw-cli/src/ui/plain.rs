@@ -17,19 +17,26 @@ pub fn run(launch: Launch) -> Result<Outcome, Error> {
 
 /// Prints a session event as a `#` status line on stderr, if it has one.
 pub fn print_event(event: &Event) {
-    match event {
-        Event::Reserving { relay } => eprintln!("# reserving a slot on relay {relay}…"),
-        Event::Listening { ticket } => {
-            eprintln!("# 🐾 listening; connect with:\nminipaw {ticket}");
-        }
-        Event::ReservationSlow => {
-            eprintln!("# still no relay reservation; is the relay reachable over UDP?");
-        }
-        Event::ReservationLost => eprintln!("# lost the relay reservation; reacquiring"),
-        Event::Accepted { peer, path } => eprintln!("# connection from {peer} ({path})"),
-        Event::Connected { path, .. } => eprintln!("# connected ({path})"),
-        Event::Upgraded => eprintln!("# upgraded to a direct connection"),
-        // Connecting, LinkLost, Resumed and Stopping have no line; -v covers them.
-        _ => {}
+    if let Some(text) = event_text(event) {
+        eprintln!("{text}");
     }
+}
+
+/// The `#` status line plain mode prints for a session event, if it has
+/// one, without a trailing newline. The listening line carries the ticket on
+/// a line of its own.
+pub fn event_text(event: &Event) -> Option<String> {
+    Some(match event {
+        Event::Reserving { relay } => format!("# reserving a slot on relay {relay}…"),
+        Event::Listening { ticket } => format!("# 🐾 listening; connect with:\nminipaw {ticket}"),
+        Event::ReservationSlow => {
+            "# still no relay reservation; is the relay reachable over UDP?".to_owned()
+        }
+        Event::ReservationLost => "# lost the relay reservation; reacquiring".to_owned(),
+        Event::Accepted { peer, path } => format!("# connection from {peer} ({path})"),
+        Event::Connected { path, .. } => format!("# connected ({path})"),
+        Event::Upgraded => "# upgraded to a direct connection".to_owned(),
+        // Connecting, LinkLost, Resumed and Stopping have no line; -v covers them.
+        _ => return None,
+    })
 }
