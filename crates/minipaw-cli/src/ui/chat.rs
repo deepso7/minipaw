@@ -32,6 +32,8 @@ use super::{Launch, UiMsg, fmt, log, plain, term};
 
 /// How many conversation lines the chat keeps; older ones are dropped.
 const MAX_ENTRIES: usize = 5000;
+/// How many bytes of text the conversation keeps; older lines are dropped.
+const MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 
 /// How many conversation lines are printed once the chat closes.
 const TRANSCRIPT_LINES: usize = 200;
@@ -44,6 +46,8 @@ const TICK: Duration = Duration::from_millis(100);
 const MAX_KEYS_PER_TICK: usize = 1024;
 /// Received bytes taken in per tick while running; see [`Chat::drain`].
 const MAX_OUTPUT_PER_TICK: usize = 256 * 1024;
+/// Events and log records taken in per tick while running.
+const MAX_MSGS_PER_TICK: usize = 1000;
 
 /// The width of the `peer› ` label column.
 const LABEL_WIDTH: usize = 6;
@@ -72,10 +76,12 @@ pub fn run(launch: Launch) -> Result<Outcome, Error> {
 
     let mut state = State::new(&launch, Instant::now());
     let Some(first) = wait_for_peer(&ui_rx, &session, &mut state) else {
-        // Ended before a peer connected: everything already printed.
+        // Ended before a peer connected: print what it reported up to its
+        // very end, then whatever logs come after.
+        let result = join(session);
         print_pending(&ui_rx);
         log::route_logs_to_stderr();
-        return join(session);
+        return result;
     };
 
     let mut terminal = match enter_full_screen() {
@@ -298,6 +304,8 @@ impl Theme {
 struct Chat {
     state: State,
     entries: VecDeque<Entry>,
+    /// The bytes of text in [`entries`](Self::entries).
+    entry_bytes: usize,
     /// Lines that fell off [`entries`](Self::entries).
     dropped: usize,
     input: LineEdit,
@@ -308,8 +316,9 @@ struct Chat {
     scroll: usize,
     /// The log's height at the last draw, for paging.
     page: usize,
-    /// Whether reading terminal events still works.
-    keys_ok: bool,
+    /// Set once reading terminal events failed for good and the session
+    /// was stopped.
+    keys_failed: bool,
     theme: Theme,
 }
 
@@ -318,13 +327,14 @@ impl Chat {
         Chat {
             state,
             entries: VecDeque::new(),
+            entry_bytes: 0,
             dropped: 0,
             input: LineEdit::new(),
             sender: Some(sender),
             splitter: LineSplitter::new(),
             scroll: 0,
             page: 10,
-            keys_ok: true,
+            keys_failed: false,
             theme: Theme::new(color),
         }
     }
@@ -340,8 +350,8 @@ impl Chat {
         session: JoinHandle<Result<Outcome, Error>>,
     ) -> thread::Result<Result<Outcome, Error>> {
         loop {
-            self.read_keys();
-            self.drain(ui_rx, output_rx, MAX_OUTPUT_PER_TICK);
+            self.read_keys(handle);
+            self.drain(ui_rx, output_rx, MAX_MSGS_PER_TICK, MAX_OUTPUT_PER_TICK);
             if session.is_finished() {
                 break;
             }
@@ -353,36 +363,49 @@ impl Chat {
         }
         let result = session.join()?;
         // Everything the peer sent was acked once written here; keep it all.
-        self.drain(ui_rx, output_rx, usize::MAX);
-        if let Some(line) = self.splitter.finish() {
+        self.drain(ui_rx, output_rx, usize::MAX, usize::MAX);
+        for line in self.splitter.finish() {
             self.push(Who::Peer, line);
         }
         self.state.finish(&result, Instant::now());
         Ok(result)
     }
 
-    /// Waits up to a tick for terminal events and handles them.
-    fn read_keys(&mut self) {
-        if !self.keys_ok {
+    /// Waits up to a tick for terminal events and handles them. Interrupted
+    /// reads are retried; any other error stops the session, since without
+    /// keys the chat could not be ended.
+    fn read_keys(&mut self, handle: &Handle) {
+        if self.keys_failed {
             thread::sleep(TICK);
             return;
         }
         let mut wait = TICK;
         for _ in 0..MAX_KEYS_PER_TICK {
-            match term_event::poll(wait) {
-                Ok(true) => {}
-                Ok(false) => return,
-                Err(_) => {
-                    self.keys_ok = false;
+            let event =
+                term_event::poll(wait).and_then(|ready| ready.then(term_event::read).transpose());
+            match event {
+                Ok(Some(term_event::Event::Key(key))) => self.on_key(key),
+                // Resizes are picked up by the next draw.
+                Ok(Some(_)) => {}
+                Ok(None) => return,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    // Retried next tick; the pause keeps a terminal that
+                    // keeps saying so from spinning the loop.
+                    thread::sleep(Duration::from_millis(10));
                     return;
                 }
-            }
-            match term_event::read() {
-                Ok(term_event::Event::Key(key)) => self.on_key(key),
-                // Resizes are picked up by the next draw.
-                Ok(_) => {}
-                Err(_) => {
-                    self.keys_ok = false;
+                Err(e) => {
+                    self.keys_failed = true;
+                    self.push(
+                        Who::Warn,
+                        sanitize_str(&format!("reading the keyboard failed: {e}; stopping")),
+                    );
+                    handle.stop();
                     return;
                 }
             }
@@ -390,10 +413,20 @@ impl Chat {
         }
     }
 
-    /// Takes in the session's events and logs, and up to `limit` bytes of
-    /// its output.
-    fn drain(&mut self, ui_rx: &Receiver<UiMsg>, output_rx: &Receiver<Vec<u8>>, limit: usize) {
-        while let Ok(msg) = ui_rx.try_recv() {
+    /// Takes in up to `msgs` of the session's events and logs, and up to
+    /// `limit` bytes of its output.
+    fn drain(
+        &mut self,
+        ui_rx: &Receiver<UiMsg>,
+        output_rx: &Receiver<Vec<u8>>,
+        msgs: usize,
+        limit: usize,
+    ) {
+        // Bounded too, so a flood of log records cannot starve keys.
+        for _ in 0..msgs {
+            let Ok(msg) = ui_rx.try_recv() else {
+                break;
+            };
             match msg {
                 UiMsg::Event(event) => {
                     self.state.apply(&event);
@@ -439,6 +472,7 @@ impl Chat {
                 Who::Note,
                 "lost the relay reservation; reacquiring".to_owned(),
             ),
+            Event::ReservationRestored => (Who::Note, "relay reservation restored".to_owned()),
             Event::ReservationSlow => (
                 Who::Warn,
                 "still no relay reservation; is the relay reachable over UDP?".to_owned(),
@@ -453,10 +487,16 @@ impl Chat {
     }
 
     fn push(&mut self, who: Who, text: String) {
-        if self.entries.len() == MAX_ENTRIES {
-            self.entries.pop_front();
+        while self.entries.len() >= MAX_ENTRIES
+            || (!self.entries.is_empty() && self.entry_bytes + text.len() > MAX_ENTRY_BYTES)
+        {
+            let Some(old) = self.entries.pop_front() else {
+                break;
+            };
+            self.entry_bytes -= old.text.len();
             self.dropped += 1;
         }
+        self.entry_bytes += text.len();
         self.entries.push_back(Entry { who, text });
     }
 
@@ -766,6 +806,7 @@ fn span_width(chars: &[char]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::super::chat_io::MAX_LINE;
     use super::*;
 
     #[test]
@@ -780,10 +821,45 @@ mod tests {
         for _ in 0..1024 {
             out_tx.send(line.clone().into_bytes()).unwrap();
         }
-        chat.drain(&ui_rx, &out_rx, MAX_OUTPUT_PER_TICK);
+        chat.drain(&ui_rx, &out_rx, MAX_MSGS_PER_TICK, MAX_OUTPUT_PER_TICK);
         assert_eq!(chat.entries.len(), MAX_OUTPUT_PER_TICK / 1024);
-        chat.drain(&ui_rx, &out_rx, usize::MAX);
+        chat.drain(&ui_rx, &out_rx, usize::MAX, usize::MAX);
         assert_eq!(chat.entries.len(), 1024);
+    }
+
+    #[test]
+    fn ticks_take_a_bounded_number_of_messages() {
+        let launch = Launch::new(None, minipaw::Config::default(), false);
+        let (input_tx, _input_rx) = std::sync::mpsc::channel();
+        let mut chat = Chat::new(State::new(&launch, Instant::now()), input_tx, false);
+        let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiMsg>();
+        let (_out_tx, out_rx) = std::sync::mpsc::channel();
+        for i in 0..MAX_MSGS_PER_TICK + 10 {
+            ui_tx
+                .send(UiMsg::Log(::log::Level::Info, i.to_string()))
+                .unwrap();
+        }
+        chat.drain(&ui_rx, &out_rx, MAX_MSGS_PER_TICK, MAX_OUTPUT_PER_TICK);
+        assert_eq!(chat.entries.len(), MAX_MSGS_PER_TICK);
+        chat.drain(&ui_rx, &out_rx, usize::MAX, usize::MAX);
+        assert_eq!(chat.entries.len(), MAX_MSGS_PER_TICK + 10);
+    }
+
+    #[test]
+    fn the_log_keeps_a_bounded_number_of_bytes() {
+        let launch = Launch::new(None, minipaw::Config::default(), false);
+        let (input_tx, _input_rx) = std::sync::mpsc::channel();
+        let mut chat = Chat::new(State::new(&launch, Instant::now()), input_tx, false);
+        let line = "x".repeat(MAX_LINE);
+        let fit = MAX_ENTRY_BYTES / MAX_LINE;
+        for i in 0..fit + 3 {
+            chat.push(Who::Peer, format!("{i:05}{}", &line[5..]));
+        }
+        assert_eq!(chat.entries.len(), fit);
+        assert_eq!(chat.dropped, 3);
+        assert_eq!(chat.entry_bytes, fit * MAX_LINE);
+        // The oldest went first.
+        assert!(chat.entries[0].text.starts_with("00003"));
     }
 
     #[test]

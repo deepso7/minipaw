@@ -23,11 +23,14 @@ pub struct Config {
     /// is the default. A dialer uses it only for tickets that carry no
     /// relay of their own.
     pub relay: Option<PeerAddr>,
-    /// Keep to the relay: no direct dials and no hole punching.
+    /// Keep to the relay: no direct dials and no hole punching. Cannot be
+    /// combined with [`direct`](Self::direct).
     pub force_relay: bool,
     /// For a dialer, a listener address to dial alongside the relay, for
     /// benchmarks and paths hole punching cannot find. The ticket's peer id
-    /// is added to it.
+    /// is added to it. Setting it with [`force_relay`](Self::force_relay)
+    /// makes [`Session::run`](crate::Session::run) fail with
+    /// [`Error::Config`].
     pub direct: Option<Multiaddr>,
     /// Test hook: once this many session bytes have arrived, a listener
     /// forgets its stream without closing it, as a relay that drops a

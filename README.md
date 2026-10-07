@@ -66,6 +66,10 @@ minipaw picks how to show status from where its streams point:
 - **Plain `#` lines** when stderr isn't a terminal, or with `--plain`. This
   is what scripts and logs see.
 
+The panel and chat need stderr to be a terminal, `TERM` set to something
+other than `dumb`, and a terminal of at least 40×8; the chat also needs raw
+mode to work. Otherwise minipaw falls back to plain lines.
+
 ## How it works
 
 - **Ticket.** The `mp…` ticket holds the server's peer ID (its public key),

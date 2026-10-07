@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use minip2p::WaitHandle;
+use minip2p::{PeerAddr, WaitHandle};
 
 use crate::config::{self, Config};
 use crate::event::{Event, Events};
@@ -200,23 +200,29 @@ impl Session {
             events,
             shared,
         } = self;
-        if let Some(relay) = &config.relay {
-            config::check_relay(relay)?;
+        // A stop during setup is seen once the endpoint is bound.
+        if shared.stopped() {
+            return Err(Error::Stopped);
         }
-        let default = || {
-            config::default_relay()
-                .ok_or_else(|| Error::Config("the built-in relay address is invalid".into()))
+        if config.force_relay && config.direct.is_some() {
+            return Err(Error::Config(
+                "a direct address and force_relay cannot both be set".into(),
+            ));
+        }
+        // Only the relay this session uses is checked: a dialer's ticket
+        // may name its own, leaving `config.relay` unused.
+        let relay = |chosen: Option<&PeerAddr>| match chosen {
+            Some(relay) => config::check_relay(relay).map(|()| relay.clone()),
+            None => config::default_relay()
+                .ok_or_else(|| Error::Config("the built-in relay address is invalid".into())),
         };
         let result = match kind {
             Kind::Listen => {
-                let relay = config.relay.clone().map_or_else(default, Ok)?;
+                let relay = relay(config.relay.as_ref())?;
                 listener::run(relay, &config, io, shared.clone(), events)
             }
             Kind::Dial(ticket) => {
-                let relay = match ticket.relay.clone().or_else(|| config.relay.clone()) {
-                    Some(relay) => relay,
-                    None => default()?,
-                };
+                let relay = relay(ticket.relay.as_ref().or(config.relay.as_ref()))?;
                 dialer::run(ticket, relay, &config, io, shared.clone(), events)
             }
         };
@@ -238,6 +244,49 @@ mod tests {
     fn sessions_move_between_threads() {
         assert_send::<Session>();
         assert_send_sync::<Handle>();
+    }
+
+    #[test]
+    fn a_dialer_checks_only_the_relay_it_uses() {
+        let relay = config::parse_relay(UNREACHABLE_RELAY).expect("relay address");
+        let ticket = Ticket {
+            peer: relay.peer_id().clone(),
+            token: [7; 16],
+            relay: Some(relay),
+        };
+        let tcp = UNREACHABLE_RELAY.replace("/udp/9/quic-v1", "/tcp/9");
+        let config = Config {
+            relay: Some(tcp.parse().expect("peer address")),
+            ..Config::default()
+        };
+        let session = dial(
+            ticket,
+            config.clone(),
+            Io::new(std::io::empty(), std::io::sink()),
+        );
+        // Past the relay check, a stop ends it.
+        let handle = session.handle();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            handle.stop();
+        });
+        assert!(matches!(session.run(), Err(Error::Stopped)));
+        stopper.join().unwrap();
+        // A listener uses its configured relay, so the same one is refused.
+        let session = listen(config, Io::new(std::io::empty(), std::io::sink()));
+        assert!(matches!(session.run(), Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn a_direct_address_and_force_relay_conflict() {
+        let config = Config {
+            force_relay: true,
+            direct: Some("/ip4/127.0.0.1/udp/9/quic-v1".parse().expect("address")),
+            ..Config::default()
+        };
+        let session = listen(config, Io::new(std::io::empty(), std::io::sink()));
+        let err = session.run().unwrap_err().to_string();
+        assert!(err.contains("force_relay"), "{err}");
     }
 
     #[test]

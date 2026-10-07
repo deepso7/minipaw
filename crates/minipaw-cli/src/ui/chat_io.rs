@@ -184,9 +184,9 @@ impl LineEdit {
     }
 }
 
-/// The longest partial line [`LineSplitter`] holds before handing it out
-/// as a line of its own, so a peer that never sends `\n` cannot grow it
-/// without bound.
+/// The longest line [`LineSplitter`] hands out, in bytes once sanitised;
+/// longer ones are split. It also caps the partial line it holds, so a peer
+/// that never sends `\n` cannot grow it without bound.
 pub const MAX_LINE: usize = 16 * 1024;
 
 /// How many spaces a tab becomes.
@@ -216,7 +216,7 @@ impl LineSplitter {
                 // A CRLF line ending, not a carriage return to draw.
                 self.partial.pop();
             }
-            lines.push(sanitize(&self.partial));
+            push_capped(&mut lines, sanitize(&self.partial));
             self.partial.clear();
         }
         self.partial.extend_from_slice(rest);
@@ -229,21 +229,37 @@ impl LineSplitter {
             if cut == 0 {
                 cut = MAX_LINE;
             }
-            lines.push(sanitize(&self.partial[..cut]));
+            push_capped(&mut lines, sanitize(&self.partial[..cut]));
             self.partial.drain(..cut);
         }
         lines
     }
 
-    /// The partial line left at the end of the stream, if any.
-    pub fn finish(&mut self) -> Option<String> {
-        if self.partial.is_empty() {
-            return None;
+    /// The partial line left at the end of the stream, if any, split as
+    /// [`push`](Self::push) splits lines.
+    pub fn finish(&mut self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if !self.partial.is_empty() {
+            push_capped(&mut lines, sanitize(&self.partial));
+            self.partial.clear();
         }
-        let line = sanitize(&self.partial);
-        self.partial.clear();
-        Some(line)
+        lines
     }
+}
+
+/// Adds `line` to `lines` in pieces of at most [`MAX_LINE`] bytes, cut
+/// between characters. Sanitising can grow text (a tab becomes four
+/// spaces), so the cap applies after it.
+fn push_capped(lines: &mut Vec<String>, mut line: String) {
+    while line.len() > MAX_LINE {
+        let mut cut = MAX_LINE;
+        while !line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let rest = line.split_off(cut);
+        lines.push(std::mem::replace(&mut line, rest));
+    }
+    lines.push(line);
 }
 
 /// `bytes` as text that is safe to draw: invalid UTF-8 and every control
@@ -267,9 +283,13 @@ pub fn sanitize_str(text: &str) -> String {
     out
 }
 
-/// The invisible characters that reorder the text around them.
+/// The invisible characters that reorder the text around them: embeddings,
+/// overrides, isolates and the directional marks.
 fn is_bidi_control(c: char) -> bool {
-    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 #[cfg(test)]
@@ -390,8 +410,8 @@ mod tests {
         assert!(s.push(b"hel").is_empty());
         assert_eq!(s.push(b"lo\nwor"), ["hello"]);
         assert_eq!(s.push(b"ld\n\nthree\r\nfour"), ["world", "", "three"]);
-        assert_eq!(s.finish().as_deref(), Some("four"));
-        assert_eq!(s.finish(), None);
+        assert_eq!(s.finish(), ["four"]);
+        assert!(s.finish().is_empty());
     }
 
     #[test]
@@ -418,10 +438,28 @@ mod tests {
             "no split chars"
         );
         assert_eq!(lines.concat(), long);
-        // A complete line is never cut.
-        let mut whole = "x".repeat(MAX_LINE * 2);
-        whole.push('\n');
-        assert_eq!(s.push(whole.as_bytes()).len(), 1);
+    }
+
+    #[test]
+    fn splitter_caps_complete_lines_after_expanding_tabs() {
+        let mut s = LineSplitter::new();
+        // 100 KiB of tabs, each four spaces once sanitised.
+        let mut tabs = vec![b'\t'; 100 * 1024];
+        tabs.push(b'\n');
+        let lines = s.push(&tabs);
+        assert!(lines.iter().all(|l| l.len() <= MAX_LINE));
+        assert_eq!(lines.iter().map(String::len).sum::<usize>(), 400 * 1024);
+        assert_eq!(lines.len(), 400 * 1024 / MAX_LINE);
+        // Cut between characters, not inside one.
+        let wide = format!("a{}\n", "é".repeat(MAX_LINE));
+        let lines = s.push(wide.as_bytes());
+        assert!(lines.iter().all(|l| l.len() <= MAX_LINE));
+        assert_eq!(lines.concat(), wide.trim_end());
+        // So is what is left at the end of the stream.
+        assert!(s.push(&tabs[..MAX_LINE]).is_empty());
+        let rest = s.finish();
+        assert_eq!(rest.len(), 4);
+        assert!(rest.iter().all(|l| l.len() <= MAX_LINE));
     }
 
     #[test]
@@ -437,6 +475,10 @@ mod tests {
         c1.extend_from_slice(b"\xff\n");
         assert_eq!(s.push(&c1), ["x\u{FFFD}2Jy\u{FFFD}"]);
         assert_eq!(sanitize_str("ab\u{202E}cd"), "ab\u{FFFD}cd");
+        assert_eq!(
+            sanitize_str("a\u{061C}b\u{200E}c\u{200F}d"),
+            "a\u{FFFD}b\u{FFFD}c\u{FFFD}d"
+        );
         assert_eq!(sanitize(b"plain text"), "plain text");
     }
 }

@@ -313,6 +313,9 @@ impl Pipe {
             Frame::Fin { offset } => {
                 self.inb.on_fin(offset)?;
                 if self.close_on_peer_fin {
+                    // Input already read still goes out; only what was not
+                    // read yet is cut off.
+                    self.pull_stdin();
                     self.stdin_open = false;
                     self.out.close();
                 }

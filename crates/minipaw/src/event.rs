@@ -54,6 +54,10 @@ pub enum Event {
     ReservationSlow,
     /// The relay dropped the reservation; the listener is getting another.
     ReservationLost,
+    /// The listener holds a relay slot again after
+    /// [`ReservationLost`](Event::ReservationLost); the ticket from
+    /// [`Listening`](Event::Listening) still works.
+    ReservationRestored,
     /// The dialer is connecting to `peer`.
     Connecting {
         /// The listener's peer id.
@@ -82,7 +86,10 @@ pub enum Event {
     },
     /// The session resumed on a fresh stream.
     Resumed,
-    /// The session is stopping on our side and telling the peer.
+    /// The session is stopping on our side, after [`Handle::stop`] or a
+    /// local failure; a connected peer is told.
+    ///
+    /// [`Handle::stop`]: crate::Handle::stop
     Stopping,
 }
 

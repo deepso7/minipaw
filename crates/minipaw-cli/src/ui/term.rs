@@ -12,8 +12,8 @@
 //! cursor's visibility), so [`restore`] knows what to undo.
 
 use std::io::{self, Stderr, Write};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use minipaw::Handle;
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
@@ -24,6 +24,9 @@ use ratatui::layout::{Position, Size};
 static RAW_MODE: AtomicBool = AtomicBool::new(false);
 static ALTERNATE_SCREEN: AtomicBool = AtomicBool::new(false);
 static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// Held for the whole of [`restore`], so a second caller waits until the
+/// terminal is back instead of exiting while the first is still writing.
+static RESTORING: Mutex<()> = Mutex::new(());
 
 /// The terminal's size as `(columns, rows)`, from an ioctl: nothing is
 /// written to the terminal.
@@ -65,6 +68,7 @@ pub fn enter_alternate_screen() -> io::Result<()> {
 /// alternate screen, a hidden cursor. Idempotent and safe from any thread,
 /// including the panic hook and the Ctrl-C handler; errors are ignored.
 pub fn restore() {
+    let _restoring = RESTORING.lock().unwrap_or_else(PoisonError::into_inner);
     if RAW_MODE.swap(false, Ordering::SeqCst) {
         let _ = terminal::disable_raw_mode();
     }

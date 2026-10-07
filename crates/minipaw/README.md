@@ -112,12 +112,18 @@ the other's data. An interactive input never ends on its own, so
 Bytes are acknowledged only once written to the output, so a slow writer
 slows the sender down instead of filling memory.
 
+A blocking read cannot be cancelled, so the input thread can outlive
+`Session::run`, parked in `read` until it returns. End a reader you own once
+`run` returns: `shutdown` a socket, drop a channel's sender. `Io::stdio()`
+may take one more chunk of stdin that way, so run one stdio session per
+process.
+
 ## Events and logging
 
-`Event` reports milestones: reserving and holding a relay slot, connecting,
-being connected relayed or direct (`PathKind`), the upgrade to a direct
-path, a lost stream and its resumption, and stopping. Byte counts are not
-events; poll `Handle::progress` instead.
+`Event` reports milestones: reserving, holding, losing and regaining a relay
+slot, connecting, being connected relayed or direct (`PathKind`), the
+upgrade to a direct path, a lost stream and its resumption, and stopping.
+Byte counts are not events; poll `Handle::progress` instead.
 
 Sessions survive their stream: when a relay cuts a circuit or the
 connection moves to a direct path, the dialer resumes on a fresh stream

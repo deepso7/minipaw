@@ -214,6 +214,11 @@ impl State {
                     self.phase = Phase::Reserving;
                 }
             }
+            Event::ReservationRestored => {
+                if before_peer {
+                    self.phase = Phase::Waiting;
+                }
+            }
             Event::Connecting { peer } => {
                 self.peer = Some(peer.clone());
                 self.phase = Phase::Connecting;
@@ -221,7 +226,10 @@ impl State {
             Event::Accepted { peer, path } | Event::Connected { peer, path } => {
                 self.peer = Some(peer.clone());
                 self.path = Some(*path);
-                self.phase = Phase::Connected;
+                // The SDK still reports what happens while it stops.
+                if self.phase != Phase::Stopping {
+                    self.phase = Phase::Connected;
+                }
                 self.connected_at.get_or_insert(now);
             }
             Event::Upgraded => {
@@ -358,6 +366,12 @@ mod tests {
         state.apply_at(&Event::ReservationSlow, t0);
         assert_eq!(state.phase, Phase::Reserving);
         assert_eq!(state.warnings.len(), 1);
+        // As after Event::Listening, which needs a real ticket.
+        state.phase = Phase::Waiting;
+        state.apply_at(&Event::ReservationLost, t0);
+        assert_eq!(state.phase, Phase::Reserving);
+        state.apply_at(&Event::ReservationRestored, t0);
+        assert_eq!(state.phase, Phase::Waiting);
         let path = PathKind::Relayed;
         state.apply_at(&Event::Accepted { peer: peer(), path }, secs(t0, 3.0));
         assert_eq!(state.phase, Phase::Connected);
@@ -414,6 +428,22 @@ mod tests {
         assert_eq!(state.phase, Phase::Done);
         assert_eq!(state.outcome, Some(Outcome::Done));
         assert!(state.phase.is_ended());
+    }
+
+    #[test]
+    fn a_late_connection_does_not_undo_stopping() {
+        let t0 = Instant::now();
+        let mut state = State::new(&launch(None), t0);
+        state.apply_at(&Event::Stopping, t0);
+        let path = PathKind::Relayed;
+        state.apply_at(&Event::Accepted { peer: peer(), path }, t0);
+        assert_eq!(state.phase, Phase::Stopping);
+        assert_eq!(state.peer, Some(peer()));
+        assert_eq!(state.path, Some(PathKind::Relayed));
+        let path = PathKind::Direct;
+        state.apply_at(&Event::Connected { peer: peer(), path }, t0);
+        assert_eq!(state.phase, Phase::Stopping);
+        assert_eq!(state.path, Some(PathKind::Direct));
     }
 
     #[test]

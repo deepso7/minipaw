@@ -115,6 +115,8 @@ impl Server {
     fn drive_until_exit(&mut self, ticket: &Ticket) -> Result<Exit, Box<dyn Error>> {
         let started = Instant::now();
         let mut announced = false;
+        // Lost since announced, so getting it back is news.
+        let mut lost = false;
         let mut warned = false;
         loop {
             let deadline = [
@@ -139,15 +141,19 @@ impl Server {
             .max(Instant::now() + Duration::from_millis(1));
 
             if let EndpointWaitOutcome::Event(event) = self.endpoint.wait(deadline)? {
-                if let EndpointEvent::Nat(NatEvent::RelayReserved { .. }) = &event
-                    && !announced
-                {
-                    announced = true;
-                    self.events.emit(Event::Listening {
-                        ticket: ticket.clone(),
-                    });
+                if let EndpointEvent::Nat(NatEvent::RelayReserved { .. }) = &event {
+                    if !announced {
+                        announced = true;
+                        self.events.emit(Event::Listening {
+                            ticket: ticket.clone(),
+                        });
+                    } else if lost {
+                        self.events.emit(Event::ReservationRestored);
+                    }
+                    lost = false;
                 }
                 if let EndpointEvent::Nat(NatEvent::RelayReservationLost { .. }) = &event {
+                    lost = announced;
                     self.events.emit(Event::ReservationLost);
                 }
                 if let Some(stop) = &mut self.stop {

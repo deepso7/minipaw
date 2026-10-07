@@ -36,7 +36,8 @@ pub fn event_text(event: &Event) -> Option<String> {
         Event::Accepted { peer, path } => format!("# connection from {peer} ({path})"),
         Event::Connected { path, .. } => format!("# connected ({path})"),
         Event::Upgraded => "# upgraded to a direct connection".to_owned(),
-        // Connecting, LinkLost, Resumed and Stopping have no line; -v covers them.
+        // Connecting, LinkLost, Resumed, ReservationRestored and Stopping
+        // have no line; -v covers them.
         _ => return None,
     })
 }
