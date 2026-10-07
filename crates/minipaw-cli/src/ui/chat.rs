@@ -686,9 +686,12 @@ impl Chat {
         let width = usize::from(inner.width).saturating_sub(1).max(1);
         let chars = self.input.chars();
         let cursor = self.input.cursor();
-        let mut start = 0;
-        while start < cursor && span_width(&chars[start..cursor]) > width {
-            start += 1;
+        let (mut start, mut before) = (cursor, 0);
+        while let Some(&c) = start.checked_sub(1).and_then(|i| chars.get(i))
+            && before + char_width(c) <= width
+        {
+            before += char_width(c);
+            start -= 1;
         }
         if !self.input.is_empty() {
             let mut shown = String::new();
@@ -703,7 +706,7 @@ impl Chat {
             }
             frame.render_widget(Paragraph::new(Span::styled(shown, t.text)), inner);
         }
-        let x = u16::try_from(span_width(&chars[start..cursor])).unwrap_or(u16::MAX);
+        let x = u16::try_from(before).unwrap_or(u16::MAX);
         frame.set_cursor_position(Position {
             x: inner
                 .x
@@ -798,10 +801,6 @@ fn char_width(c: char) -> usize {
         let mut buf = [0u8; 4];
         Span::raw(&*c.encode_utf8(&mut buf)).width()
     }
-}
-
-fn span_width(chars: &[char]) -> usize {
-    chars.iter().map(|&c| char_width(c)).sum()
 }
 
 #[cfg(test)]

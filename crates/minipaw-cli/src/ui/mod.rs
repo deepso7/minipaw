@@ -124,14 +124,20 @@ impl Launch {
     }
 }
 
-/// The size of stdin, when it is a regular file.
+/// What is left of stdin, when it is a regular file: its size past the
+/// current position, which `(read -r header; minipaw) <file` has moved.
 fn stdin_len() -> Option<u64> {
     #[cfg(unix)]
     {
-        std::fs::metadata("/dev/stdin")
-            .ok()
-            .filter(std::fs::Metadata::is_file)
-            .map(|meta| meta.len())
+        use std::io::Seek as _;
+        use std::os::fd::AsFd as _;
+
+        let fd = std::io::stdin().as_fd().try_clone_to_owned().ok()?;
+        // Shares stdin's offset; seeking by zero only reads it.
+        let mut file = std::fs::File::from(fd);
+        let meta = file.metadata().ok().filter(std::fs::Metadata::is_file)?;
+        let pos = file.stream_position().ok()?;
+        Some(meta.len().saturating_sub(pos))
     }
     #[cfg(not(unix))]
     {

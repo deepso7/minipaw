@@ -7,14 +7,12 @@ mod ui;
 
 use std::process::ExitCode;
 
-use clap::Parser as _;
-
 use args::{Args, Command};
 use ui::{Launch, term};
 
 fn main() -> ExitCode {
     // Usage errors exit 2, --help and --version 0.
-    let args = Args::parse();
+    let args = Args::try_from_argv(std::env::args_os()).unwrap_or_else(|e| e.exit());
     if let Some(Command::Parse { ticket }) = &args.command {
         args::print_ticket(ticket);
         return ExitCode::SUCCESS;

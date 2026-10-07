@@ -2,7 +2,8 @@
 
 use std::ffi::OsString;
 
-use clap::{Parser, Subcommand};
+use clap::error::ErrorKind;
+use clap::{CommandFactory as _, Parser, Subcommand};
 use minipaw::{Config, Multiaddr, PeerAddr, Ticket};
 
 /// minipaw: pipe stdin/stdout between two machines, peer to peer.
@@ -14,7 +15,7 @@ use minipaw::{Config, Multiaddr, PeerAddr, Ticket};
 #[command(
     name = "minipaw",
     version,
-    args_conflicts_with_subcommands = true,
+    override_usage = "minipaw [OPTIONS] [TICKET]\n       minipaw [-v] parse <TICKET>",
     after_help = "\
 Examples:
   minipaw <big.iso                 send a file; prints a ticket
@@ -38,7 +39,7 @@ pub struct Args {
     pub relay: Option<String>,
 
     /// Log connection progress to stderr.
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     pub verbose: bool,
 
     /// Print plain status lines instead of the terminal UI.
@@ -47,6 +48,34 @@ pub struct Args {
 
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+impl Args {
+    /// Parses `argv` (program name first). Session options cannot go with
+    /// a subcommand; `-v` goes with anything.
+    ///
+    /// # Errors
+    ///
+    /// A usage error, or `--help`/`--version`; `exit` prints it.
+    pub fn try_from_argv(
+        argv: impl IntoIterator<Item = impl Into<OsString> + Clone>,
+    ) -> Result<Self, clap::Error> {
+        let args = Self::try_parse_from(argv)?;
+        if args.command.is_some() {
+            let session = [
+                (args.ticket.is_some(), "[TICKET]"),
+                (args.relay.is_some(), "--relay"),
+                (args.plain, "--plain"),
+            ];
+            if let Some((_, name)) = session.iter().find(|(used, _)| *used) {
+                return Err(Self::command().error(
+                    ErrorKind::ArgumentConflict,
+                    format!("{name} cannot be used with a subcommand"),
+                ));
+            }
+        }
+        Ok(args)
+    }
 }
 
 /// Subcommands.
@@ -128,8 +157,6 @@ pub fn print_ticket(ticket: &Ticket) {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory as _;
-    use clap::error::ErrorKind;
 
     use super::*;
 
@@ -137,7 +164,7 @@ mod tests {
         "/ip4/127.0.0.1/udp/19876/quic-v1/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf";
 
     fn parse(argv: &[&str]) -> Result<Args, clap::Error> {
-        Args::try_parse_from(std::iter::once("minipaw").chain(argv.iter().copied()))
+        Args::try_from_argv(std::iter::once("minipaw").chain(argv.iter().copied()))
     }
 
     fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
@@ -169,6 +196,12 @@ mod tests {
 
         let args = parse(&["parse", TICKET]).expect("parse");
         assert!(matches!(args.command, Some(Command::Parse { .. })));
+
+        // `-v` goes with anything, so wrappers can always pass it.
+        for argv in [["-v", "parse", TICKET], ["parse", "-v", TICKET]] {
+            let args = parse(&argv).expect("verbose parse");
+            assert!(args.verbose && matches!(args.command, Some(Command::Parse { .. })));
+        }
     }
 
     #[test]
@@ -178,9 +211,19 @@ mod tests {
             kind(&["--relay", RELAY, TICKET]),
             ErrorKind::ArgumentConflict
         );
-        assert_eq!(kind(&["-v", "parse", TICKET]), ErrorKind::ArgumentConflict);
+        for argv in [["--plain", "parse", TICKET], [TICKET, "parse", TICKET]] {
+            assert_eq!(kind(&argv), ErrorKind::ArgumentConflict, "{argv:?}");
+        }
+        assert_eq!(
+            kind(&["--relay", RELAY, "parse", TICKET]),
+            ErrorKind::ArgumentConflict
+        );
         assert_eq!(kind(&["garbage"]), ErrorKind::ValueValidation);
         assert_eq!(kind(&["--bogus"]), ErrorKind::UnknownArgument);
+        assert_eq!(
+            kind(&["parse", "--plain", TICKET]),
+            ErrorKind::UnknownArgument
+        );
         assert_eq!(kind(&["parse"]), ErrorKind::MissingRequiredArgument);
         assert_eq!(parse(&["parse", "x"]).unwrap_err().exit_code(), 2);
     }
