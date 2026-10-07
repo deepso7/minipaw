@@ -221,11 +221,13 @@ check_squatters() {
   done
   grep -q "streams held" "$T/squat.err" || { fail "squatter could not open its streams"; return; }
   # Well inside the squatters' 10s Hello deadline, so the pool is still full
-  # and admitting the client means evicting one of them.
-  "$BIN" "$TICKET" < <(echo from-client) >"$T/client.out" 2>"$T/client.err" &
+  # and admitting the client means evicting one of them. The client dials
+  # the server directly too, so a slow relay cannot push it past that.
+  MINIPAW_DIRECT="/ip4/127.0.0.1/udp/$port/quic-v1" \
+    "$BIN" "$TICKET" < <(echo from-client) >"$T/client.out" 2>"$T/client.err" &
   local client=$!
   track $client
-  for _ in $(seq 1 40); do
+  for _ in $(seq 1 80); do
     grep -q from-server "$T/client.out" && break
     sleep 0.1
   done

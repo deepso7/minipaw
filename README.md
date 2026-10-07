@@ -102,8 +102,8 @@ checkout; build it once with
 `cargo build --release -p minip2p-relay-server-example` there, or set
 `MINIP2P_RELAY` to a relay binary (see `scripts/lib.sh`). To skip the local
 relay, set `RELAY` to any relay address, such as the hosted default (CI does
-this); `check.sh` then skips `resume`, which needs a local relay with circuit
-limits. Benchmark results
+this). `resume` still needs a relay binary, since it starts its own relay
+with circuit limits; `check.sh` skips it when there is none. Benchmark results
 accumulate in `bench/results.tsv`, one row per run with the commit.
 
 Two environment variables exist for testing only:
