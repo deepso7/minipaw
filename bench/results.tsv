@@ -1,3 +1,7 @@
-date	commit	mode	mib	mib_per_s	client_cpu_s	server_cpu_s	host
-2026-10-05T16:29:45Z	48663a8	direct	1024	75.6	13.69	13.75	Darwin-arm64
-2026-10-05T16:30:11Z	48663a8	relayed	1024	40.7	15.50	15.27	Darwin-arm64
+date	commit	mode	mib	runs	median_mib_s	min_mib_s	max_mib_s	client_cpu_s	server_cpu_s	host
+2026-10-05T16:29:45Z	48663a8	direct	1024	1	75.6	75.6	75.6	13.69	13.75	Darwin-arm64
+2026-10-05T16:30:11Z	48663a8	relayed	1024	1	40.7	40.7	40.7	15.50	15.27	Darwin-arm64
+2026-10-07T09:35:22Z	7514d58	direct	512	5	47.9	31.6	66.3	10.38	10.52	Darwin-arm64
+2026-10-07T09:36:34Z	7514d58	relayed	512	5	35.9	34.4	36.3	8.74	8.85	Darwin-arm64
+2026-10-07T09:37:29Z	7514d58	up@mito	64	3	6.6	5.8	6.6			Darwin-arm64
+2026-10-07T09:37:29Z	7514d58	down@mito	64	3	9.4	9.2	10.0			Darwin-arm64
