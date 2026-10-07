@@ -1,0 +1,8 @@
+# Stdout may carry a session's data (`minipaw <ticket> >file`), so the
+# terminal UIs draw on stderr and must never write escape sequences to stdout.
+disallowed-methods = [
+  { path = "ratatui::crossterm::cursor::position", reason = "writes the ESC[6n cursor query to stdout, which may be the session's data; use ui::term::StderrBackend, which never queries" },
+  { path = "ratatui::init", reason = "sets up the terminal on stdout, which may be the session's data; use ui::term on stderr" },
+  { path = "ratatui::try_init", reason = "sets up the terminal on stdout, which may be the session's data; use ui::term on stderr" },
+  { path = "ratatui::restore", reason = "writes to stdout, which may be the session's data; use ui::term::restore" },
+]
