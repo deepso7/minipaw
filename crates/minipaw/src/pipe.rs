@@ -25,6 +25,8 @@ use crate::wire::{Frame, FrameReader, MAX_DATA};
 
 use crate::io::Io;
 
+/// Chunks read ahead of the send buffer, waiting in the input channel.
+const INPUT_QUEUE: usize = 8;
 /// A non-urgent ack waits this long after the first unacked write, so it
 /// covers more of them.
 const ACK_DELAY: Duration = Duration::from_millis(10);
@@ -240,7 +242,7 @@ impl Pipe {
             quiet_broken_pipe,
         } = io;
         let failure = Failure::default();
-        let (stdin_tx, stdin) = mpsc::sync_channel(8);
+        let (stdin_tx, stdin) = mpsc::sync_channel(INPUT_QUEUE);
         spawn_input(input, stdin_tx, failure.clone(), wake.clone());
         let (stdout, stdout_rx) = mpsc::channel();
         let (done_tx, writer_done) = mpsc::channel();
@@ -321,9 +323,13 @@ impl Pipe {
                 self.inb.on_fin(offset)?;
                 if self.close_on_peer_fin && self.stdin_open {
                     // Input already read still goes out, even past a full
-                    // window; only what was not read yet is cut off.
+                    // window; only what was not read yet is cut off. Take
+                    // just the queue's backlog: a busy reader refills it.
                     self.stdin_open = false;
-                    while let Ok(Input::Data(data)) = self.stdin.try_recv() {
+                    for _ in 0..INPUT_QUEUE {
+                        let Ok(Input::Data(data)) = self.stdin.try_recv() else {
+                            break;
+                        };
                         self.held.push_back(data);
                     }
                     self.pull_stdin();
@@ -600,7 +606,7 @@ mod tests {
         let reads = Arc::new(AtomicUsize::new(0));
         let io = Io::new(ChunkReader(rx, reads.clone()), io::sink()).close_on_peer_fin(true);
         let mut pipe = pipe(io);
-        let chunks = WINDOW / MAX_DATA + 3;
+        let chunks = WINDOW / MAX_DATA + INPUT_QUEUE;
         for _ in 0..chunks {
             tx.send(vec![1; MAX_DATA]).unwrap();
         }
@@ -621,6 +627,19 @@ mod tests {
         }
         assert_eq!(pipe.out.end(), (chunks * MAX_DATA) as u64);
         assert_eq!(pipe.out.fin_due(), Some(pipe.out.end()));
+    }
+
+    #[test]
+    fn peer_fin_takes_only_the_backlog_of_a_busy_reader() {
+        let io = Io::new(io::repeat(1), io::sink()).close_on_peer_fin(true);
+        let mut pipe = pipe(io);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pipe.out.has_room() {
+            assert!(Instant::now() < deadline, "input never filled the window");
+            pipe.pull_stdin();
+        }
+        pipe.on_frame(Frame::Fin { offset: 0 }).unwrap();
+        assert!(pipe.held.len() <= INPUT_QUEUE);
     }
 
     #[test]
