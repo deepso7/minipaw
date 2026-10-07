@@ -25,7 +25,7 @@ use crate::wire::{Frame, FrameReader, MAX_DATA};
 const ACK_DELAY: Duration = Duration::from_millis(10);
 /// minip2p has no writable event, so a full send buffer is retried after
 /// this pause.
-const BACKPRESSURE_RETRY: Duration = Duration::from_millis(5);
+pub const BACKPRESSURE_RETRY: Duration = Duration::from_millis(5);
 
 pub enum SendError {
     /// The stream's send buffer is full; the frame was not queued.
@@ -169,6 +169,11 @@ impl Pipe {
     /// Session bytes received so far: the resume point we announce.
     pub fn recv_offset(&self) -> u64 {
         self.inb.recv
+    }
+
+    /// Whether [`attach`](Self::attach) would accept `peer_recv`.
+    pub fn check_attach(&self, peer_recv: u64) -> Result<(), String> {
+        self.out.check_rewind(peer_recv)
     }
 
     /// A new stream is attached and the peer has received `peer_recv`

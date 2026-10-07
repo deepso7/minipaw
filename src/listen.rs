@@ -74,18 +74,31 @@ pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
 }
 
 impl Server {
+    /// Runs the session. Once stopping, the stop is the outcome whatever
+    /// else goes wrong: the client ending too, or a timeout.
     fn drive(&mut self, ticket: &Ticket) -> Result<Exit, Box<dyn Error>> {
+        match self.drive_until_exit(ticket) {
+            Err(e) if self.stop.is_some() => {
+                crate::debug!("while stopping: {e}");
+                Ok(Exit::Stopped(self.stop.take().ok_or("no stop")?))
+            }
+            result => result,
+        }
+    }
+
+    fn drive_until_exit(&mut self, ticket: &Ticket) -> Result<Exit, Box<dyn Error>> {
         let started = Instant::now();
         let mut announced = false;
         let mut warned = false;
         loop {
             let deadline = [
-                self.pipe.deadline(),
+                // Pipe timers are for sending, which stops when stopping.
+                self.stop.is_none().then(|| self.pipe.deadline()).flatten(),
                 (!announced && !warned).then(|| started + RESERVE_WARNING),
                 self.lost_since
                     .filter(|_| self.pipe.delivered())
                     .map(|t| t + DELIVERED_GRACE),
-                self.stop.as_ref().map(|stop| stop.by),
+                self.stop.as_ref().map(Stop::wake_at),
                 self.pending.values().map(|(_, deadline)| *deadline).min(),
             ]
             .into_iter()
@@ -105,12 +118,8 @@ impl Server {
                 if let EndpointEvent::Nat(NatEvent::RelayReservationLost { .. }) = &event {
                     eprintln!("# lost the relay reservation; reacquiring");
                 }
-                if self
-                    .stop
-                    .as_ref()
-                    .is_some_and(|stop| stop.confirmed_by(&event))
-                {
-                    return Ok(Exit::Stopped(self.stop.take().ok_or("no stop")?));
+                if let Some(stop) = &mut self.stop {
+                    stop.observe(&event);
                 }
                 self.on_event(event)?;
             }
@@ -128,11 +137,14 @@ impl Server {
             }
             if let Some(stop) = &mut self.stop {
                 // A server with no client has nobody to tell.
-                if self.client.is_none() || stop.is_due() {
-                    return Ok(Exit::Stopped(self.stop.take().ok_or("no stop")?));
-                }
-                if let Some(link) = &self.link {
-                    stop.tell(&mut self.endpoint, link);
+                match stop.step(
+                    &mut self.endpoint,
+                    self.link.as_ref(),
+                    self.client.is_some(),
+                ) {
+                    Ok(true) => return Ok(Exit::Stopped(self.stop.take().ok_or("no stop")?)),
+                    Ok(false) => {}
+                    Err(e) => self.lose(&format!("stop not sent: {e}")),
                 }
                 continue;
             }
@@ -196,7 +208,7 @@ impl Server {
                         self.pipe.on_frame(frame)?;
                     }
                 } else {
-                    self.on_pending_data((peer_id, conn_id, stream_id), &data);
+                    self.on_pending_data((peer_id, conn_id, stream_id), &data)?;
                 }
             }
             EndpointEvent::StreamClosed {
@@ -241,38 +253,36 @@ impl Server {
     }
 
     /// Buffers data on a not-yet-admitted stream until its `Hello` is
-    /// complete, then admits or refuses it.
-    fn on_pending_data(&mut self, key: StreamKey, data: &[u8]) {
+    /// complete, then admits or refuses it. Nothing about the session
+    /// changes until the stream is fully set up, so a refused or failed
+    /// admission leaves the current client and link as they were.
+    fn on_pending_data(&mut self, key: StreamKey, data: &[u8]) -> Result<(), Box<dyn Error>> {
         let Some((reader, _)) = self.pending.get_mut(&key) else {
-            return;
+            return Ok(());
         };
         reader.push(data);
-        let hello = match reader.next() {
-            Ok(None) => return,
+        let (token, session, recv) = match reader.next() {
+            Ok(None) => return Ok(()),
             Ok(Some(Frame::Hello {
                 token,
                 session,
                 recv,
             })) => (token, session, recv),
-            Ok(Some(_)) => return self.refuse(key, "expected Hello"),
-            Err(e) => return self.refuse(key, &e),
+            Ok(Some(_)) => return self.refused(key, "expected Hello"),
+            Err(e) => return self.refused(key, &e),
         };
-        let (token, session, recv) = hello;
         if !constant_time_eq(&token, &self.token) {
-            return self.refuse(key, "wrong token");
+            return self.refused(key, "wrong token");
         }
-        let peer = &key.0;
-        match &self.client {
-            Some((client, admitted)) if client != peer || *admitted != session => {
-                return self.refuse(key, "busy with another client");
+        let resuming = match &self.client {
+            Some((client, admitted)) if *client != key.0 || *admitted != session => {
+                return self.refused(key, "busy with another client");
             }
-            Some(_) => crate::debug!("client resumed at offset {recv}"),
-            None => {
-                let direct = net::is_direct(&self.endpoint, peer);
-                self.told_direct = direct;
-                eprintln!("# connection from {peer} ({})", net::path_label(direct));
-                self.client = Some((peer.clone(), session));
-            }
+            Some(_) => true,
+            None => false,
+        };
+        if let Err(e) = self.pipe.check_attach(recv) {
+            return self.refused(key, &e);
         }
 
         let reader = self
@@ -283,22 +293,38 @@ impl Server {
         let (peer, conn, stream) = key;
         let mut link = Link::new(peer, conn, stream);
         link.reader = reader;
-        if let Some(old) = self.link.take() {
-            old.abandon(&mut self.endpoint);
-        }
         let welcome = Frame::Welcome {
             recv: self.pipe.recv_offset(),
         };
-        if let Err(e) = self.pipe.attach(recv) {
-            let key = (link.peer.clone(), link.conn, link.stream);
-            return self.refuse(key, &e);
-        }
         if let Err(e) = link.send(&mut self.endpoint, &welcome) {
             crate::debug!("welcome failed: {e}");
-            return link.abandon(&mut self.endpoint);
+            link.abandon(&mut self.endpoint);
+            return Ok(());
         }
-        self.link = Some(link);
+
+        if resuming {
+            crate::debug!("client resumed at offset {recv}");
+        } else {
+            let direct = net::is_direct(&self.endpoint, &link.peer);
+            self.told_direct = direct;
+            eprintln!(
+                "# connection from {} ({})",
+                link.peer,
+                net::path_label(direct)
+            );
+            self.client = Some((link.peer.clone(), session));
+        }
+        if let Some(old) = self.link.take() {
+            old.abandon(&mut self.endpoint);
+        }
+        self.pipe.attach(recv)?;
         self.lost_since = None;
+        // Frames that arrived together with the Hello.
+        let link = self.link.insert(link);
+        while let Some(frame) = link.reader.next()? {
+            self.pipe.on_frame(frame)?;
+        }
+        Ok(())
     }
 
     fn evict_oldest_pending(&mut self) {
@@ -330,7 +356,8 @@ impl Server {
         }
     }
 
-    fn refuse(&mut self, key: StreamKey, reason: &str) {
+    /// Turns a pending stream away with an `Error`; an admission outcome.
+    fn refused(&mut self, key: StreamKey, reason: &str) -> Result<(), Box<dyn Error>> {
         crate::debug!("refusing stream from {}: {reason}", key.0);
         self.pending.remove(&key);
         let (peer, conn, stream) = key;
@@ -344,6 +371,7 @@ impl Server {
         {
             crate::debug!("close refused stream: {e}");
         }
+        Ok(())
     }
 
     fn lose(&mut self, reason: &str) {

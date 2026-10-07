@@ -86,6 +86,14 @@ impl Outbound {
     /// `peer_recv`: resend from there. Received is not written, so the bytes
     /// stay buffered (and counted against the window) until acked.
     pub fn rewind(&mut self, peer_recv: u64) -> Result<(), String> {
+        self.check_rewind(peer_recv)?;
+        self.sent = peer_recv;
+        self.fin_sent = false;
+        Ok(())
+    }
+
+    /// Whether a peer may resume at `peer_recv`, without changing anything.
+    pub fn check_rewind(&self, peer_recv: u64) -> Result<(), String> {
         if peer_recv < self.acked || peer_recv > self.end() {
             return Err(format!(
                 "peer resumed at {peer_recv}, outside our unacked range {}..={}",
@@ -93,8 +101,6 @@ impl Outbound {
                 self.end()
             ));
         }
-        self.sent = peer_recv;
-        self.fin_sent = false;
         Ok(())
     }
 

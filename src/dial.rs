@@ -104,7 +104,19 @@ pub fn run(ticket: Ticket, relay: PeerAddr) -> Result<(), Box<dyn Error>> {
 }
 
 impl Client {
+    /// Runs the session. Once stopping, the stop is the outcome whatever
+    /// else goes wrong: the peer ending too, or a timeout.
     fn drive(&mut self) -> Result<Exit, Box<dyn Error>> {
+        match self.drive_until_exit() {
+            Err(e) if self.stop.is_some() => {
+                crate::debug!("while stopping: {e}");
+                Ok(Exit::Stopped(self.stop.take().ok_or("no stop")?))
+            }
+            result => result,
+        }
+    }
+
+    fn drive_until_exit(&mut self) -> Result<Exit, Box<dyn Error>> {
         loop {
             self.on_timers()?;
             let delivered_by = self
@@ -112,9 +124,10 @@ impl Client {
                 .filter(|_| self.pipe.delivered())
                 .map(|t| t + DELIVERED_GRACE);
             let deadline = [
-                self.pipe.deadline(),
+                // Pipe timers are for sending, which stops when stopping.
+                self.stop.is_none().then(|| self.pipe.deadline()).flatten(),
                 self.phase_deadline(),
-                self.stop.as_ref().map(|stop| stop.by),
+                self.stop.as_ref().map(Stop::wake_at),
                 delivered_by,
             ]
             .into_iter()
@@ -124,12 +137,8 @@ impl Client {
             // A past deadline makes `wait` return without polling anything.
             .max(Instant::now() + Duration::from_millis(1));
             if let EndpointWaitOutcome::Event(event) = self.endpoint.wait(deadline)? {
-                if self
-                    .stop
-                    .as_ref()
-                    .is_some_and(|stop| stop.confirmed_by(&event))
-                {
-                    return Ok(Exit::Stopped(self.stop.take().ok_or("no stop")?));
+                if let Some(stop) = &mut self.stop {
+                    stop.observe(&event);
                 }
                 self.on_event(event)?;
             }
@@ -145,12 +154,16 @@ impl Client {
                 self.stop = Stop::check(&self.pipe);
             }
             if let Some(stop) = &mut self.stop {
-                // A server holding no session of ours needs no news.
-                if !self.hello_sent || stop.is_due() {
-                    return Ok(Exit::Stopped(self.stop.take().ok_or("no stop")?));
-                }
-                if let Phase::Up { link } = &self.phase {
-                    stop.tell(&mut self.endpoint, link);
+                // From Hello on the server may hold our session, so the news
+                // goes out on a stream still waiting for Welcome too.
+                let link = match &self.phase {
+                    Phase::Up { link } | Phase::Handshaking { link, .. } => Some(link),
+                    _ => None,
+                };
+                match stop.step(&mut self.endpoint, link, self.hello_sent) {
+                    Ok(true) => return Ok(Exit::Stopped(self.stop.take().ok_or("no stop")?)),
+                    Ok(false) => {}
+                    Err(e) => self.lose(&format!("stop not sent: {e}")),
                 }
                 continue;
             }

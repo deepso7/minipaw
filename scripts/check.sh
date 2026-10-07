@@ -92,7 +92,8 @@ check_resume() {
 }
 
 # Ctrl-C on one side ends both: it exits 130, the peer exits 1, promptly.
-interrupt() { # interrupt <client|server|blocked>
+# With `both`, both sides are interrupted at once and both exit 130.
+interrupt() { # interrupt <client|server|blocked|both>
   local who=$1 server_in=$T/server.in
   if [ "$who" = blocked ]; then
     # The server floods a client whose stdout reader never reads.
@@ -127,12 +128,15 @@ interrupt() { # interrupt <client|server|blocked>
   local start
   start=$(date +%s)
   kill -INT "$victim"
+  [ "$who" = both ] && kill -INT "$peer"
   local victim_code=0 peer_code=0
   wait_upto "$victim" 10 || victim_code=$?
   wait_upto "$peer" 10 || peer_code=$?
   local took
   took=$(elapsed "$start")
-  [ "$victim_code" = 130 ] && [ "$peer_code" = 1 ] ||
+  local want_peer=1
+  [ "$who" = both ] && want_peer=130
+  [ "$victim_code" = 130 ] && [ "$peer_code" = "$want_peer" ] ||
     { fail "exit codes interrupted=$victim_code peer=$peer_code"; return; }
   [ "$took" -le 5 ] || { fail "took ${took}s to end both sides"; return; }
   grep -q from-client "$T/server.out" || { fail "server lost the client's data"; return; }
@@ -142,6 +146,7 @@ interrupt() { # interrupt <client|server|blocked>
 check_interrupt_client() { interrupt client; }
 check_interrupt_server() { interrupt server; }
 check_interrupt_blocked() { interrupt blocked; }
+check_interrupt_both() { interrupt both; }
 
 # A wrong token is refused at once.
 check_wrong_token() {
@@ -207,14 +212,17 @@ check_squatters() {
     sleep 0.1
   done
   grep -q "streams held" "$T/squat.err" || { fail "squatter could not open its streams"; return; }
-  local code=0
+  # Well inside the squatters' 10s Hello deadline, so the pool is still full
+  # and admitting the client means evicting one of them.
   "$BIN" "$TICKET" < <(echo from-client) >"$T/client.out" 2>"$T/client.err" &
   local client=$!
   track $client
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 40); do
     grep -q from-server "$T/client.out" && break
     sleep 0.1
   done
+  grep -q "too many pending" "$T/server.err" ||
+    { fail "the client got in without evicting a squatter"; return; }
   kill "$client" "$SERVER_PID" 2>/dev/null
   wait "$client" 2>/dev/null
   grep -q from-server "$T/client.out" || { fail "client locked out: $(cat "$T/client.err")"; return; }
@@ -279,7 +287,7 @@ check_closed_reader() {
 }
 
 ALL="transfer forced_relay resume interrupt_client interrupt_server interrupt_blocked
-wrong_token busy squatters stdin_error stdout_error closed_reader"
+interrupt_both wrong_token busy squatters stdin_error stdout_error closed_reader"
 if [ "${1:-}" = list ]; then
   echo $ALL
   exit 0

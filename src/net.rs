@@ -10,7 +10,7 @@ use minip2p::{
     ReservationPolicy,
 };
 
-use crate::pipe::{Link, Pipe};
+use crate::pipe::{BACKPRESSURE_RETRY, Link, Pipe, SendError};
 use crate::wire::{Frame, PROTOCOL};
 use minip2p::{ConnectionId, PeerId, StreamId};
 
@@ -153,6 +153,27 @@ pub fn log_event(event: &EndpointEvent) {
 
 /// Half-closes the finished session's stream and gives the peer a moment
 /// to finish its side, so our last ack is not lost to an early exit.
+/// Puts whatever is queued (a last frame, a stream half-close) on the wire:
+/// a wait can return an already-buffered event without polling the
+/// transport, and closing drops what was never sent. A zero wait always
+/// polls once.
+fn flush(endpoint: &mut Endpoint) {
+    for _ in 0..16 {
+        match endpoint.wait(Duration::ZERO) {
+            Ok(EndpointWaitOutcome::Deadline) | Err(_) => break,
+            Ok(EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted) => {}
+        }
+    }
+}
+
+/// Flushes, then closes the endpoint.
+fn close(mut endpoint: Endpoint) {
+    flush(&mut endpoint);
+    if let Err(e) = endpoint.close() {
+        crate::debug!("close endpoint: {e}");
+    }
+}
+
 pub fn linger_and_close(mut endpoint: Endpoint, link: Option<Link>) {
     if let Some(link) = link {
         if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
@@ -160,6 +181,10 @@ pub fn linger_and_close(mut endpoint: Endpoint, link: Option<Link>) {
         }
         let deadline = Instant::now() + LINGER;
         loop {
+            // A past deadline makes `wait` return without polling anything.
+            if Instant::now() >= deadline {
+                break;
+            }
             match endpoint.wait(deadline) {
                 Ok(EndpointWaitOutcome::Event(
                     EndpointEvent::StreamRemoteWriteClosed {
@@ -181,9 +206,7 @@ pub fn linger_and_close(mut endpoint: Endpoint, link: Option<Link>) {
             }
         }
     }
-    if let Err(e) = endpoint.close() {
-        crate::debug!("close endpoint: {e}");
-    }
+    close(endpoint);
 }
 
 /// How a session loop ended without an error.
@@ -209,6 +232,10 @@ pub struct Stop {
     pub by: Instant,
     /// Streams the `Error` went out on.
     told: Vec<(PeerId, ConnectionId, StreamId)>,
+    /// The peer half-closed one of them: it read the `Error`.
+    confirmed: bool,
+    /// The last send hit backpressure; try again then.
+    retry_at: Option<Instant>,
 }
 
 enum StopReason {
@@ -229,6 +256,8 @@ impl Stop {
             reason,
             by: Instant::now() + ABORT_GRACE,
             told: Vec::new(),
+            confirmed: false,
+            retry_at: None,
         })
     }
 
@@ -239,44 +268,66 @@ impl Stop {
         }
     }
 
-    /// Sends the `Error` on `link` and half-closes it, once per stream.
-    pub fn tell(&mut self, endpoint: &mut Endpoint, link: &Link) {
-        let key = (link.peer.clone(), link.conn, link.stream);
-        if self.told.contains(&key) {
-            return;
-        }
-        if let Err(e) = link.send(endpoint, &Frame::Error(self.message().into())) {
-            crate::debug!("stop not sent: {e}");
-        }
-        if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
-            crate::debug!("close stream: {e}");
-        }
-        self.told.push(key);
-    }
-
-    /// Whether `event` is the peer half-closing a stream we told it on,
-    /// which it does once it has read the `Error`.
-    pub fn confirmed_by(&self, event: &EndpointEvent) -> bool {
-        match event {
-            EndpointEvent::StreamRemoteWriteClosed {
-                peer_id,
-                conn_id,
-                stream_id,
-            }
-            | EndpointEvent::StreamClosed {
-                peer_id,
-                conn_id,
-                stream_id,
-            } => self
+    /// Notes the peer gracefully half-closing a stream we told it on, which
+    /// it does once it has read the `Error`. A reset is not confirmation: it
+    /// discards what we queued.
+    pub fn observe(&mut self, event: &EndpointEvent) {
+        if let EndpointEvent::StreamRemoteWriteClosed {
+            peer_id,
+            conn_id,
+            stream_id,
+        } = event
+            && self
                 .told
                 .iter()
-                .any(|(p, c, s)| p == peer_id && c == conn_id && s == stream_id),
-            _ => false,
+                .any(|(p, c, s)| p == peer_id && c == conn_id && s == stream_id)
+        {
+            self.confirmed = true;
         }
     }
 
-    pub fn is_due(&self) -> bool {
-        Instant::now() >= self.by
+    /// One loop iteration while stopping: sends the `Error` on `link` (the
+    /// stream that can carry it, if one is up) unless it already went out
+    /// there. `peer_has_session` is whether the peer may hold our session
+    /// and so must be told. `Ok(true)` ends the loop; `Err` means `link` is
+    /// dead and should be dropped, so a fresh stream can carry the news.
+    pub fn step(
+        &mut self,
+        endpoint: &mut Endpoint,
+        link: Option<&Link>,
+        peer_has_session: bool,
+    ) -> Result<bool, String> {
+        let now = Instant::now();
+        if self.confirmed || !peer_has_session || now >= self.by {
+            return Ok(true);
+        }
+        let Some(link) = link else {
+            return Ok(false);
+        };
+        let key = (link.peer.clone(), link.conn, link.stream);
+        if self.told.contains(&key) || self.retry_at.is_some_and(|at| now < at) {
+            return Ok(false);
+        }
+        self.retry_at = None;
+        match link.try_send(endpoint, &Frame::Error(self.message().into())) {
+            Ok(()) => {
+                if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
+                    crate::debug!("close stream: {e}");
+                }
+                self.told.push(key);
+                Ok(false)
+            }
+            Err(SendError::Full) => {
+                self.retry_at = Some(now + BACKPRESSURE_RETRY);
+                Ok(false)
+            }
+            Err(SendError::Dead(e)) => Err(e),
+        }
+    }
+
+    /// When the loop must wake for the stop: a send retry or the deadline.
+    pub fn wake_at(&self) -> Instant {
+        self.retry_at.map_or(self.by, |at| at.min(self.by))
     }
 }
 
@@ -305,9 +356,7 @@ pub fn finish(
         Ok(Exit::Stopped(stop)) => {
             // The loop already told the peer, or gave up trying.
             drop(link);
-            if let Err(e) = endpoint.close() {
-                crate::debug!("close endpoint: {e}");
-            }
+            close(endpoint);
             pipe.finish(Some(STDOUT_GRACE));
             Err(match stop.reason {
                 StopReason::Interrupted => Interrupted.into(),
@@ -444,7 +493,5 @@ fn abort(
             }
         }
     }
-    if let Err(e) = endpoint.close() {
-        crate::debug!("close endpoint: {e}");
-    }
+    close(endpoint);
 }

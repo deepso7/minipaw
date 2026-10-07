@@ -32,7 +32,7 @@ done
 [ -x "$BIN" ] || cargo build -q --release
 
 T=$(mktemp -d)
-trap 'kill "${SERVER_PID:-}" 2>/dev/null || true; stop_relay; rm -rf "$T"' EXIT
+trap 'reap_all; stop_relay; rm -rf "$T"' EXIT
 ensure_relay
 
 cpu() { awk '/^user/{u=$2} /^sys/{s=$2} END{printf "%.2f", u+s}' "$1"; }

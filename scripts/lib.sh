@@ -19,7 +19,10 @@ track() { BG_PIDS+=("$1"); }
 reap_all() {
   local pid
   for pid in "${BG_PIDS[@]:-}"; do
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+    [ -n "$pid" ] || continue
+    # Children first: a wrapper such as `time` does not pass on its signal.
+    pkill -P "$pid" 2>/dev/null
+    kill "$pid" 2>/dev/null
   done
   for pid in "${BG_PIDS[@]:-}"; do
     [ -n "$pid" ] && wait "$pid" 2>/dev/null
