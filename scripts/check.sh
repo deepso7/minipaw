@@ -71,8 +71,10 @@ transfer() { # transfer <up-bytes> <down-bytes>
   [ "$client$server" = 00 ] || { fail "exit codes client=$client server=$server"; return 1; }
 }
 
+# Sized to finish well inside the timeout on a relayed path too: CI's macOS
+# runners cannot hole-punch and get about 300 KB/s through the hosted relay.
 check_transfer() {
-  transfer 30000000 10000000 && pass "30 MB up, 10 MB down"
+  transfer 10000000 5000000 && pass "10 MB up, 5 MB down"
 }
 
 check_forced_relay() {
@@ -97,6 +99,19 @@ check_resume() {
   local circuits=$(($(grep -c 'circuit opened' "$LIMITED_LOG") - before))
   [ "$circuits" -gt 5 ] || { fail "only $circuits circuits: the relay never cut the session"; return; }
   pass "2 MB up, 0.5 MB down across $circuits relay circuits"
+}
+
+# A relay that drops a circuit may tell only one side (minip2p#306). The
+# server forgets its link after 1 MB without closing it; the client must
+# notice the silence, reconnect, and finish the session where it left off.
+# Relay only, as in the real case; a path upgrade would also recover it.
+check_heartbeat() {
+  MINIPAW_FORCE_RELAY=1 MINIPAW_TEST_DROP_LINK_AFTER=1000000 transfer 3000000 1000000 || return
+  grep -q "test hook: dropping the link" "$T/server.err" ||
+    { fail "the server never dropped its link"; return; }
+  grep -q "no word from the server" "$T/client.err" ||
+    { fail "the client never noticed the silence"; return; }
+  pass "client noticed a silent link and resumed: 3 MB up, 1 MB down"
 }
 
 # Ctrl-C on one side ends both: it exits 130, the peer exits 1, promptly.
@@ -296,7 +311,7 @@ check_closed_reader() {
   pass "both exit 0"
 }
 
-ALL="transfer forced_relay resume interrupt_client interrupt_server interrupt_blocked
+ALL="transfer forced_relay resume heartbeat interrupt_client interrupt_server interrupt_blocked
 interrupt_both wrong_token busy squatters stdin_error stdout_error closed_reader"
 if [ "${1:-}" = list ]; then
   echo $ALL

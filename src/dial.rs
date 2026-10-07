@@ -125,7 +125,10 @@ impl Client {
                 .map(|t| t + DELIVERED_GRACE);
             let deadline = [
                 // Pipe timers are for sending, which stops when stopping.
-                self.stop.is_none().then(|| self.pipe.deadline()).flatten(),
+                self.stop
+                    .is_none()
+                    .then(|| self.pipe.deadline(self.up_link()))
+                    .flatten(),
                 self.phase_deadline(),
                 self.stop.as_ref().map(Stop::wake_at),
                 delivered_by,
@@ -188,13 +191,21 @@ impl Client {
         &self.ticket.peer
     }
 
+    fn up_link(&self) -> Option<&Link> {
+        match &self.phase {
+            Phase::Up { link } => Some(link),
+            _ => None,
+        }
+    }
+
     fn phase_deadline(&self) -> Option<Instant> {
         match &self.phase {
             Phase::Idle { at } => Some(*at),
             Phase::Opening { since, .. } | Phase::Handshaking { since, .. } => {
                 Some(*since + SETUP_TIMEOUT)
             }
-            Phase::Connecting { .. } | Phase::Up { .. } => None,
+            Phase::Up { link } => Some(link.dead_at()),
+            Phase::Connecting { .. } => None,
         }
     }
 
@@ -215,6 +226,15 @@ impl Client {
                 if now.duration_since(*since) >= SETUP_TIMEOUT =>
             {
                 self.lose("stream setup timed out");
+            }
+            Phase::Up { link } if now >= link.dead_at() => {
+                // The connection under a silent stream may be a relayed
+                // circuit the relay dropped without telling us; a stream on
+                // it would be just as dead, so start over with a fresh one.
+                self.lose("no word from the server");
+                if let Err(e) = self.endpoint.disconnect(&self.ticket.peer) {
+                    crate::debug!("disconnect: {e}");
+                }
             }
             _ => {}
         }
@@ -355,7 +375,7 @@ impl Client {
         if !link.is(peer, conn, stream) {
             return Ok(());
         }
-        link.reader.push(data);
+        link.push(data);
         loop {
             let (Phase::Handshaking { link, .. } | Phase::Up { link }) = &mut self.phase else {
                 return Ok(());

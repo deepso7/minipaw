@@ -41,6 +41,11 @@ struct Server {
     told_direct: bool,
     /// Ctrl-C or a local failure, once seen.
     stop: Option<Stop>,
+    /// Test hook (`MINIPAW_TEST_DROP_LINK_AFTER=<bytes>`): once this many
+    /// session bytes have arrived, forget the link without closing it, as
+    /// a relay that drops a circuit and tells only us would. The client
+    /// sees its stream go silent.
+    drop_link_after: Option<u64>,
 }
 
 pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
@@ -54,6 +59,13 @@ pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
     };
     net::handle_interrupt(endpoint.wait_handle())?;
     let pipe = Pipe::new(&endpoint.wait_handle());
+    let drop_link_after = match std::env::var("MINIPAW_TEST_DROP_LINK_AFTER") {
+        Ok(raw) => Some(
+            raw.parse()
+                .map_err(|e| format!("invalid MINIPAW_TEST_DROP_LINK_AFTER '{raw}': {e}"))?,
+        ),
+        Err(_) => None,
+    };
     let mut server = Server {
         endpoint,
         pipe,
@@ -64,6 +76,7 @@ pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
         lost_since: None,
         told_direct: false,
         stop: None,
+        drop_link_after,
     };
 
     eprintln!("# reserving a slot on relay {}…", relay.peer_id());
@@ -93,7 +106,11 @@ impl Server {
         loop {
             let deadline = [
                 // Pipe timers are for sending, which stops when stopping.
-                self.stop.is_none().then(|| self.pipe.deadline()).flatten(),
+                self.stop
+                    .is_none()
+                    .then(|| self.pipe.deadline(self.link.as_ref()))
+                    .flatten(),
+                self.link.as_ref().map(Link::dead_at),
                 (!announced && !warned).then(|| started + RESERVE_WARNING),
                 self.lost_since
                     .filter(|_| self.pipe.delivered())
@@ -124,6 +141,13 @@ impl Server {
                 self.on_event(event)?;
             }
             self.expire_pending();
+            if self
+                .link
+                .as_ref()
+                .is_some_and(|l| Instant::now() >= l.dead_at())
+            {
+                self.lose("no word from the client");
+            }
             if !announced && !warned && started.elapsed() >= RESERVE_WARNING {
                 warned = true;
                 eprintln!("# still no relay reservation; is the relay reachable over UDP?");
@@ -203,9 +227,18 @@ impl Server {
                 if let Some(link) = &mut self.link
                     && link.is(&peer_id, conn_id, stream_id)
                 {
-                    link.reader.push(&data);
+                    link.push(&data);
                     while let Some(frame) = link.reader.next()? {
                         self.pipe.on_frame(frame)?;
+                    }
+                    if self
+                        .drop_link_after
+                        .is_some_and(|after| self.pipe.recv_offset() >= after)
+                    {
+                        self.drop_link_after = None;
+                        crate::debug!("test hook: dropping the link without closing it");
+                        self.link = None;
+                        self.lost_since = Some(Instant::now());
                     }
                 } else {
                     self.on_pending_data((peer_id, conn_id, stream_id), &data)?;

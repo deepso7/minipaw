@@ -1,12 +1,13 @@
 //! Frames on a `/minipaw/pipe/1` stream: `[kind u8][len u32 BE][payload]`.
 //!
 //! The dialer opens every stream with `Hello`; the server answers `Welcome`.
-//! Both then exchange `Data`, `Ack`, and `Fin`. Offsets count payload bytes
-//! of the whole session, not of one stream, so a session survives its
-//! stream being replaced.
+//! Both then exchange `Data`, `Ack`, `Fin`, and `Ping`. Offsets count
+//! payload bytes of the whole session, not of one stream, so a session
+//! survives its stream being replaced. `VERSION` in `Hello` is bumped
+//! whenever a peer would misread the other's frames.
 
 pub const PROTOCOL: &str = "/minipaw/pipe/1";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 /// Largest `Data` payload we send.
 pub const MAX_DATA: usize = 32 * 1024;
@@ -20,6 +21,7 @@ const DATA: u8 = 3;
 const ACK: u8 = 4;
 const FIN: u8 = 5;
 const ERROR: u8 = 6;
+const PING: u8 = 7;
 
 pub type Token = [u8; 16];
 pub type SessionId = [u8; 16];
@@ -50,6 +52,9 @@ pub enum Frame {
     },
     /// Fatal refusal; the stream is closed after it.
     Error(String),
+    /// Keeps a quiet stream alive: each side sends one when it has sent
+    /// nothing else for a while, and any frame shows the sender is there.
+    Ping,
 }
 
 impl Frame {
@@ -76,6 +81,7 @@ impl Frame {
             }
             Frame::Fin { offset } => frame(FIN, &offset.to_be_bytes()),
             Frame::Error(message) => frame(ERROR, message.as_bytes()),
+            Frame::Ping => frame(PING, &[]),
         }
     }
 
@@ -101,6 +107,7 @@ impl Frame {
             },
             FIN => Frame::Fin { offset: r.u64()? },
             ERROR => return Ok(Frame::Error(String::from_utf8_lossy(payload).into_owned())),
+            PING => Frame::Ping,
             other => return Err(format!("unknown frame kind {other}")),
         };
         if !r.0.is_empty() {
@@ -198,6 +205,7 @@ mod tests {
             },
             Frame::Fin { offset: 5 },
             Frame::Error("busy".into()),
+            Frame::Ping,
         ];
         let bytes: Vec<u8> = frames.iter().flat_map(Frame::encode).collect();
 
@@ -222,6 +230,10 @@ mod tests {
 
         let mut reader = FrameReader::default();
         reader.push(&frame(ACK, &[0; 3]));
+        assert!(reader.next().is_err());
+
+        let mut reader = FrameReader::default();
+        reader.push(&frame(PING, &[0]));
         assert!(reader.next().is_err());
 
         let mut reader = FrameReader::default();
