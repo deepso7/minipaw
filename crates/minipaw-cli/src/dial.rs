@@ -12,8 +12,8 @@ use minip2p::{
 
 use crate::net::{self, DELIVERED_GRACE, Exit, RESUME_TIMEOUT, Stop};
 use crate::pipe::{Link, Pipe};
-use crate::ticket::Ticket;
-use crate::wire::{Frame, PROTOCOL, SessionId};
+use minipaw::ticket::Ticket;
+use minipaw::wire::{Frame, PROTOCOL, SessionId};
 
 /// Ceiling on stream negotiation plus the Hello/Welcome exchange.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);

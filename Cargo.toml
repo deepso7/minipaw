@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/minipaw-cli"]
+members = ["crates/minipaw", "crates/minipaw-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,7 @@ repository = "https://github.com/deepso7/minipaw"
 authors = ["Deepso"]
 
 [workspace.dependencies]
+minipaw = { path = "crates/minipaw", version = "0.1.0" }
 base64 = "0.23"
 ctrlc = "3"
 getrandom = "0.4"

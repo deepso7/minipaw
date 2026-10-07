@@ -1,0 +1,15 @@
+[package]
+name = "minipaw"
+description = "Pipe bytes between two machines peer to peer over minip2p: QUIC, relayed bootstrap, hole-punched direct paths"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+base64.workspace = true
+minip2p-rs.workspace = true
+
+[lints]
+workspace = true

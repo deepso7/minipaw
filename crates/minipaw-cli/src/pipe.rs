@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use minip2p::{ConnectionId, Endpoint, Error, PeerId, StreamId, TransportError, WaitHandle};
 
-use crate::session::{Inbound, Outbound};
-use crate::wire::{Frame, FrameReader, MAX_DATA};
+use minipaw::window::{Inbound, Outbound};
+use minipaw::wire::{Frame, FrameReader, MAX_DATA};
 
 /// A non-urgent ack waits this long after the first unacked write, so it
 /// covers more of them.

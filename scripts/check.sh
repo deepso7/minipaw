@@ -12,7 +12,8 @@ cd "$(dirname "$0")/.."
 . scripts/lib.sh
 
 BIN=${BIN:-target/release/minipaw}
-cargo build -q --release -p minipaw-cli --bin minipaw --example squat || exit 2
+cargo build -q --release -p minipaw-cli --bin minipaw || exit 2
+cargo build -q --release -p minipaw --example squat || exit 2
 SQUAT=target/release/examples/squat
 
 T=$(mktemp -d)

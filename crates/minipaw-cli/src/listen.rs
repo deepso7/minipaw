@@ -14,8 +14,8 @@ use minip2p::{
 
 use crate::net::{self, DELIVERED_GRACE, Exit, RESUME_TIMEOUT, Stop};
 use crate::pipe::{Link, Pipe};
-use crate::ticket::Ticket;
-use crate::wire::{Frame, FrameReader, PROTOCOL, SessionId, Token};
+use minipaw::ticket::Ticket;
+use minipaw::wire::{Frame, FrameReader, PROTOCOL, SessionId, Token};
 
 /// Inbound streams still waiting for their `Hello`.
 const MAX_PENDING: usize = 16;

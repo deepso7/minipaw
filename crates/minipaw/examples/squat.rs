@@ -1,13 +1,13 @@
 //! Test helper for `scripts/check.sh`: opens pipe streams to a minipaw server
 //! and never sends `Hello`, to check a squatter cannot lock out real clients.
 //!
-//!   cargo run --release --example squat -- <server-quic-peer-addr> <streams> <seconds>
+//!   cargo run --release -p minipaw --example squat -- <server-quic-peer-addr> <streams> <seconds>
 
 use std::time::{Duration, Instant};
 
 use minip2p::{Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr};
 
-const PROTOCOL: &str = "/minipaw/pipe/1";
+use minipaw::PROTOCOL;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);

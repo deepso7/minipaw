@@ -11,8 +11,8 @@ use minip2p::{
 };
 
 use crate::pipe::{BACKPRESSURE_RETRY, Link, Pipe, SendError};
-use crate::wire::{Frame, PROTOCOL};
 use minip2p::{ConnectionId, PeerId, StreamId};
+use minipaw::wire::{Frame, PROTOCOL};
 
 const AGENT: &str = concat!("minipaw/", env!("CARGO_PKG_VERSION"));
 
@@ -51,7 +51,7 @@ pub fn resolve_relay(flag: Option<&str>) -> Result<PeerAddr, Box<dyn Error>> {
     let relay: PeerAddr = raw
         .parse()
         .map_err(|e| format!("invalid relay address '{raw}': {e}"))?;
-    crate::ticket::check_relay(&relay)?;
+    minipaw::ticket::check_relay(&relay)?;
     if !relay.transport().is_quic_transport() {
         return Err(format!(
             "relay must be a QUIC address (…/udp/<port>/quic-v1/p2p/<id>), got '{raw}'"

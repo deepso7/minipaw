@@ -9,11 +9,8 @@ mod dial;
 mod listen;
 mod net;
 mod pipe;
-mod session;
-mod ticket;
-mod wire;
 
-use ticket::Ticket;
+use minipaw::Ticket;
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 

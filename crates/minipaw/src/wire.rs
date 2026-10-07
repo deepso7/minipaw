@@ -163,6 +163,7 @@ impl FrameReader {
         self.buf.extend_from_slice(data);
     }
 
+    #[allow(clippy::should_implement_trait)] // pub only until the session moves in
     pub fn next(&mut self) -> Result<Option<Frame>, String> {
         let rest = self.buf.get(self.head..).unwrap_or_default();
         let Some((header, body)) = rest.split_first_chunk::<HEADER_LEN>() else {

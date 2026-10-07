@@ -983,13 +983,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "minipaw-cli"
+name = "minipaw"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "minip2p-rs",
+]
+
+[[package]]
+name = "minipaw-cli"
+version = "0.1.0"
+dependencies = [
  "ctrlc",
  "getrandom",
  "minip2p-rs",
+ "minipaw",
 ]
 
 [[package]]
