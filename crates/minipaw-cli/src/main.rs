@@ -3,14 +3,19 @@
 //! control plane. Connection details travel out of band as a ticket.
 
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod dial;
+mod io;
 mod listen;
 mod net;
 mod pipe;
 
 use minipaw::Ticket;
+
+use io::Io;
+use net::Shared;
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 
@@ -88,13 +93,20 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
 fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::Help => print!("{USAGE}"),
-        Command::Listen { relay } => listen::run(net::resolve_relay(relay.as_deref())?)?,
+        Command::Listen { relay } => {
+            let relay = net::resolve_relay(relay.as_deref())?;
+            let shared = Arc::new(Shared::default());
+            net::handle_interrupt(shared.clone())?;
+            listen::run(relay, Io::stdio(), shared)?;
+        }
         Command::Dial { ticket } => {
             let relay = match &ticket.relay {
                 Some(relay) => relay.clone(),
                 None => net::resolve_relay(None)?,
             };
-            dial::run(ticket, relay)?;
+            let shared = Arc::new(Shared::default());
+            net::handle_interrupt(shared.clone())?;
+            dial::run(ticket, relay, Io::stdio(), shared)?;
         }
         Command::Parse { ticket } => {
             println!("peer:  {}", ticket.peer);

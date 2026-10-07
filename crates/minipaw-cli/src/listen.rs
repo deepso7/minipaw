@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use minip2p::{
@@ -12,7 +13,8 @@ use minip2p::{
     StreamId,
 };
 
-use crate::net::{self, DELIVERED_GRACE, Exit, RESUME_TIMEOUT, Stop};
+use crate::io::Io;
+use crate::net::{self, DELIVERED_GRACE, Exit, RESUME_TIMEOUT, Shared, Stop};
 use crate::pipe::{Link, Pipe};
 use minipaw::ticket::Ticket;
 use minipaw::wire::{Frame, FrameReader, PROTOCOL, SessionId, Token};
@@ -41,6 +43,7 @@ struct Server {
     told_direct: bool,
     /// Ctrl-C or a local failure, once seen.
     stop: Option<Stop>,
+    shared: Arc<Shared>,
     /// Test hook (`MINIPAW_TEST_DROP_LINK_AFTER=<bytes>`): once this many
     /// session bytes have arrived, forget the link without closing it, as
     /// a relay that drops a circuit and tells only us would. The client
@@ -48,7 +51,7 @@ struct Server {
     drop_link_after: Option<u64>,
 }
 
-pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
+pub fn run(relay: PeerAddr, io: Io, shared: Arc<Shared>) -> Result<(), Box<dyn Error>> {
     let endpoint = net::bind(&relay, true)?;
     let token = net::random16()?;
     let embed = net::default_relay().is_none_or(|default| default != relay);
@@ -57,8 +60,8 @@ pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
         token,
         relay: embed.then(|| relay.clone()),
     };
-    net::handle_interrupt(endpoint.wait_handle())?;
-    let pipe = Pipe::new(&endpoint.wait_handle());
+    shared.set_wake(endpoint.wait_handle());
+    let pipe = Pipe::new(&endpoint.wait_handle(), io, shared.stats.clone());
     let drop_link_after = match std::env::var("MINIPAW_TEST_DROP_LINK_AFTER") {
         Ok(raw) => Some(
             raw.parse()
@@ -76,6 +79,7 @@ pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
         lost_since: None,
         told_direct: false,
         stop: None,
+        shared,
         drop_link_after,
     };
 
@@ -157,7 +161,7 @@ impl Server {
                 if let Err(e) = self.pipe.pump(&mut self.endpoint, self.link.as_ref()) {
                     self.lose(&format!("send failed: {e}"));
                 }
-                self.stop = Stop::check(&self.pipe);
+                self.stop = Stop::check(&self.shared, &self.pipe);
             }
             if let Some(stop) = &mut self.stop {
                 // A server with no client has nobody to tell.

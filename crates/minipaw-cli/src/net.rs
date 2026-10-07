@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use minip2p::{
@@ -10,7 +11,7 @@ use minip2p::{
     ReservationPolicy,
 };
 
-use crate::pipe::{BACKPRESSURE_RETRY, Link, Pipe, SendError};
+use crate::pipe::{BACKPRESSURE_RETRY, Link, LocalFailure, Pipe, SendError, Stats};
 use minip2p::{ConnectionId, PeerId, StreamId};
 use minipaw::wire::{Frame, PROTOCOL};
 
@@ -240,16 +241,17 @@ pub struct Stop {
 
 enum StopReason {
     Interrupted,
-    Failed(String),
+    Failed(LocalFailure),
 }
 
 impl Stop {
-    /// Ctrl-C or the pipe's first local I/O error, if either happened.
-    pub fn check(pipe: &Pipe) -> Option<Stop> {
-        let reason = if interrupted() {
+    /// A stop request or the pipe's first local I/O error, if either
+    /// happened.
+    pub fn check(shared: &Shared, pipe: &Pipe) -> Option<Stop> {
+        let reason = if shared.stopped() {
             StopReason::Interrupted
         } else {
-            StopReason::Failed(pipe.failure()?)
+            StopReason::Failed(pipe.take_failure()?)
         };
         crate::debug!("stopping; telling the peer");
         Some(Stop {
@@ -360,7 +362,7 @@ pub fn finish(
             pipe.finish(Some(STDOUT_GRACE));
             Err(match stop.reason {
                 StopReason::Interrupted => Interrupted.into(),
-                StopReason::Failed(message) => message.into(),
+                StopReason::Failed(failure) => failure.into(),
             })
         }
         Err(e) if e.is::<PeerEnded>() => {
@@ -395,23 +397,54 @@ impl fmt::Display for Interrupted {
 
 impl Error for Interrupted {}
 
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+/// State a session shares with other threads: stop requests and progress.
+#[derive(Default)]
+pub struct Shared {
+    stop: AtomicBool,
+    /// Wakes the session's `Endpoint::wait`, once it has an endpoint.
+    wake: Mutex<Option<minip2p::WaitHandle>>,
+    pub stats: Arc<Stats>,
+}
 
-/// Routes Ctrl-C to the event loop: the first sets [`interrupted`] and wakes
-/// `wait`; a second exits on the spot.
-pub fn handle_interrupt(wake: minip2p::WaitHandle) -> Result<(), Box<dyn Error>> {
+impl Shared {
+    /// Asks the session to stop and wakes it. Returns whether a stop was
+    /// already requested.
+    pub fn stop(&self) -> bool {
+        let was = self.stop.swap(true, Ordering::SeqCst);
+        if let Ok(wake) = self.wake.lock()
+            && let Some(wake) = wake.as_ref()
+        {
+            wake.interrupt();
+        }
+        was
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// Lets [`stop`](Self::stop) wake the session's endpoint. A stop that
+    /// came first wakes it now, so the loop sees it at once.
+    pub fn set_wake(&self, wake: minip2p::WaitHandle) {
+        if let Ok(mut slot) = self.wake.lock() {
+            *slot = Some(wake.clone());
+        }
+        if self.stopped() {
+            wake.interrupt();
+        }
+    }
+}
+
+/// Routes Ctrl-C to the session: the first asks it to stop; a second exits
+/// on the spot.
+pub fn handle_interrupt(shared: Arc<Shared>) -> Result<(), Box<dyn Error>> {
     ctrlc::set_handler(move || {
-        if INTERRUPTED.swap(true, Ordering::SeqCst) {
+        if shared.stop() {
             std::process::exit(130);
         }
-        wake.interrupt();
     })
     .map_err(|e| format!("installing the Ctrl-C handler: {e}"))?;
     Ok(())
-}
-
-pub fn interrupted() -> bool {
-    INTERRUPTED.load(Ordering::SeqCst)
 }
 
 /// The peer ended the session (an `Error` frame). Nothing is owed back, so

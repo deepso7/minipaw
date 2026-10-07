@@ -3,6 +3,7 @@
 //! that resumes on a fresh stream whenever the current one dies.
 
 use std::error::Error;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use minip2p::{
@@ -10,7 +11,8 @@ use minip2p::{
     Multiaddr, NatEvent, PeerAddr, PeerId, StreamId,
 };
 
-use crate::net::{self, DELIVERED_GRACE, Exit, RESUME_TIMEOUT, Stop};
+use crate::io::Io;
+use crate::net::{self, DELIVERED_GRACE, Exit, RESUME_TIMEOUT, Shared, Stop};
 use crate::pipe::{Link, Pipe};
 use minipaw::ticket::Ticket;
 use minipaw::wire::{Frame, PROTOCOL, SessionId};
@@ -60,15 +62,21 @@ struct Client {
     told_direct: bool,
     /// Ctrl-C or a local failure, once seen.
     stop: Option<Stop>,
+    shared: Arc<Shared>,
     /// Test hook (`MINIPAW_DIRECT`): a server address to dial alongside the
     /// relay, for benchmarks and paths hole punching cannot find.
     direct: Option<PeerAddr>,
 }
 
-pub fn run(ticket: Ticket, relay: PeerAddr) -> Result<(), Box<dyn Error>> {
+pub fn run(
+    ticket: Ticket,
+    relay: PeerAddr,
+    io: Io,
+    shared: Arc<Shared>,
+) -> Result<(), Box<dyn Error>> {
     let endpoint = net::bind(&relay, false)?;
-    net::handle_interrupt(endpoint.wait_handle())?;
-    let pipe = Pipe::new(&endpoint.wait_handle());
+    shared.set_wake(endpoint.wait_handle());
+    let pipe = Pipe::new(&endpoint.wait_handle(), io, shared.stats.clone());
     let direct = match std::env::var("MINIPAW_DIRECT") {
         Ok(raw) => {
             let addr: Multiaddr = raw
@@ -94,6 +102,7 @@ pub fn run(ticket: Ticket, relay: PeerAddr) -> Result<(), Box<dyn Error>> {
         hello_sent: false,
         told_direct: false,
         stop: None,
+        shared,
         direct,
     };
 
@@ -154,7 +163,7 @@ impl Client {
                 if let Err(e) = self.pipe.pump(&mut self.endpoint, link) {
                     self.lose(&format!("send failed: {e}"));
                 }
-                self.stop = Stop::check(&self.pipe);
+                self.stop = Stop::check(&self.shared, &self.pipe);
             }
             if let Some(stop) = &mut self.stop {
                 // From Hello on the server may hold our session, so the news

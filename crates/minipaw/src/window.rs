@@ -40,8 +40,14 @@ pub struct Outbound {
 }
 
 impl Outbound {
-    fn end(&self) -> u64 {
+    /// Session offset just past the last byte taken from local input.
+    pub fn end(&self) -> u64 {
         self.acked + self.buf.len() as u64
+    }
+
+    /// Session bytes the peer has acknowledged writing.
+    pub fn acked(&self) -> u64 {
+        self.acked
     }
 
     pub fn has_room(&self) -> bool {

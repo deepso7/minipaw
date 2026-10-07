@@ -9,7 +9,8 @@
 //! claiming a complete transfer.
 
 use std::cell::Cell;
-use std::io::{ErrorKind, IsTerminal as _, Read as _, Write as _};
+use std::fmt;
+use std::io::{ErrorKind, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -20,6 +21,8 @@ use minip2p::{ConnectionId, Endpoint, Error, PeerId, StreamId, TransportError, W
 
 use minipaw::window::{Inbound, Outbound};
 use minipaw::wire::{Frame, FrameReader, MAX_DATA};
+
+use crate::io::Io;
 
 /// A non-urgent ack waits this long after the first unacked write, so it
 /// covers more of them.
@@ -134,19 +137,74 @@ enum Input {
     Eof,
 }
 
+/// Keeps a value on its own cache line, so threads updating neighbours do
+/// not contend for it.
+#[derive(Default)]
+#[repr(align(128))]
+pub struct CachePadded<T>(pub T);
+
+/// Session byte counters, for progress reports. The session thread keeps
+/// all but `written` with relaxed stores; the output thread counts
+/// `written`, and acks report it, so it is read with `Acquire`.
+#[derive(Default)]
+pub struct Stats {
+    /// Bytes taken from local input.
+    pub read: AtomicU64,
+    /// Of those, bytes the peer has confirmed writing.
+    pub acked: AtomicU64,
+    /// Bytes received from the peer.
+    pub received: AtomicU64,
+    /// Of those, bytes written to local output.
+    pub written: CachePadded<AtomicU64>,
+}
+
+/// A local I/O error that ends the session.
+#[derive(Debug)]
+pub enum LocalFailure {
+    /// Reading local input failed.
+    Read(std::io::Error),
+    /// Writing local output failed (a closed reader is not a failure).
+    Write(std::io::Error),
+}
+
+impl fmt::Display for LocalFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LocalFailure::Read(e) => write!(f, "reading stdin: {e}"),
+            LocalFailure::Write(e) => write!(f, "writing stdout: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for LocalFailure {}
+
+#[derive(Default)]
+struct FailureSlot {
+    /// Whether any failure happened, even once taken.
+    hit: bool,
+    first: Option<LocalFailure>,
+}
+
 /// The first local I/O error either helper thread hit.
 #[derive(Clone, Default)]
-struct Failure(Arc<Mutex<Option<String>>>);
+struct Failure(Arc<Mutex<FailureSlot>>);
 
 impl Failure {
-    fn set(&self, message: String) {
-        if let Ok(mut slot) = self.0.lock() {
-            slot.get_or_insert(message);
+    fn set(&self, failure: LocalFailure) {
+        if let Ok(mut slot) = self.0.lock()
+            && !slot.hit
+        {
+            slot.hit = true;
+            slot.first = Some(failure);
         }
     }
 
-    fn get(&self) -> Option<String> {
-        self.0.lock().ok().and_then(|slot| slot.clone())
+    fn is_set(&self) -> bool {
+        self.0.lock().is_ok_and(|slot| slot.hit)
+    }
+
+    fn take(&self) -> Option<LocalFailure> {
+        self.0.lock().ok().and_then(|mut slot| slot.first.take())
     }
 }
 
@@ -162,7 +220,7 @@ pub struct Pipe {
     writer: Option<JoinHandle<()>>,
     /// Signals once the writer has flushed and exited.
     writer_done: Receiver<()>,
-    written: Arc<AtomicU64>,
+    stats: Arc<Stats>,
     failure: Failure,
     ack_due: Option<Instant>,
     /// Sends paused by backpressure until then.
@@ -170,16 +228,21 @@ pub struct Pipe {
 }
 
 impl Pipe {
-    pub fn new(wake: &WaitHandle) -> Self {
+    pub fn new(wake: &WaitHandle, io: Io, stats: Arc<Stats>) -> Self {
+        let Io {
+            input,
+            output,
+            close_on_peer_fin,
+        } = io;
         let failure = Failure::default();
         let (stdin_tx, stdin) = mpsc::sync_channel(8);
-        spawn_stdin(stdin_tx, failure.clone(), wake.clone());
+        spawn_input(input, stdin_tx, failure.clone(), wake.clone());
         let (stdout, stdout_rx) = mpsc::channel();
         let (done_tx, writer_done) = mpsc::channel();
-        let written = Arc::new(AtomicU64::new(0));
-        let writer = spawn_stdout(
+        let writer = spawn_output(
+            output,
             stdout_rx,
-            written.clone(),
+            stats.clone(),
             failure.clone(),
             done_tx,
             wake.clone(),
@@ -189,15 +252,19 @@ impl Pipe {
             inb: Inbound::default(),
             stdin,
             stdin_open: true,
-            close_on_peer_fin: std::io::stdin().is_terminal(),
+            close_on_peer_fin,
             stdout: Some(stdout),
             writer: Some(writer),
             writer_done,
-            written,
+            stats,
             failure,
             ack_due: None,
             blocked_until: None,
         }
+    }
+
+    fn written(&self) -> u64 {
+        self.stats.written.0.load(Ordering::Acquire)
     }
 
     /// Session bytes received so far: the resume point we announce.
@@ -216,7 +283,7 @@ impl Pipe {
         crate::debug!(
             "resuming: peer has {peer_recv} bytes of ours, we have {} of theirs ({} written)",
             self.inb.recv,
-            self.written.load(Ordering::Acquire)
+            self.written()
         );
         self.out.rewind(peer_recv)?;
         self.inb.resume();
@@ -228,18 +295,21 @@ impl Pipe {
     pub fn on_frame(&mut self, frame: Frame) -> Result<(), Box<dyn std::error::Error>> {
         match frame {
             Frame::Data(data) => {
-                self.inb
-                    .on_data(data.len(), self.written.load(Ordering::Acquire))?;
+                self.inb.on_data(data.len(), self.written())?;
+                self.stats.received.store(self.inb.recv, Ordering::Relaxed);
                 // A writer that stopped on a local error has already
                 // reported it; what still arrives has nowhere to go.
                 if let Some(stdout) = &self.stdout
                     && stdout.send(data).is_err()
-                    && self.failure.get().is_none()
+                    && !self.failure.is_set()
                 {
                     return Err("stdout writer exited".into());
                 }
             }
-            Frame::Ack { offset, fin } => self.out.ack(offset, fin)?,
+            Frame::Ack { offset, fin } => {
+                self.out.ack(offset, fin)?;
+                self.stats.acked.store(self.out.acked(), Ordering::Relaxed);
+            }
             Frame::Fin { offset } => {
                 self.inb.on_fin(offset)?;
                 if self.close_on_peer_fin {
@@ -296,7 +366,7 @@ impl Pipe {
         link: &Link,
         now: Instant,
     ) -> Result<(), SendError> {
-        let written = self.written.load(Ordering::Acquire);
+        let written = self.written();
         if self.inb.ack_pending(written) {
             if self.inb.ack_urgent(written) || self.ack_due.is_some_and(|due| now >= due) {
                 let (offset, fin) = self.inb.ack(written);
@@ -330,7 +400,10 @@ impl Pipe {
     fn pull_stdin(&mut self) {
         while self.stdin_open && self.out.has_room() {
             match self.stdin.try_recv() {
-                Ok(Input::Data(data)) => self.out.push(&data),
+                Ok(Input::Data(data)) => {
+                    self.out.push(&data);
+                    self.stats.read.store(self.out.end(), Ordering::Relaxed);
+                }
                 Ok(Input::Eof) | Err(TryRecvError::Disconnected) => {
                     self.stdin_open = false;
                     self.out.close();
@@ -351,20 +424,19 @@ impl Pipe {
         })
     }
 
-    /// A local I/O error that ends the session.
-    pub fn failure(&self) -> Option<String> {
-        self.failure.get()
+    /// The local I/O error that ends the session, if one happened and was
+    /// not already taken.
+    pub fn take_failure(&self) -> Option<LocalFailure> {
+        self.failure.take()
     }
 
     fn peer_finished(&self) -> bool {
-        self.inb
-            .fin
-            .is_some_and(|fin| fin == self.written.load(Ordering::Acquire))
+        self.inb.fin.is_some_and(|fin| fin == self.written())
     }
 
     /// Both directions are complete and confirmed.
     pub fn done(&self) -> bool {
-        self.inb.finished(self.written.load(Ordering::Acquire)) && self.out.fin_acked
+        self.inb.finished(self.written()) && self.out.fin_acked
     }
 
     /// Both directions' data is confirmed: everything the peer sent is
@@ -394,17 +466,21 @@ impl Pipe {
     }
 }
 
-fn spawn_stdin(tx: SyncSender<Input>, failure: Failure, wake: WaitHandle) {
+fn spawn_input(
+    mut reader: Box<dyn Read + Send>,
+    tx: SyncSender<Input>,
+    failure: Failure,
+    wake: WaitHandle,
+) {
     thread::spawn(move || {
-        let mut stdin = std::io::stdin().lock();
         let mut buf = vec![0u8; MAX_DATA];
         loop {
-            let input = match stdin.read(&mut buf) {
+            let input = match reader.read(&mut buf) {
                 Ok(0) => Input::Eof,
                 Ok(n) => Input::Data(buf.get(..n).unwrap_or_default().to_vec()),
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => {
-                    failure.set(format!("reading stdin: {e}"));
+                    failure.set(LocalFailure::Read(e));
                     wake.interrupt();
                     return;
                 }
@@ -421,28 +497,31 @@ fn spawn_stdin(tx: SyncSender<Input>, failure: Failure, wake: WaitHandle) {
     });
 }
 
-fn spawn_stdout(
+fn spawn_output(
+    mut output: Box<dyn Write + Send>,
     rx: Receiver<Vec<u8>>,
-    written: Arc<AtomicU64>,
+    stats: Arc<Stats>,
     failure: Failure,
     done: Sender<()>,
     wake: WaitHandle,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let mut stdout = std::io::stdout().lock();
         let mut closed = false;
         for data in rx {
             // A reader that went away (`| head`) wants no more output, like
             // netcat: keep counting so the session still finishes.
-            if !closed && let Err(e) = stdout.write_all(&data).and_then(|()| stdout.flush()) {
+            if !closed && let Err(e) = output.write_all(&data).and_then(|()| output.flush()) {
                 if e.kind() != ErrorKind::BrokenPipe {
-                    failure.set(format!("writing stdout: {e}"));
+                    failure.set(LocalFailure::Write(e));
                     wake.interrupt();
                     break;
                 }
                 closed = true;
             }
-            written.fetch_add(data.len() as u64, Ordering::Release);
+            stats
+                .written
+                .0
+                .fetch_add(data.len() as u64, Ordering::Release);
             wake.interrupt();
         }
         // The receiver is gone once the session has ended.
