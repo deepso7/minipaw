@@ -4,9 +4,9 @@
 
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 mod dial;
+mod event;
 mod io;
 mod listen;
 mod net;
@@ -14,23 +14,65 @@ mod pipe;
 
 use minipaw::Ticket;
 
+use event::{Event, Events};
 use io::Io;
 use net::Shared;
 
-static VERBOSE: AtomicBool = AtomicBool::new(false);
+/// Prints the session's log records to stderr: diagnostics as `# …` lines,
+/// warnings and errors as `minipaw: …`.
+struct PlainLogger;
 
-pub fn verbose() -> bool {
-    VERBOSE.load(Ordering::Relaxed)
+impl PlainLogger {
+    /// Installs the logger: debug records with `-v`, warnings and errors
+    /// otherwise.
+    fn install(verbose: bool) {
+        static LOGGER: PlainLogger = PlainLogger;
+        if log::set_logger(&LOGGER).is_ok() {
+            log::set_max_level(if verbose {
+                log::LevelFilter::Debug
+            } else {
+                log::LevelFilter::Warn
+            });
+        }
+    }
 }
 
-/// Prints a `#`-prefixed diagnostic to stderr under `-v`.
-#[macro_export]
-macro_rules! debug {
-    ($($arg:tt)*) => {
-        if $crate::verbose() {
-            eprintln!("# {}", format_args!($($arg)*));
+impl log::Log for PlainLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        let target = metadata.target();
+        metadata.level() <= log::max_level()
+            && (target == "minipaw" || target.starts_with("minipaw::"))
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
         }
-    };
+        match record.level() {
+            log::Level::Error | log::Level::Warn => eprintln!("minipaw: {}", record.args()),
+            _ => eprintln!("# {}", record.args()),
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// Prints a session's events as today's `#` status lines.
+fn print_event(event: Event) {
+    match event {
+        Event::Reserving { relay } => eprintln!("# reserving a slot on relay {relay}…"),
+        Event::Listening { ticket } => {
+            eprintln!("# 🐾 listening; connect with:\nminipaw {ticket}");
+        }
+        Event::ReservationSlow => {
+            eprintln!("# still no relay reservation; is the relay reachable over UDP?");
+        }
+        Event::ReservationLost => eprintln!("# lost the relay reservation; reacquiring"),
+        Event::Accepted { peer, path } => eprintln!("# connection from {peer} ({path})"),
+        Event::Connected { path, .. } => eprintln!("# connected ({path})"),
+        Event::Upgraded => eprintln!("# upgraded to a direct connection"),
+        Event::Connecting { .. } | Event::LinkLost { .. } | Event::Resumed | Event::Stopping => {}
+    }
 }
 
 const USAGE: &str = "\
@@ -49,6 +91,11 @@ OPTIONS:
     -h, --help            Show this help
 ";
 
+struct Args {
+    command: Command,
+    verbose: bool,
+}
+
 enum Command {
     Listen { relay: Option<String> },
     Dial { ticket: Ticket },
@@ -56,14 +103,23 @@ enum Command {
     Help,
 }
 
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    let mut verbose = false;
+    let command = parse_command(args, &mut verbose)?;
+    Ok(Args { command, verbose })
+}
+
+fn parse_command(
+    args: impl IntoIterator<Item = String>,
+    verbose: &mut bool,
+) -> Result<Command, String> {
     let mut relay = None;
     let mut positional = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
-            "-v" | "--verbose" => VERBOSE.store(true, Ordering::Relaxed),
+            "-v" | "--verbose" => *verbose = true,
             "--relay" => relay = Some(args.next().ok_or("--relay requires a value")?),
             flag if flag.starts_with("--relay=") => {
                 relay = flag.strip_prefix("--relay=").map(str::to_owned);
@@ -97,7 +153,7 @@ fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
             let relay = net::resolve_relay(relay.as_deref())?;
             let shared = Arc::new(Shared::default());
             net::handle_interrupt(shared.clone())?;
-            listen::run(relay, Io::stdio(), shared)?;
+            listen::run(relay, Io::stdio(), shared, Events::new(print_event))?;
         }
         Command::Dial { ticket } => {
             let relay = match &ticket.relay {
@@ -106,7 +162,7 @@ fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
             };
             let shared = Arc::new(Shared::default());
             net::handle_interrupt(shared.clone())?;
-            dial::run(ticket, relay, Io::stdio(), shared)?;
+            dial::run(ticket, relay, Io::stdio(), shared, Events::new(print_event))?;
         }
         Command::Parse { ticket } => {
             println!("peer:  {}", ticket.peer);
@@ -120,13 +176,14 @@ fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> ExitCode {
-    let command = match parse_args(std::env::args().skip(1)) {
-        Ok(command) => command,
+    let Args { command, verbose } = match parse_args(std::env::args().skip(1)) {
+        Ok(args) => args,
         Err(e) => {
             eprintln!("minipaw: {e}\n\n{USAGE}");
             return ExitCode::from(2);
         }
     };
+    PlainLogger::install(verbose);
     match run(command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if e.is::<net::Interrupted>() => ExitCode::from(130),

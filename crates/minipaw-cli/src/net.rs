@@ -85,7 +85,7 @@ pub fn bind(relay: &PeerAddr, reserve: bool) -> Result<Endpoint, Box<dyn Error>>
         .bind()?;
     // Bound addresses are the local half of the hole-punch candidates.
     for addr in endpoint.listen_all()? {
-        crate::debug!("bound {addr}");
+        log::debug!("bound {addr}");
     }
     Ok(endpoint)
 }
@@ -101,10 +101,6 @@ pub fn is_direct(endpoint: &Endpoint, peer: &minip2p::PeerId) -> bool {
     !matches!(endpoint.path(peer), Some(Path::Relayed { .. }))
 }
 
-pub fn path_label(direct: bool) -> &'static str {
-    if direct { "direct" } else { "via relay" }
-}
-
 pub fn path_name(path: &Path) -> &'static str {
     match path {
         Path::DirectDialed => "direct",
@@ -114,40 +110,40 @@ pub fn path_name(path: &Path) -> &'static str {
 }
 
 pub fn log_event(event: &EndpointEvent) {
-    if !crate::verbose() {
+    if !log::log_enabled!(log::Level::Debug) {
         return;
     }
     match event {
         EndpointEvent::ConnectionEstablished { peer_id, conn_id } => {
-            crate::debug!("connected to {peer_id} ({conn_id:?})");
+            log::debug!("connected to {peer_id} ({conn_id:?})");
         }
         EndpointEvent::ConnectionClosed { peer_id, conn_id } => {
-            crate::debug!("disconnected from {peer_id} ({conn_id:?})");
+            log::debug!("disconnected from {peer_id} ({conn_id:?})");
         }
         EndpointEvent::ConnectionReplaced { peer_id, old, new } => {
-            crate::debug!("connection to {peer_id} replaced ({old:?} -> {new:?})");
+            log::debug!("connection to {peer_id} replaced ({old:?} -> {new:?})");
         }
         EndpointEvent::ConnectSettled { outcome, .. } => {
-            crate::debug!("connect attempt settled: {outcome:?}");
+            log::debug!("connect attempt settled: {outcome:?}");
         }
         EndpointEvent::Nat(nat) => match nat {
-            NatEvent::RelayReserved { relay, .. } => crate::debug!("reserved on relay {relay}"),
+            NatEvent::RelayReserved { relay, .. } => log::debug!("reserved on relay {relay}"),
             NatEvent::RelayReservationLost { relay } => {
-                crate::debug!("reservation on relay {relay} lost");
+                log::debug!("reservation on relay {relay} lost");
             }
             NatEvent::PathEstablished { path, .. }
             | NatEvent::InboundPathEstablished { path, .. } => {
-                crate::debug!("path established: {}", path_name(path));
+                log::debug!("path established: {}", path_name(path));
             }
-            NatEvent::PathUpgraded { to, .. } => crate::debug!("path upgraded: {}", path_name(to)),
-            NatEvent::InboundDirectUpgrade { .. } => crate::debug!("path upgraded: direct"),
+            NatEvent::PathUpgraded { to, .. } => log::debug!("path upgraded: {}", path_name(to)),
+            NatEvent::InboundDirectUpgrade { .. } => log::debug!("path upgraded: direct"),
             NatEvent::HolePunchFailed {
                 attempt, reason, ..
-            } => crate::debug!("hole punch attempt {attempt} failed: {reason}"),
-            NatEvent::FellBackToRelay { .. } => crate::debug!("staying on the relay"),
-            other => crate::debug!("{other:?}"),
+            } => log::debug!("hole punch attempt {attempt} failed: {reason}"),
+            NatEvent::FellBackToRelay { .. } => log::debug!("staying on the relay"),
+            other => log::debug!("{other:?}"),
         },
-        EndpointEvent::Error(error) => crate::debug!("endpoint error: {error:?}"),
+        EndpointEvent::Error(error) => log::debug!("endpoint error: {error:?}"),
         _ => {}
     }
 }
@@ -171,14 +167,14 @@ fn flush(endpoint: &mut Endpoint) {
 fn close(mut endpoint: Endpoint) {
     flush(&mut endpoint);
     if let Err(e) = endpoint.close() {
-        crate::debug!("close endpoint: {e}");
+        log::debug!("close endpoint: {e}");
     }
 }
 
 pub fn linger_and_close(mut endpoint: Endpoint, link: Option<Link>) {
     if let Some(link) = link {
         if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
-            crate::debug!("close stream: {e}");
+            log::debug!("close stream: {e}");
         }
         let deadline = Instant::now() + LINGER;
         loop {
@@ -253,7 +249,7 @@ impl Stop {
         } else {
             StopReason::Failed(pipe.take_failure()?)
         };
-        crate::debug!("stopping; telling the peer");
+        log::debug!("stopping; telling the peer");
         Some(Stop {
             reason,
             by: Instant::now() + ABORT_GRACE,
@@ -314,7 +310,7 @@ impl Stop {
         match link.try_send(endpoint, &Frame::Error(self.message().into())) {
             Ok(()) => {
                 if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
-                    crate::debug!("close stream: {e}");
+                    log::debug!("close stream: {e}");
                 }
                 self.told.push(key);
                 Ok(false)
@@ -479,10 +475,10 @@ fn abort(
     let mut told: Vec<Link> = Vec::new();
     let tell = |endpoint: &mut Endpoint, told: &mut Vec<Link>, link: Link| {
         if let Err(e) = link.send(endpoint, &error) {
-            crate::debug!("abort not sent: {e}");
+            log::debug!("abort not sent: {e}");
         }
         if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
-            crate::debug!("close stream: {e}");
+            log::debug!("close stream: {e}");
         }
         told.push(link);
     };

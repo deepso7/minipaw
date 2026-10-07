@@ -996,6 +996,7 @@ version = "0.1.0"
 dependencies = [
  "ctrlc",
  "getrandom",
+ "log",
  "minip2p-rs",
  "minipaw",
 ]

@@ -127,7 +127,7 @@ impl Link {
     /// Drops the stream and any events still buffered for it.
     pub fn abandon(self, endpoint: &mut Endpoint) {
         if let Err(e) = endpoint.abandon_stream(&self.peer, self.conn, self.stream) {
-            crate::debug!("abandon stream {}: {e}", self.stream);
+            log::debug!("abandon stream {}: {e}", self.stream);
         }
     }
 }
@@ -280,7 +280,7 @@ impl Pipe {
     /// A new stream is attached and the peer has received `peer_recv`
     /// bytes: resend from there, and re-ack on the new stream.
     pub fn attach(&mut self, peer_recv: u64) -> Result<(), String> {
-        crate::debug!(
+        log::debug!(
             "resuming: peer has {peer_recv} bytes of ours, we have {} of theirs ({} written)",
             self.inb.recv,
             self.written()
@@ -461,7 +461,7 @@ impl Pipe {
             return;
         }
         if writer.join().is_err() {
-            eprintln!("minipaw: stdout writer panicked");
+            log::error!("stdout writer panicked");
         }
     }
 }

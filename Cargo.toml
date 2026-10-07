@@ -14,6 +14,7 @@ minipaw = { path = "crates/minipaw", version = "0.1.0" }
 base64 = "0.23"
 ctrlc = "3"
 getrandom = "0.4"
+log = "0.4"
 minip2p-rs = { version = "0.7.4", features = ["nat"] }
 
 [workspace.lints.rust]
