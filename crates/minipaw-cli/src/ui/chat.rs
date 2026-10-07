@@ -42,6 +42,8 @@ const TICK: Duration = Duration::from_millis(100);
 /// Terminal events handled per refresh at most, so a big paste cannot
 /// starve the rest of the loop.
 const MAX_KEYS_PER_TICK: usize = 1024;
+/// Received bytes taken in per tick; see [`Chat::drain`].
+const MAX_OUTPUT_PER_TICK: usize = 256 * 1024;
 
 /// The width of the `peer› ` label column.
 const LABEL_WIDTH: usize = 6;
@@ -403,7 +405,14 @@ impl Chat {
                 }
             }
         }
-        while let Ok(chunk) = output_rx.try_recv() {
+        // A bounded share per tick, so a peer streaming faster than we can
+        // sanitise cannot starve keys and redraws; the rest waits in the
+        // bounded channel, which slows the peer through acks.
+        let mut taken = 0;
+        while taken < MAX_OUTPUT_PER_TICK
+            && let Ok(chunk) = output_rx.try_recv()
+        {
+            taken += chunk.len();
             for line in self.splitter.push(&chunk) {
                 self.push(Who::Peer, line);
             }

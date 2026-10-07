@@ -72,9 +72,13 @@ pub fn choose_mode(plain: bool) -> Mode {
         return mode;
     }
     match term::size() {
-        Some((cols, rows)) if cols >= MIN_SIZE.0 && rows >= MIN_SIZE.1 => mode,
-        _ => Mode::Plain,
+        Some((cols, rows)) if cols >= MIN_SIZE.0 && rows >= MIN_SIZE.1 => {}
+        _ => return Mode::Plain,
     }
+    if mode == Mode::Chat && !term::raw_mode_works() {
+        return Mode::Plain;
+    }
+    mode
 }
 
 /// Everything needed to start the session, whatever the mode.

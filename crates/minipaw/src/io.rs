@@ -6,6 +6,14 @@ use std::io::{IsTerminal as _, Read, Write};
 /// bytes from the peer are written to `output`.
 ///
 /// Each runs on its own helper thread, so both may block.
+///
+/// A blocking read cannot be cancelled, so the input thread can outlive
+/// [`Session::run`](crate::Session::run): it stays parked in `read` until
+/// that returns, then sees the session is gone and exits without using
+/// what it read. With a reader you own, end it once `run` returns (for a
+/// socket, `shutdown`; for a channel, drop the sender). With
+/// [`Io::stdio`], the thread may take one more chunk of stdin, so run one
+/// stdio session per process.
 pub struct Io {
     pub(crate) input: Box<dyn Read + Send>,
     pub(crate) output: Box<dyn Write + Send>,

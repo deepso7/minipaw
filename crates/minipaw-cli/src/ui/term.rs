@@ -38,6 +38,13 @@ pub fn enable_raw_mode() -> io::Result<()> {
     Ok(())
 }
 
+/// Whether raw mode can be turned on, leaving it off. Chat mode checks this
+/// before the session starts, so a terminal that refuses falls back to
+/// plain mode instead of ending a session already under way.
+pub fn raw_mode_works() -> bool {
+    terminal::enable_raw_mode().is_ok() && terminal::disable_raw_mode().is_ok()
+}
+
 /// Switches stderr's terminal to the alternate screen, for [`restore`] to
 /// undo.
 pub fn enter_alternate_screen() -> io::Result<()> {
