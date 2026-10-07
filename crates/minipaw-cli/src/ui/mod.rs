@@ -76,6 +76,9 @@ pub fn choose_mode(plain: bool) -> Mode {
         _ => return Mode::Plain,
     }
     if mode == Mode::Chat && !term::raw_mode_works() {
+        // If raw mode went on but would not go off, retry now: plain mode
+        // needs the terminal's Ctrl-C to raise SIGINT.
+        term::restore();
         return Mode::Plain;
     }
     mode
