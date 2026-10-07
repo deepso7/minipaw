@@ -17,13 +17,43 @@ const PREFIX: &str = "mp";
 const VERSION: u8 = 1;
 const EMBEDDED_RELAY: u8 = 1;
 
+/// What a dialer needs to reach a listener: its peer id, a secret token,
+/// and the relay it is reachable through. Its text form starts with `mp`;
+/// parse one with [`str::parse`].
+///
+/// Anyone holding a ticket can connect, until the listener has a peer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ticket {
-    pub peer: PeerId,
-    pub token: Token,
+    pub(crate) peer: PeerId,
+    pub(crate) token: Token,
     /// `None` means the built-in default relay.
-    pub relay: Option<PeerAddr>,
+    pub(crate) relay: Option<PeerAddr>,
 }
+
+impl Ticket {
+    /// The listener's peer id.
+    pub fn peer(&self) -> &PeerId {
+        &self.peer
+    }
+
+    /// The relay the listener is reachable through, or `None` for
+    /// [`DEFAULT_RELAY`](crate::DEFAULT_RELAY).
+    pub fn relay(&self) -> Option<&PeerAddr> {
+        self.relay.as_ref()
+    }
+}
+
+/// Why a string is not a valid [`Ticket`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TicketError(String);
+
+impl fmt::Display for TicketError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TicketError {}
 
 impl fmt::Display for Ticket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -43,7 +73,7 @@ impl fmt::Display for Ticket {
 const MAX_FIELD: usize = u8::MAX as usize;
 
 /// Whether `relay` fits in a ticket; check before printing one.
-pub fn check_relay(relay: &PeerAddr) -> Result<(), String> {
+pub(crate) fn check_relay(relay: &PeerAddr) -> Result<(), String> {
     let len = relay.to_multiaddr().to_bytes().len();
     if len > MAX_FIELD {
         return Err(format!(
@@ -59,50 +89,54 @@ fn push_field(raw: &mut Vec<u8>, field: &[u8]) {
 }
 
 impl FromStr for Ticket {
-    type Err = String;
+    type Err = TicketError;
 
-    fn from_str(s: &str) -> Result<Self, String> {
-        let body = s
-            .trim()
-            .strip_prefix(PREFIX)
-            .ok_or_else(|| format!("not a minipaw address (expected a '{PREFIX}' prefix)"))?;
-        let raw = B64
-            .decode(body)
-            .map_err(|e| format!("invalid minipaw address: {e}"))?;
-        let mut r = raw.as_slice();
-
-        let [version, flags, rest @ ..] = r else {
-            return Err("minipaw address is truncated".into());
-        };
-        if *version != VERSION {
-            return Err(format!("unsupported minipaw address version {version}"));
-        }
-        r = rest;
-        let (token, rest) = r
-            .split_first_chunk::<16>()
-            .ok_or("minipaw address is truncated")?;
-        r = rest;
-        let peer = PeerId::from_bytes(take_field(&mut r)?)
-            .map_err(|e| format!("invalid peer id in minipaw address: {e}"))?;
-        let relay = if flags & EMBEDDED_RELAY != 0 {
-            let addr = Multiaddr::from_bytes(take_field(&mut r)?)
-                .map_err(|e| format!("invalid relay in minipaw address: {e}"))?;
-            Some(
-                PeerAddr::from_multiaddr(&addr)
-                    .map_err(|e| format!("invalid relay in minipaw address: {e}"))?,
-            )
-        } else {
-            None
-        };
-        if !r.is_empty() {
-            return Err("minipaw address has trailing bytes".into());
-        }
-        Ok(Ticket {
-            peer,
-            token: *token,
-            relay,
-        })
+    fn from_str(s: &str) -> Result<Self, TicketError> {
+        parse(s).map_err(TicketError)
     }
+}
+
+fn parse(s: &str) -> Result<Ticket, String> {
+    let body = s
+        .trim()
+        .strip_prefix(PREFIX)
+        .ok_or_else(|| format!("not a minipaw address (expected a '{PREFIX}' prefix)"))?;
+    let raw = B64
+        .decode(body)
+        .map_err(|e| format!("invalid minipaw address: {e}"))?;
+    let mut r = raw.as_slice();
+
+    let [version, flags, rest @ ..] = r else {
+        return Err("minipaw address is truncated".into());
+    };
+    if *version != VERSION {
+        return Err(format!("unsupported minipaw address version {version}"));
+    }
+    r = rest;
+    let (token, rest) = r
+        .split_first_chunk::<16>()
+        .ok_or("minipaw address is truncated")?;
+    r = rest;
+    let peer = PeerId::from_bytes(take_field(&mut r)?)
+        .map_err(|e| format!("invalid peer id in minipaw address: {e}"))?;
+    let relay = if flags & EMBEDDED_RELAY != 0 {
+        let addr = Multiaddr::from_bytes(take_field(&mut r)?)
+            .map_err(|e| format!("invalid relay in minipaw address: {e}"))?;
+        Some(
+            PeerAddr::from_multiaddr(&addr)
+                .map_err(|e| format!("invalid relay in minipaw address: {e}"))?,
+        )
+    } else {
+        None
+    };
+    if !r.is_empty() {
+        return Err("minipaw address has trailing bytes".into());
+    }
+    Ok(Ticket {
+        peer,
+        token: *token,
+        relay,
+    })
 }
 
 fn take_field<'a>(r: &mut &'a [u8]) -> Result<&'a [u8], String> {

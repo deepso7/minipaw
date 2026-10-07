@@ -2,8 +2,8 @@
 
 use std::fmt;
 
+use crate::Ticket;
 use minip2p::PeerId;
-use minipaw::Ticket;
 
 /// How the connection to the peer is routed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +39,6 @@ impl PathKind {
 /// thread.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-#[allow(dead_code)] // Fields only UIs read; the plain printer does not.
 pub enum Event {
     /// The listener is asking `relay` for a slot.
     Reserving {

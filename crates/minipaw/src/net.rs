@@ -2,8 +2,6 @@
 
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use minip2p::{
@@ -11,15 +9,12 @@ use minip2p::{
     ReservationPolicy,
 };
 
-use crate::pipe::{BACKPRESSURE_RETRY, Link, LocalFailure, Pipe, SendError, Stats};
+use crate::pipe::{BACKPRESSURE_RETRY, Link, LocalFailure, Pipe, SendError};
+use crate::session::{Outcome, Shared};
+use crate::wire::{Frame, PROTOCOL};
 use minip2p::{ConnectionId, PeerId, StreamId};
-use minipaw::wire::{Frame, PROTOCOL};
 
 const AGENT: &str = concat!("minipaw/", env!("CARGO_PKG_VERSION"));
-
-/// The relay a ticket without an embedded relay goes through, unless
-/// `--relay` or `MINIPAW_RELAY` names another.
-pub const DEFAULT_RELAY: &str = "/dns/relay.minip2p.com/udp/19876/quic-v1/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf";
 
 /// How long either side keeps trying to get a lost stream back.
 pub const RESUME_TIMEOUT: Duration = Duration::from_secs(60);
@@ -28,52 +23,29 @@ pub const LINGER: Duration = Duration::from_secs(2);
 /// With all data confirmed but the stream lost, how long we keep the
 /// session open so the peer can resume and collect our last ack.
 pub const DELIVERED_GRACE: Duration = Duration::from_secs(10);
-/// On Ctrl-C or an error, how long we wait for a blocked stdout to drain.
+/// On a stop or an error, how long we wait for a blocked output to drain.
 const STDOUT_GRACE: Duration = Duration::from_secs(1);
-/// After Ctrl-C or a local failure, how long we try to tell the peer: first
+/// After a stop request or a local failure, how long we try to tell the peer: first
 /// waiting for a stream if the session is between streams, then for the
 /// peer to confirm it got the news.
 pub const ABORT_GRACE: Duration = Duration::from_secs(3);
 
-pub fn default_relay() -> Option<PeerAddr> {
-    DEFAULT_RELAY.parse().ok()
-}
-
-/// Resolves `--relay`, then `MINIPAW_RELAY`, then the built-in default.
-pub fn resolve_relay(flag: Option<&str>) -> Result<PeerAddr, Box<dyn Error>> {
-    let env = std::env::var("MINIPAW_RELAY").ok();
-    let raw = flag
-        .or(env.as_deref())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_RELAY);
-    if raw.is_empty() {
-        return Err("no relay configured: pass --relay <multiaddr> or set MINIPAW_RELAY".into());
-    }
-    let relay: PeerAddr = raw
-        .parse()
-        .map_err(|e| format!("invalid relay address '{raw}': {e}"))?;
-    minipaw::ticket::check_relay(&relay)?;
-    if !relay.transport().is_quic_transport() {
-        return Err(format!(
-            "relay must be a QUIC address (…/udp/<port>/quic-v1/p2p/<id>), got '{raw}'"
-        )
-        .into());
-    }
-    Ok(relay)
-}
-
 /// QUIC on every interface, the pipe protocol, and NAT traversal through
 /// `relay`. Servers hold a reservation there to be reachable; clients only
-/// open circuits through it, then hole-punch with DCUtR.
-pub fn bind(relay: &PeerAddr, reserve: bool) -> Result<Endpoint, Box<dyn Error>> {
+/// open circuits through it, then hole-punch with DCUtR. `force_relay`
+/// keeps to the relay: no direct dials or hole punching.
+pub fn bind(
+    relay: &PeerAddr,
+    reserve: bool,
+    force_relay: bool,
+) -> Result<Endpoint, Box<dyn Error>> {
     let nat = NatConfig {
         reservation_policy: if reserve {
             ReservationPolicy::Always
         } else {
             ReservationPolicy::Never
         },
-        // Test hook: relay only, no direct dials or hole punching.
-        force_relay: std::env::var_os("MINIPAW_FORCE_RELAY").is_some(),
+        force_relay,
         ..NatConfig::default()
     };
     let mut endpoint = Endpoint::builder()
@@ -213,7 +185,7 @@ pub enum Exit {
     /// All data in both directions is confirmed, but the stream is gone and
     /// the peer did not come back for our last ack.
     Delivered,
-    /// Ctrl-C or a local failure.
+    /// A stop request or a local failure.
     Stopped(Stop),
 }
 
@@ -330,8 +302,8 @@ impl Stop {
 }
 
 /// Ends a session however it ended: tells the peer when it should know,
-/// flushes stdout (bounded when the session did not complete), and maps the
-/// outcome to `run`'s result.
+/// flushes the output (bounded when the session did not complete), and
+/// maps the outcome to `run`'s result.
 ///
 /// `peer` is the other end of the session, once there is one.
 pub fn finish(
@@ -340,16 +312,16 @@ pub fn finish(
     link: Option<Link>,
     peer: Option<PeerId>,
     exit: Result<Exit, Box<dyn Error>>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Outcome, crate::Error> {
     match exit {
         Ok(Exit::Done) => {
             pipe.finish(None);
             linger_and_close(endpoint, link);
-            Ok(())
+            Ok(Outcome::Done)
         }
         Ok(Exit::Delivered) => {
             pipe.finish(None);
-            Ok(())
+            Ok(Outcome::Delivered)
         }
         Ok(Exit::Stopped(stop)) => {
             // The loop already told the peer, or gave up trying.
@@ -357,15 +329,16 @@ pub fn finish(
             close(endpoint);
             pipe.finish(Some(STDOUT_GRACE));
             Err(match stop.reason {
-                StopReason::Interrupted => Interrupted.into(),
-                StopReason::Failed(failure) => failure.into(),
+                StopReason::Interrupted => crate::Error::Stopped,
+                StopReason::Failed(LocalFailure::Read(e)) => crate::Error::Input(e),
+                StopReason::Failed(LocalFailure::Write(e)) => crate::Error::Output(e),
             })
         }
         Err(e) if e.is::<PeerEnded>() => {
             pipe.finish(Some(STDOUT_GRACE));
             // Half-closing back confirms to the peer that its Error landed.
             linger_and_close(endpoint, link);
-            Err(e)
+            Err(crate::Error::from_internal(e))
         }
         Err(e) => {
             abort(
@@ -376,72 +349,22 @@ pub fn finish(
                 Instant::now() + ABORT_GRACE,
             );
             pipe.finish(Some(STDOUT_GRACE));
-            Err(e)
+            Err(crate::Error::from_internal(e))
         }
     }
 }
 
-/// The error `main` turns into exit status 130, silently.
+/// The peer went away and did not come back in time.
 #[derive(Debug)]
-pub struct Interrupted;
+pub struct Disconnected(pub &'static str);
 
-impl fmt::Display for Interrupted {
+impl fmt::Display for Disconnected {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("interrupted")
+        f.write_str(self.0)
     }
 }
 
-impl Error for Interrupted {}
-
-/// State a session shares with other threads: stop requests and progress.
-#[derive(Default)]
-pub struct Shared {
-    stop: AtomicBool,
-    /// Wakes the session's `Endpoint::wait`, once it has an endpoint.
-    wake: Mutex<Option<minip2p::WaitHandle>>,
-    pub stats: Arc<Stats>,
-}
-
-impl Shared {
-    /// Asks the session to stop and wakes it. Returns whether a stop was
-    /// already requested.
-    pub fn stop(&self) -> bool {
-        let was = self.stop.swap(true, Ordering::SeqCst);
-        if let Ok(wake) = self.wake.lock()
-            && let Some(wake) = wake.as_ref()
-        {
-            wake.interrupt();
-        }
-        was
-    }
-
-    pub fn stopped(&self) -> bool {
-        self.stop.load(Ordering::SeqCst)
-    }
-
-    /// Lets [`stop`](Self::stop) wake the session's endpoint. A stop that
-    /// came first wakes it now, so the loop sees it at once.
-    pub fn set_wake(&self, wake: minip2p::WaitHandle) {
-        if let Ok(mut slot) = self.wake.lock() {
-            *slot = Some(wake.clone());
-        }
-        if self.stopped() {
-            wake.interrupt();
-        }
-    }
-}
-
-/// Routes Ctrl-C to the session: the first asks it to stop; a second exits
-/// on the spot.
-pub fn handle_interrupt(shared: Arc<Shared>) -> Result<(), Box<dyn Error>> {
-    ctrlc::set_handler(move || {
-        if shared.stop() {
-            std::process::exit(130);
-        }
-    })
-    .map_err(|e| format!("installing the Ctrl-C handler: {e}"))?;
-    Ok(())
-}
+impl Error for Disconnected {}
 
 /// The peer ended the session (an `Error` frame). Nothing is owed back, so
 /// we just leave.

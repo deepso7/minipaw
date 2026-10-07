@@ -15,9 +15,7 @@ doc = false
 [dependencies]
 minipaw.workspace = true
 ctrlc.workspace = true
-getrandom.workspace = true
 log.workspace = true
-minip2p-rs.workspace = true
 
 [lints]
 workspace = true

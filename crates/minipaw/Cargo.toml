@@ -6,9 +6,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
+keywords = ["p2p", "netcat", "quic", "hole-punching", "relay"]
+categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
 base64.workspace = true
+getrandom.workspace = true
+log.workspace = true
 minip2p-rs.workspace = true
 
 [lints]

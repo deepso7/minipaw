@@ -6,7 +6,9 @@
 //! survives its stream being replaced. `VERSION` in `Hello` is bumped
 //! whenever a peer would misread the other's frames.
 
+/// The libp2p protocol id of a minipaw session stream.
 pub const PROTOCOL: &str = "/minipaw/pipe/1";
+/// The session protocol version a `Hello` carries; peers must match.
 pub const VERSION: u8 = 2;
 
 /// Largest `Data` payload we send.
@@ -163,7 +165,6 @@ impl FrameReader {
         self.buf.extend_from_slice(data);
     }
 
-    #[allow(clippy::should_implement_trait)] // pub only until the session moves in
     pub fn next(&mut self) -> Result<Option<Frame>, String> {
         let rest = self.buf.get(self.head..).unwrap_or_default();
         let Some((header, body)) = rest.split_first_chunk::<HEADER_LEN>() else {

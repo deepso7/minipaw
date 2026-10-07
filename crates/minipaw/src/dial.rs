@@ -8,15 +8,17 @@ use std::time::{Duration, Instant};
 
 use minip2p::{
     ConnectId, ConnectOutcome, ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome,
-    Multiaddr, NatEvent, PeerAddr, PeerId, StreamId,
+    NatEvent, PeerAddr, PeerId, StreamId,
 };
 
+use crate::config::Config;
 use crate::event::{Event, Events, PathKind};
 use crate::io::Io;
-use crate::net::{self, DELIVERED_GRACE, Exit, RESUME_TIMEOUT, Shared, Stop};
+use crate::net::{self, DELIVERED_GRACE, Disconnected, Exit, RESUME_TIMEOUT, Stop};
 use crate::pipe::{Link, Pipe};
-use minipaw::ticket::Ticket;
-use minipaw::wire::{Frame, PROTOCOL, SessionId};
+use crate::session::{Outcome, Shared};
+use crate::ticket::Ticket;
+use crate::wire::{Frame, PROTOCOL, SessionId};
 
 /// Ceiling on stream negotiation plus the Hello/Welcome exchange.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -61,43 +63,43 @@ struct Client {
     hello_sent: bool,
     /// The user has been told the session runs on a direct path.
     told_direct: bool,
-    /// Ctrl-C or a local failure, once seen.
+    /// A stop request or a local failure, once seen.
     stop: Option<Stop>,
     shared: Arc<Shared>,
     events: Events,
-    /// Test hook (`MINIPAW_DIRECT`): a server address to dial alongside the
+    /// Test hook ([`Config::direct`]): a server address to dial alongside the
     /// relay, for benchmarks and paths hole punching cannot find.
     direct: Option<PeerAddr>,
 }
 
+/// Runs a dialer's session to `ticket`'s listener through `relay`.
 pub fn run(
     ticket: Ticket,
     relay: PeerAddr,
+    config: &Config,
     io: Io,
     shared: Arc<Shared>,
     events: Events,
-) -> Result<(), Box<dyn Error>> {
-    let endpoint = net::bind(&relay, false)?;
+) -> Result<Outcome, crate::Error> {
+    let direct = match &config.direct {
+        Some(addr) => Some(
+            PeerAddr::new(addr.clone(), ticket.peer.clone()).map_err(|e| {
+                crate::Error::Config(format!("invalid direct address '{addr}': {e}"))
+            })?,
+        ),
+        None => None,
+    };
+    let endpoint =
+        net::bind(&relay, false, config.force_relay).map_err(crate::Error::from_internal)?;
+    let session = net::random16().map_err(crate::Error::from_internal)?;
     shared.set_wake(endpoint.wait_handle());
     let pipe = Pipe::new(&endpoint.wait_handle(), io, shared.stats.clone());
-    let direct = match std::env::var("MINIPAW_DIRECT") {
-        Ok(raw) => {
-            let addr: Multiaddr = raw
-                .parse()
-                .map_err(|e| format!("invalid MINIPAW_DIRECT '{raw}': {e}"))?;
-            Some(
-                PeerAddr::new(addr, ticket.peer.clone())
-                    .map_err(|e| format!("invalid MINIPAW_DIRECT '{raw}': {e}"))?,
-            )
-        }
-        Err(_) => None,
-    };
     let now = Instant::now();
     let mut client = Client {
         endpoint,
         pipe,
         ticket,
-        session: net::random16()?,
+        session,
         phase: Phase::Idle { at: now },
         backoff: Duration::ZERO,
         lost_since: Some(now),
@@ -230,11 +232,12 @@ impl Client {
         if let Some(since) = self.lost_since
             && now.duration_since(since) >= RESUME_TIMEOUT
         {
-            return Err(if self.was_up {
-                "lost the connection to the server".into()
+            return Err(Disconnected(if self.was_up {
+                "lost the connection to the server"
             } else {
-                "could not reach the server".into()
-            });
+                "could not reach the server"
+            })
+            .into());
         }
         match &self.phase {
             Phase::Idle { at } if now >= *at => self.start(),

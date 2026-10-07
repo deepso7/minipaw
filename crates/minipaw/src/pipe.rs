@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use minip2p::{ConnectionId, Endpoint, Error, PeerId, StreamId, TransportError, WaitHandle};
 
-use minipaw::window::{Inbound, Outbound};
-use minipaw::wire::{Frame, FrameReader, MAX_DATA};
+use crate::window::{Inbound, Outbound};
+use crate::wire::{Frame, FrameReader, MAX_DATA};
 
 use crate::io::Io;
 
@@ -170,8 +170,8 @@ pub enum LocalFailure {
 impl fmt::Display for LocalFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LocalFailure::Read(e) => write!(f, "reading stdin: {e}"),
-            LocalFailure::Write(e) => write!(f, "writing stdout: {e}"),
+            LocalFailure::Read(e) => write!(f, "reading input: {e}"),
+            LocalFailure::Write(e) => write!(f, "writing output: {e}"),
         }
     }
 }

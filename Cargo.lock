@@ -987,6 +987,8 @@ name = "minipaw"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "getrandom",
+ "log",
  "minip2p-rs",
 ]
 
@@ -995,9 +997,7 @@ name = "minipaw-cli"
 version = "0.1.0"
 dependencies = [
  "ctrlc",
- "getrandom",
  "log",
- "minip2p-rs",
  "minipaw",
 ]
 

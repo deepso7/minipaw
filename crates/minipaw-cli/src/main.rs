@@ -3,20 +3,9 @@
 //! control plane. Connection details travel out of band as a ticket.
 
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-mod dial;
-mod event;
-mod io;
-mod listen;
-mod net;
-mod pipe;
-
-use minipaw::Ticket;
-
-use event::{Event, Events};
-use io::Io;
-use net::Shared;
+use minipaw::{Config, Event, Handle, Io, Multiaddr, PeerAddr, Session, Ticket};
 
 /// Prints the session's log records to stderr: diagnostics as `# …` lines,
 /// warnings and errors as `minipaw: …`.
@@ -57,7 +46,7 @@ impl log::Log for PlainLogger {
     fn flush(&self) {}
 }
 
-/// Prints a session's events as today's `#` status lines.
+/// Prints a session's events as `#` status lines.
 fn print_event(event: Event) {
     match event {
         Event::Reserving { relay } => eprintln!("# reserving a slot on relay {relay}…"),
@@ -71,7 +60,8 @@ fn print_event(event: Event) {
         Event::Accepted { peer, path } => eprintln!("# connection from {peer} ({path})"),
         Event::Connected { path, .. } => eprintln!("# connected ({path})"),
         Event::Upgraded => eprintln!("# upgraded to a direct connection"),
-        Event::Connecting { .. } | Event::LinkLost { .. } | Event::Resumed | Event::Stopping => {}
+        // Connecting, LinkLost, Resumed and Stopping have no line; -v covers them.
+        _ => {}
     }
 }
 
@@ -131,10 +121,10 @@ fn parse_command(
     match positional.as_slice() {
         [] => Ok(Command::Listen { relay }),
         [cmd, ticket] if cmd == "parse" => Ok(Command::Parse {
-            ticket: ticket.parse()?,
+            ticket: ticket.parse().map_err(|e| format!("{e}"))?,
         }),
         [ticket] => {
-            let ticket: Ticket = ticket.parse()?;
+            let ticket: Ticket = ticket.parse().map_err(|e| format!("{e}"))?;
             if relay.is_some() {
                 return Err(
                     "--relay only applies when listening; tickets carry their relay".into(),
@@ -146,27 +136,90 @@ fn parse_command(
     }
 }
 
+/// `--relay`, else `MINIPAW_RELAY`; `None` means the built-in default.
+fn relay_setting(flag: Option<&str>) -> Result<Option<PeerAddr>, minipaw::Error> {
+    let env = std::env::var("MINIPAW_RELAY").ok();
+    flag.or(env.as_deref())
+        .filter(|s| !s.is_empty())
+        .map(minipaw::parse_relay)
+        .transpose()
+}
+
+/// The settings both modes share, from the environment.
+fn base_config() -> Config {
+    let mut config = Config::default();
+    // Test hook: relay only, no direct dials or hole punching.
+    config.force_relay = std::env::var_os("MINIPAW_FORCE_RELAY").is_some();
+    config
+}
+
+/// Test hook: a server address to dial alongside the relay, for benchmarks
+/// and paths hole punching cannot find.
+fn direct_setting(ticket: &Ticket) -> Result<Option<Multiaddr>, String> {
+    let Ok(raw) = std::env::var("MINIPAW_DIRECT") else {
+        return Ok(None);
+    };
+    let addr: Multiaddr = raw
+        .parse()
+        .map_err(|e| format!("invalid MINIPAW_DIRECT '{raw}': {e}"))?;
+    PeerAddr::new(addr.clone(), ticket.peer().clone())
+        .map_err(|e| format!("invalid MINIPAW_DIRECT '{raw}': {e}"))?;
+    Ok(Some(addr))
+}
+
+/// Test hook: the server forgets its stream after this many bytes.
+fn drop_link_setting() -> Result<Option<u64>, String> {
+    match std::env::var("MINIPAW_TEST_DROP_LINK_AFTER") {
+        Ok(raw) => raw
+            .parse()
+            .map(Some)
+            .map_err(|e| format!("invalid MINIPAW_TEST_DROP_LINK_AFTER '{raw}': {e}")),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Routes Ctrl-C to the session: the first stops it, telling the peer; a
+/// second exits on the spot.
+fn handle_interrupt(handle: Handle) -> Result<(), String> {
+    static PRESSED: AtomicBool = AtomicBool::new(false);
+    ctrlc::set_handler(move || {
+        if PRESSED.swap(true, Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+        handle.stop();
+    })
+    .map_err(|e| format!("installing the Ctrl-C handler: {e}"))
+}
+
+/// Runs a session with stdio and the plain status printer.
+fn run_session(session: Session) -> Result<(), Box<dyn std::error::Error>> {
+    let session = session.on_event(print_event);
+    handle_interrupt(session.handle())?;
+    session.run()?;
+    Ok(())
+}
+
 fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::Help => print!("{USAGE}"),
         Command::Listen { relay } => {
-            let relay = net::resolve_relay(relay.as_deref())?;
-            let shared = Arc::new(Shared::default());
-            net::handle_interrupt(shared.clone())?;
-            listen::run(relay, Io::stdio(), shared, Events::new(print_event))?;
+            let mut config = base_config();
+            config.relay = relay_setting(relay.as_deref())?;
+            config.test_drop_link_after = drop_link_setting()?;
+            run_session(minipaw::listen(config, Io::stdio()))?;
         }
         Command::Dial { ticket } => {
-            let relay = match &ticket.relay {
-                Some(relay) => relay.clone(),
-                None => net::resolve_relay(None)?,
-            };
-            let shared = Arc::new(Shared::default());
-            net::handle_interrupt(shared.clone())?;
-            dial::run(ticket, relay, Io::stdio(), shared, Events::new(print_event))?;
+            let mut config = base_config();
+            // Tickets carry their relay; only one without needs ours.
+            if ticket.relay().is_none() {
+                config.relay = relay_setting(None)?;
+            }
+            config.direct = direct_setting(&ticket)?;
+            run_session(minipaw::dial(ticket, config, Io::stdio()))?;
         }
         Command::Parse { ticket } => {
-            println!("peer:  {}", ticket.peer);
-            match &ticket.relay {
+            println!("peer:  {}", ticket.peer());
+            match ticket.relay() {
                 Some(relay) => println!("relay: {relay}"),
                 None => println!("relay: (default)"),
             }
@@ -184,12 +237,14 @@ fn main() -> ExitCode {
         }
     };
     PlainLogger::install(verbose);
-    match run(command) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) if e.is::<net::Interrupted>() => ExitCode::from(130),
-        Err(e) => {
-            eprintln!("minipaw: {e}");
-            ExitCode::FAILURE
-        }
+    let Err(e) = run(command) else {
+        return ExitCode::SUCCESS;
+    };
+    match e.downcast_ref::<minipaw::Error>() {
+        Some(minipaw::Error::Stopped) => return ExitCode::from(130),
+        Some(minipaw::Error::Input(e)) => eprintln!("minipaw: reading stdin: {e}"),
+        Some(minipaw::Error::Output(e)) => eprintln!("minipaw: writing stdout: {e}"),
+        _ => eprintln!("minipaw: {e}"),
     }
+    ExitCode::FAILURE
 }

@@ -13,12 +13,14 @@ use minip2p::{
     StreamId,
 };
 
+use crate::config::Config;
 use crate::event::{Event, Events, PathKind};
 use crate::io::Io;
-use crate::net::{self, DELIVERED_GRACE, Exit, RESUME_TIMEOUT, Shared, Stop};
+use crate::net::{self, DELIVERED_GRACE, Disconnected, Exit, RESUME_TIMEOUT, Stop};
 use crate::pipe::{Link, Pipe};
-use minipaw::ticket::Ticket;
-use minipaw::wire::{Frame, FrameReader, PROTOCOL, SessionId, Token};
+use crate::session::{Outcome, Shared};
+use crate::ticket::Ticket;
+use crate::wire::{Frame, FrameReader, PROTOCOL, SessionId, Token};
 
 /// Inbound streams still waiting for their `Hello`.
 const MAX_PENDING: usize = 16;
@@ -42,26 +44,29 @@ struct Server {
     lost_since: Option<Instant>,
     /// The user has been told the client is on a direct path.
     told_direct: bool,
-    /// Ctrl-C or a local failure, once seen.
+    /// A stop request or a local failure, once seen.
     stop: Option<Stop>,
     shared: Arc<Shared>,
     events: Events,
-    /// Test hook (`MINIPAW_TEST_DROP_LINK_AFTER=<bytes>`): once this many
+    /// Test hook ([`Config::test_drop_link_after`]): once this many
     /// session bytes have arrived, forget the link without closing it, as
     /// a relay that drops a circuit and tells only us would. The client
     /// sees its stream go silent.
     drop_link_after: Option<u64>,
 }
 
+/// Runs a listener's session through `relay`.
 pub fn run(
     relay: PeerAddr,
+    config: &Config,
     io: Io,
     shared: Arc<Shared>,
     events: Events,
-) -> Result<(), Box<dyn Error>> {
-    let endpoint = net::bind(&relay, true)?;
-    let token = net::random16()?;
-    let embed = net::default_relay().is_none_or(|default| default != relay);
+) -> Result<Outcome, crate::Error> {
+    let endpoint =
+        net::bind(&relay, true, config.force_relay).map_err(crate::Error::from_internal)?;
+    let token = net::random16().map_err(crate::Error::from_internal)?;
+    let embed = crate::config::default_relay().is_none_or(|default| default != relay);
     let ticket = Ticket {
         peer: endpoint.peer_id().clone(),
         token,
@@ -69,13 +74,7 @@ pub fn run(
     };
     shared.set_wake(endpoint.wait_handle());
     let pipe = Pipe::new(&endpoint.wait_handle(), io, shared.stats.clone());
-    let drop_link_after = match std::env::var("MINIPAW_TEST_DROP_LINK_AFTER") {
-        Ok(raw) => Some(
-            raw.parse()
-                .map_err(|e| format!("invalid MINIPAW_TEST_DROP_LINK_AFTER '{raw}': {e}"))?,
-        ),
-        Err(_) => None,
-    };
+    let drop_link_after = config.test_drop_link_after;
     let mut server = Server {
         endpoint,
         pipe,
@@ -199,7 +198,7 @@ impl Server {
                     return Ok(Exit::Delivered);
                 }
                 if since.elapsed() >= RESUME_TIMEOUT {
-                    return Err("client disconnected and did not come back".into());
+                    return Err(Disconnected("client disconnected and did not come back").into());
                 }
             }
         }
