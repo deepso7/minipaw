@@ -1,5 +1,7 @@
 # minipaw
 
+[![CI](https://github.com/deepso7/minipaw/actions/workflows/ci.yml/badge.svg)](https://github.com/deepso7/minipaw/actions/workflows/ci.yml)
+
 Pipe stdin/stdout between two machines, peer to peer — like netcat, but it
 gets through NATs, needs no accounts, and every byte is end-to-end encrypted.
 

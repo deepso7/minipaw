@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The relay the end-to-end checks run against; keep in step with the
+  # minip2p-rs version in Cargo.toml.
+  MINIP2P_REF: v0.7.4
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache relay
+        id: relay-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/relay-bin
+          key: minip2p-relay-${{ runner.os }}-${{ env.MINIP2P_REF }}
+      - name: Build relay
+        if: steps.relay-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$MINIP2P_REF" https://github.com/deepso7/minip2p "$RUNNER_TEMP/minip2p"
+          cargo build --release --manifest-path "$RUNNER_TEMP/minip2p/Cargo.toml" -p minip2p-relay-server-example
+          mkdir -p "$RUNNER_TEMP/relay-bin"
+          cp "$RUNNER_TEMP/minip2p/target/release/minip2p-relay" "$RUNNER_TEMP/relay-bin/"
+
+      - run: cargo test
+      - name: End-to-end checks
+        run: scripts/check.sh
+        env:
+          MINIP2P_RELAY: ${{ runner.temp }}/relay-bin/minip2p-relay
+          SHOW_LOGS: "1"
