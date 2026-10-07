@@ -71,8 +71,10 @@ transfer() { # transfer <up-bytes> <down-bytes>
   [ "$client$server" = 00 ] || { fail "exit codes client=$client server=$server"; return 1; }
 }
 
+# Sized to finish well inside the timeout on a relayed path too: CI's macOS
+# runners cannot hole-punch and get about 300 KB/s through the hosted relay.
 check_transfer() {
-  transfer 30000000 10000000 && pass "30 MB up, 10 MB down"
+  transfer 10000000 5000000 && pass "10 MB up, 5 MB down"
 }
 
 check_forced_relay() {
