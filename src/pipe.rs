@@ -8,6 +8,7 @@
 //! [`Pipe::failure`] reports it so the session ends nonzero rather than
 //! claiming a complete transfer.
 
+use std::cell::Cell;
 use std::io::{ErrorKind, IsTerminal as _, Read as _, Write as _};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
@@ -26,6 +27,12 @@ const ACK_DELAY: Duration = Duration::from_millis(10);
 /// minip2p has no writable event, so a full send buffer is retried after
 /// this pause.
 pub const BACKPRESSURE_RETRY: Duration = Duration::from_millis(5);
+/// A link that has sent nothing for this long sends a `Ping`.
+const PING_INTERVAL: Duration = Duration::from_secs(3);
+/// A link that has heard nothing for this long is dead. minip2p does not
+/// always report a relayed circuit closing on one side (deepso7/minip2p#306),
+/// so without this a session could wait on a dead stream for ever.
+const DEAD_AFTER: Duration = Duration::from_secs(10);
 
 pub enum SendError {
     /// The stream's send buffer is full; the frame was not queued.
@@ -51,16 +58,38 @@ pub struct Link {
     pub conn: ConnectionId,
     pub stream: StreamId,
     pub reader: FrameReader,
+    /// When the peer last sent anything on this stream.
+    heard: Instant,
+    /// When we last queued a frame on it.
+    sent: Cell<Instant>,
 }
 
 impl Link {
     pub fn new(peer: PeerId, conn: ConnectionId, stream: StreamId) -> Self {
+        let now = Instant::now();
         Link {
             peer,
             conn,
             stream,
             reader: FrameReader::default(),
+            heard: now,
+            sent: Cell::new(now),
         }
+    }
+
+    /// Takes data the peer sent on this stream.
+    pub fn push(&mut self, data: &[u8]) {
+        self.heard = Instant::now();
+        self.reader.push(data);
+    }
+
+    /// When the link counts as dead unless the peer is heard from.
+    pub fn dead_at(&self) -> Instant {
+        self.heard + DEAD_AFTER
+    }
+
+    fn ping_at(&self) -> Instant {
+        self.sent.get() + PING_INTERVAL
     }
 
     pub fn is(&self, peer: &PeerId, conn: ConnectionId, stream: StreamId) -> bool {
@@ -76,7 +105,9 @@ impl Link {
                 } else {
                     SendError::Dead(e.to_string())
                 }
-            })
+            })?;
+        self.sent.set(Instant::now());
+        Ok(())
     }
 
     /// Sends a frame that must go out now, such as a handshake.
@@ -220,6 +251,8 @@ impl Pipe {
                 ))
                 .into());
             }
+            // Hearing it is all that matters, and `Link::push` saw to that.
+            Frame::Ping => {}
             Frame::Hello { .. } | Frame::Welcome { .. } => {
                 return Err("unexpected handshake frame mid-session".into());
             }
@@ -285,6 +318,9 @@ impl Pipe {
             link.try_send(endpoint, &Frame::Fin { offset })?;
             self.out.mark_fin_sent();
         }
+        if now >= link.ping_at() {
+            link.try_send(endpoint, &Frame::Ping)?;
+        }
         Ok(())
     }
 
@@ -301,10 +337,15 @@ impl Pipe {
         }
     }
 
-    /// When `pump` next has timed work: a backpressure retry, or else a
-    /// delayed ack (which cannot go out while sends are blocked anyway).
-    pub fn deadline(&self) -> Option<Instant> {
-        self.blocked_until.or(self.ack_due)
+    /// When `pump` next has timed work on `link`: a backpressure retry, or
+    /// else a delayed ack or a ping (which cannot go out while sends are
+    /// blocked anyway).
+    pub fn deadline(&self, link: Option<&Link>) -> Option<Instant> {
+        let link = link?;
+        self.blocked_until.or_else(|| {
+            let ping = link.ping_at();
+            Some(self.ack_due.map_or(ping, |due| due.min(ping)))
+        })
     }
 
     /// A local I/O error that ends the session.

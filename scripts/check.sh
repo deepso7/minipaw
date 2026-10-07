@@ -99,6 +99,18 @@ check_resume() {
   pass "2 MB up, 0.5 MB down across $circuits relay circuits"
 }
 
+# A relay that drops a circuit may tell only one side (minip2p#306). The
+# server forgets its link after 1 MB without closing it; the client must
+# notice the silence, reconnect, and finish the session where it left off.
+check_heartbeat() {
+  MINIPAW_TEST_DROP_LINK_AFTER=1000000 transfer 3000000 1000000 || return
+  grep -q "test hook: dropping the link" "$T/server.err" ||
+    { fail "the server never dropped its link"; return; }
+  grep -q "no word from the server" "$T/client.err" ||
+    { fail "the client never noticed the silence"; return; }
+  pass "client noticed a silent link and resumed: 3 MB up, 1 MB down"
+}
+
 # Ctrl-C on one side ends both: it exits 130, the peer exits 1, promptly.
 # With `both`, both sides are interrupted at once and both exit 130.
 interrupt() { # interrupt <client|server|blocked|both>
@@ -296,7 +308,7 @@ check_closed_reader() {
   pass "both exit 0"
 }
 
-ALL="transfer forced_relay resume interrupt_client interrupt_server interrupt_blocked
+ALL="transfer forced_relay resume heartbeat interrupt_client interrupt_server interrupt_blocked
 interrupt_both wrong_token busy squatters stdin_error stdout_error closed_reader"
 if [ "${1:-}" = list ]; then
   echo $ALL

@@ -64,6 +64,8 @@ any error (including the other side hitting one), `130` on Ctrl-C.
 - **Resumable sessions.** If the connection drops — a relay cutting a
   circuit, a path upgrade, a network blip — the client reconnects and both
   sides resume from the last byte the other received, for up to 60 seconds.
+  A quiet session pings every few seconds, so a connection that dies
+  without a word is noticed within 10 seconds too.
 - **Backpressure.** The receiver acknowledges bytes only once they are
   written to its stdout, so a slow reader slows the sender instead of
   filling memory.
@@ -106,6 +108,8 @@ this). `resume` still needs a relay binary, since it starts its own relay
 with circuit limits; `check.sh` skips it when there is none. Benchmark results
 accumulate in `bench/results.tsv`, one row per run with the commit.
 
-Two environment variables exist for testing only:
-`MINIPAW_FORCE_RELAY=1` disables direct connections, and
-`MINIPAW_DIRECT=<multiaddr>` makes the client also dial the server directly.
+A few environment variables exist for testing only:
+`MINIPAW_FORCE_RELAY=1` disables direct connections,
+`MINIPAW_DIRECT=<multiaddr>` makes the client also dial the server directly,
+and `MINIPAW_TEST_DROP_LINK_AFTER=<bytes>` makes the server go silent on its
+stream once, after that many bytes.
