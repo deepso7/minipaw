@@ -34,13 +34,20 @@ pub enum Frame {
         recv: u64,
     },
     /// Server → dialer: how many session bytes the server has received.
-    Welcome { recv: u64 },
+    Welcome {
+        recv: u64,
+    },
     Data(Vec<u8>),
     /// Cumulative count of bytes the receiver has consumed; `fin` once it
     /// has consumed everything up to the sender's `Fin`.
-    Ack { offset: u64, fin: bool },
+    Ack {
+        offset: u64,
+        fin: bool,
+    },
     /// The sender will write nothing past `offset`.
-    Fin { offset: u64 },
+    Fin {
+        offset: u64,
+    },
     /// Fatal refusal; the stream is closed after it.
     Error(String),
 }
@@ -157,7 +164,9 @@ impl FrameReader {
         let [kind, len @ ..] = *header;
         let len = u32::from_be_bytes(len) as usize;
         if len > MAX_PAYLOAD {
-            return Err(format!("frame of {len} bytes exceeds the {MAX_PAYLOAD} byte limit"));
+            return Err(format!(
+                "frame of {len} bytes exceeds the {MAX_PAYLOAD} byte limit"
+            ));
         }
         let Some(payload) = body.get(..len) else {
             return Ok(None);

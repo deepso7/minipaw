@@ -39,6 +39,20 @@ impl fmt::Display for Ticket {
     }
 }
 
+/// Ticket fields carry a one-byte length.
+const MAX_FIELD: usize = u8::MAX as usize;
+
+/// Whether `relay` fits in a ticket; check before printing one.
+pub fn check_relay(relay: &PeerAddr) -> Result<(), String> {
+    let len = relay.to_multiaddr().to_bytes().len();
+    if len > MAX_FIELD {
+        return Err(format!(
+            "relay address is {len} bytes encoded; tickets fit at most {MAX_FIELD}"
+        ));
+    }
+    Ok(())
+}
+
 fn push_field(raw: &mut Vec<u8>, field: &[u8]) {
     raw.push(u8::try_from(field.len()).unwrap_or(u8::MAX));
     raw.extend_from_slice(field);
@@ -134,6 +148,19 @@ mod tests {
             relay: None,
         };
         assert!(ticket.to_string().len() <= 80, "{ticket}");
+    }
+
+    #[test]
+    fn oversized_relays_are_rejected() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let addr = |host: &str| -> PeerAddr {
+            format!("/dns/{host}/udp/19876/quic-v1/p2p/{peer}")
+                .parse()
+                .unwrap()
+        };
+        assert!(check_relay(&addr("relay.example.com")).is_ok());
+        let long = format!("{}.com", "a".repeat(240));
+        assert!(check_relay(&addr(&long)).is_err());
     }
 
     #[test]

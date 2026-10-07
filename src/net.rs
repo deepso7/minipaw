@@ -10,20 +10,25 @@ use minip2p::{
     ReservationPolicy,
 };
 
-use crate::pipe::Link;
+use crate::pipe::{Link, Pipe};
 use crate::wire::{Frame, PROTOCOL};
+use minip2p::PeerId;
 
 const AGENT: &str = concat!("minipaw/", env!("CARGO_PKG_VERSION"));
 
 /// The relay a ticket without an embedded relay goes through, unless
 /// `--relay` or `MINIPAW_RELAY` names another.
-pub const DEFAULT_RELAY: &str =
-    "/dns/relay.minip2p.com/udp/19876/quic-v1/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf";
+pub const DEFAULT_RELAY: &str = "/dns/relay.minip2p.com/udp/19876/quic-v1/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf";
 
 /// How long either side keeps trying to get a lost stream back.
 pub const RESUME_TIMEOUT: Duration = Duration::from_secs(60);
 /// After finishing, how long we wait for the peer to finish too.
 pub const LINGER: Duration = Duration::from_secs(2);
+/// With all data confirmed but the stream lost, how long we keep the
+/// session open so the peer can resume and collect our last ack.
+pub const DELIVERED_GRACE: Duration = Duration::from_secs(10);
+/// On Ctrl-C or an error, how long we wait for a blocked stdout to drain.
+const STDOUT_GRACE: Duration = Duration::from_secs(1);
 /// After Ctrl-C mid-migration, how long we wait for the session's stream to
 /// come back so the peer can be told, rather than left waiting to resume.
 pub const ABORT_GRACE: Duration = Duration::from_secs(3);
@@ -45,8 +50,12 @@ pub fn resolve_relay(flag: Option<&str>) -> Result<PeerAddr, Box<dyn Error>> {
     let relay: PeerAddr = raw
         .parse()
         .map_err(|e| format!("invalid relay address '{raw}': {e}"))?;
+    crate::ticket::check_relay(&relay)?;
     if !relay.transport().is_quic_transport() {
-        return Err(format!("relay must be a QUIC address (…/udp/<port>/quic-v1/p2p/<id>), got '{raw}'").into());
+        return Err(format!(
+            "relay must be a QUIC address (…/udp/<port>/quic-v1/p2p/<id>), got '{raw}'"
+        )
+        .into());
     }
     Ok(relay)
 }
@@ -180,11 +189,60 @@ pub fn linger_and_close(mut endpoint: Endpoint, link: Option<Link>) {
 pub enum Exit {
     /// Both directions finished and were acknowledged.
     Done,
-    /// Everything arrived and our `Fin` went out, but the stream is gone;
-    /// nothing is left to linger on.
-    PeerGone,
+    /// All data in both directions is confirmed, but the stream is gone and
+    /// the peer did not come back for our last ack.
+    Delivered,
     /// Ctrl-C: tell the peer, then stop.
     Interrupted,
+    /// A local I/O error: tell the peer, then fail.
+    Failed(String),
+}
+
+/// Ends a session however it ended: tells the peer when it should know,
+/// flushes stdout (bounded when the session did not complete), and maps the
+/// outcome to `run`'s result.
+///
+/// `peer` is the other end of the session, once there is one.
+pub fn finish(
+    endpoint: Endpoint,
+    pipe: &mut Pipe,
+    link: Option<Link>,
+    peer: Option<PeerId>,
+    exit: Result<Exit, Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    match exit {
+        Ok(Exit::Done) => {
+            pipe.finish(None);
+            linger_and_close(endpoint, link);
+            Ok(())
+        }
+        Ok(Exit::Delivered) => {
+            pipe.finish(None);
+            Ok(())
+        }
+        Ok(Exit::Interrupted) => {
+            abort(endpoint, link, peer, "interrupted");
+            pipe.finish(Some(STDOUT_GRACE));
+            Err(Interrupted.into())
+        }
+        Ok(Exit::Failed(message)) => {
+            abort(endpoint, link, peer, "the other side hit a local I/O error");
+            pipe.finish(Some(STDOUT_GRACE));
+            Err(message.into())
+        }
+        Err(e) if e.is::<PeerEnded>() => {
+            pipe.finish(Some(STDOUT_GRACE));
+            if let Err(e) = endpoint.close() {
+                crate::debug!("close endpoint: {e}");
+            }
+            Err(e)
+        }
+        Err(e) => {
+            abort(endpoint, link, peer, "the other side failed");
+            pipe.finish(Some(STDOUT_GRACE));
+            Err(e)
+        }
+    }
 }
 
 /// The error `main` turns into exit status 130, silently.
@@ -218,13 +276,63 @@ pub fn interrupted() -> bool {
     INTERRUPTED.load(Ordering::SeqCst)
 }
 
-/// Ends the session after a local action rather than a quiet disconnect,
-/// so the peer exits now instead of waiting out [`RESUME_TIMEOUT`].
-pub fn abort(mut endpoint: Endpoint, link: Option<Link>, reason: &str) {
-    if let Some(link) = &link
-        && let Err(e) = link.send(&mut endpoint, &Frame::Error(reason.into()))
-    {
-        crate::debug!("abort not sent: {e}");
+/// The peer ended the session (an `Error` frame). Nothing is owed back, so
+/// we just leave.
+#[derive(Debug)]
+pub struct PeerEnded(pub String);
+
+impl fmt::Display for PeerEnded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
-    linger_and_close(endpoint, link);
+}
+
+impl Error for PeerEnded {}
+
+/// Ends the session after a local action rather than a quiet disconnect,
+/// so the peer exits now instead of waiting out [`RESUME_TIMEOUT`]. The
+/// `Error` on the current stream can be lost if the peer is just moving to
+/// a new path, so for a short while we also answer the peer's resume
+/// attempts with it, leaving once the peer disconnects.
+fn abort(mut endpoint: Endpoint, link: Option<Link>, peer: Option<PeerId>, reason: &str) {
+    let error = Frame::Error(reason.into());
+    if let Some(link) = &link {
+        if let Err(e) = link.send(&mut endpoint, &error) {
+            crate::debug!("abort not sent: {e}");
+        }
+        if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
+            crate::debug!("close stream: {e}");
+        }
+    }
+    if let Some(peer) = peer {
+        let deadline = Instant::now() + ABORT_GRACE;
+        loop {
+            match endpoint.wait(deadline) {
+                Ok(EndpointWaitOutcome::Event(EndpointEvent::ConnectionClosed {
+                    peer_id, ..
+                })) if peer_id == peer => break,
+                Ok(EndpointWaitOutcome::Event(EndpointEvent::StreamReady {
+                    peer_id,
+                    conn_id,
+                    stream_id,
+                    initiated_locally: false,
+                    ..
+                })) if peer_id == peer => {
+                    let late = Link::new(peer_id, conn_id, stream_id);
+                    if let Err(e) = late.send(&mut endpoint, &error) {
+                        crate::debug!("abort not sent on the resumed stream: {e}");
+                    }
+                    if let Err(e) = endpoint.close_stream_write(&late.peer, late.conn, late.stream)
+                    {
+                        crate::debug!("close stream: {e}");
+                    }
+                }
+                Ok(EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted) => {}
+                Ok(EndpointWaitOutcome::Deadline) | Err(_) => break,
+            }
+        }
+    }
+    if let Err(e) = endpoint.close() {
+        crate::debug!("close endpoint: {e}");
+    }
 }

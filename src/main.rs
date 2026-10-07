@@ -78,7 +78,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
         [ticket] => {
             let ticket: Ticket = ticket.parse()?;
             if relay.is_some() {
-                return Err("--relay only applies when listening; tickets carry their relay".into());
+                return Err(
+                    "--relay only applies when listening; tickets carry their relay".into(),
+                );
             }
             Ok(Command::Dial { ticket })
         }

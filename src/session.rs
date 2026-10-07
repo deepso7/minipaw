@@ -3,8 +3,12 @@
 //! A session outlives the libp2p stream carrying it: a relayed path
 //! upgrading to a direct one, a connection replacement, or a relay cutting
 //! a circuit all kill the stream. Each side keeps every byte it sent until
-//! the peer acknowledges it, so a fresh stream can pick up exactly where the
-//! peer's receive offset says the old one stopped.
+//! the peer acknowledges writing it, so a fresh stream can pick up exactly
+//! where the peer's receive offset says the old one stopped.
+//!
+//! Acks count bytes the receiver has *written* to its output, so the
+//! sender's [`WINDOW`] also bounds what the receiver holds in memory. A
+//! resume only moves the send position; it never frees window.
 
 use std::collections::VecDeque;
 
@@ -12,6 +16,10 @@ use crate::wire::MAX_DATA;
 
 /// Unacknowledged bytes we buffer before we stop reading local input.
 pub const WINDOW: usize = 4 * 1024 * 1024;
+/// Received-but-unwritten bytes an honest sender can have in flight: a full
+/// window plus the one stdin read that may overshoot it. More is a protocol
+/// violation.
+pub const RECV_LIMIT: u64 = (WINDOW + MAX_DATA) as u64;
 
 /// Our half of the session: bytes on their way to the peer.
 #[derive(Default)]
@@ -25,8 +33,6 @@ pub struct Outbound {
     eof: bool,
     /// `Fin` went out on the current stream.
     fin_sent: bool,
-    /// `Fin` went out on some stream.
-    pub fin_sent_ever: bool,
     pub fin_acked: bool,
 }
 
@@ -74,15 +80,16 @@ impl Outbound {
     }
 
     /// A new stream is attached and the peer has received everything before
-    /// `peer_recv`: resend from there.
+    /// `peer_recv`: resend from there. Received is not written, so the bytes
+    /// stay buffered (and counted against the window) until acked.
     pub fn rewind(&mut self, peer_recv: u64) -> Result<(), String> {
-        if peer_recv < self.acked {
+        if peer_recv < self.acked || peer_recv > self.end() {
             return Err(format!(
-                "peer resumed at {peer_recv}, before already-acked offset {}",
-                self.acked
+                "peer resumed at {peer_recv}, outside our unacked range {}..={}",
+                self.acked,
+                self.end()
             ));
         }
-        self.ack(peer_recv, false)?;
         self.sent = peer_recv;
         self.fin_sent = false;
         Ok(())
@@ -115,7 +122,6 @@ impl Outbound {
 
     pub fn mark_fin_sent(&mut self) {
         self.fin_sent = true;
-        self.fin_sent_ever = true;
     }
 }
 
@@ -130,11 +136,16 @@ pub struct Inbound {
 }
 
 impl Inbound {
-    pub fn on_data(&mut self, len: usize) -> Result<(), String> {
+    /// `written` is how much of the session we have written out so far.
+    pub fn on_data(&mut self, len: usize, written: u64) -> Result<(), String> {
         if self.fin.is_some() {
             return Err("peer sent data after its Fin".into());
         }
-        self.recv += len as u64;
+        let recv = self.recv + len as u64;
+        if recv - written > RECV_LIMIT {
+            return Err("peer sent past its window".into());
+        }
+        self.recv = recv;
         Ok(())
     }
 
@@ -181,6 +192,20 @@ mod tests {
     }
 
     #[test]
+    fn resuming_does_not_free_window() {
+        let mut out = Outbound::default();
+        out.push(&vec![0; WINDOW]);
+        drain(&mut out);
+        assert!(!out.has_room());
+        // The peer received everything but wrote none of it.
+        out.rewind(WINDOW as u64).unwrap();
+        assert!(!out.has_room(), "a resume must not make room");
+        assert!(out.next_chunk().is_none());
+        out.ack(WINDOW as u64, false).unwrap();
+        assert!(out.has_room());
+    }
+
+    #[test]
     fn fin_is_resent_after_rewind_until_acked() {
         let mut out = Outbound::default();
         out.push(b"abc");
@@ -209,16 +234,25 @@ mod tests {
         assert!(out.ack(3, true).is_err(), "no Fin was sent");
         out.ack(2, false).unwrap();
         assert!(out.rewind(1).is_err());
+        assert!(out.rewind(4).is_err(), "past what we sent");
         out.ack(1, false).unwrap(); // stale, ignored
     }
 
     #[test]
     fn inbound_fin_must_match_received_bytes() {
         let mut inb = Inbound::default();
-        inb.on_data(4).unwrap();
+        inb.on_data(4, 0).unwrap();
         assert!(inb.on_fin(3).is_err());
         inb.on_fin(4).unwrap();
         inb.on_fin(4).unwrap();
-        assert!(inb.on_data(1).is_err());
+        assert!(inb.on_data(1, 4).is_err());
+    }
+
+    #[test]
+    fn inbound_rejects_data_past_the_window() {
+        let mut inb = Inbound::default();
+        inb.on_data(RECV_LIMIT as usize, 0).unwrap();
+        assert!(inb.on_data(1, 0).is_err(), "nothing written yet");
+        inb.on_data(1, 1).unwrap();
     }
 }

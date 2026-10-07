@@ -4,12 +4,14 @@
 //! through the endpoint's [`WaitHandle`]: one reads stdin into a bounded
 //! channel, one writes received bytes to stdout. Acks report bytes the
 //! writer has actually written, so a slow stdout throttles the remote
-//! sender instead of growing a buffer here.
+//! sender instead of growing a buffer here. A local I/O error is fatal:
+//! [`Pipe::failure`] reports it so the session ends nonzero rather than
+//! claiming a complete transfer.
 
-use std::io::{IsTerminal as _, Read as _, Write as _};
-use std::sync::Arc;
+use std::io::{ErrorKind, IsTerminal as _, Read as _, Write as _};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -99,6 +101,22 @@ enum Input {
     Eof,
 }
 
+/// The first local I/O error either helper thread hit.
+#[derive(Clone, Default)]
+struct Failure(Arc<Mutex<Option<String>>>);
+
+impl Failure {
+    fn set(&self, message: String) {
+        if let Ok(mut slot) = self.0.lock() {
+            slot.get_or_insert(message);
+        }
+    }
+
+    fn get(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|slot| slot.clone())
+    }
+}
+
 pub struct Pipe {
     out: Outbound,
     inb: Inbound,
@@ -109,7 +127,10 @@ pub struct Pipe {
     close_on_peer_fin: bool,
     stdout: Option<Sender<Vec<u8>>>,
     writer: Option<JoinHandle<()>>,
+    /// Signals once the writer has flushed and exited.
+    writer_done: Receiver<()>,
     written: Arc<AtomicU64>,
+    failure: Failure,
     /// Written offset last acked to the peer, and whether that ack covered
     /// its `Fin`.
     acked: u64,
@@ -121,11 +142,19 @@ pub struct Pipe {
 
 impl Pipe {
     pub fn new(wake: &WaitHandle) -> Self {
+        let failure = Failure::default();
         let (stdin_tx, stdin) = mpsc::sync_channel(8);
-        spawn_stdin(stdin_tx, wake.clone());
+        spawn_stdin(stdin_tx, failure.clone(), wake.clone());
         let (stdout, stdout_rx) = mpsc::channel();
+        let (done_tx, writer_done) = mpsc::channel();
         let written = Arc::new(AtomicU64::new(0));
-        let writer = spawn_stdout(stdout_rx, written.clone(), wake.clone());
+        let writer = spawn_stdout(
+            stdout_rx,
+            written.clone(),
+            failure.clone(),
+            done_tx,
+            wake.clone(),
+        );
         Pipe {
             out: Outbound::default(),
             inb: Inbound::default(),
@@ -134,7 +163,9 @@ impl Pipe {
             close_on_peer_fin: std::io::stdin().is_terminal(),
             stdout: Some(stdout),
             writer: Some(writer),
+            writer_done,
             written,
+            failure,
             acked: 0,
             fin_acked: false,
             ack_due: None,
@@ -150,6 +181,11 @@ impl Pipe {
     /// A new stream is attached and the peer has received `peer_recv`
     /// bytes: resend from there, and re-ack on the new stream.
     pub fn attach(&mut self, peer_recv: u64) -> Result<(), String> {
+        crate::debug!(
+            "resuming: peer has {peer_recv} bytes of ours, we have {} of theirs ({} written)",
+            self.inb.recv,
+            self.written.load(Ordering::Acquire)
+        );
         self.out.rewind(peer_recv)?;
         self.fin_acked = false;
         self.ack_due = Some(Instant::now());
@@ -157,10 +193,11 @@ impl Pipe {
         Ok(())
     }
 
-    pub fn on_frame(&mut self, frame: Frame) -> Result<(), String> {
+    pub fn on_frame(&mut self, frame: Frame) -> Result<(), Box<dyn std::error::Error>> {
         match frame {
             Frame::Data(data) => {
-                self.inb.on_data(data.len())?;
+                self.inb
+                    .on_data(data.len(), self.written.load(Ordering::Acquire))?;
                 if let Some(stdout) = &self.stdout
                     && stdout.send(data).is_err()
                 {
@@ -175,7 +212,13 @@ impl Pipe {
                     self.out.close();
                 }
             }
-            Frame::Error(message) => return Err(format!("peer ended the session: {message}")),
+            Frame::Error(message) => {
+                return Err(crate::net::PeerEnded(format!(
+                    "peer ended the session: {}",
+                    message.escape_debug()
+                ))
+                .into());
+            }
             Frame::Hello { .. } | Frame::Welcome { .. } => {
                 return Err("unexpected handshake frame mid-session".into());
             }
@@ -265,13 +308,21 @@ impl Pipe {
         }
     }
 
-    /// When `pump` next has timed work: a delayed ack or a backpressure retry.
+    /// When `pump` next has timed work: a backpressure retry, or else a
+    /// delayed ack (which cannot go out while sends are blocked anyway).
     pub fn deadline(&self) -> Option<Instant> {
-        self.ack_due.into_iter().chain(self.blocked_until).min()
+        self.blocked_until.or(self.ack_due)
+    }
+
+    /// A local I/O error that ends the session.
+    pub fn failure(&self) -> Option<String> {
+        self.failure.get()
     }
 
     fn peer_finished(&self) -> bool {
-        self.inb.fin.is_some_and(|fin| fin == self.written.load(Ordering::Acquire))
+        self.inb
+            .fin
+            .is_some_and(|fin| fin == self.written.load(Ordering::Acquire))
     }
 
     /// Both directions are complete and confirmed.
@@ -279,25 +330,34 @@ impl Pipe {
         self.peer_finished() && self.fin_acked && self.out.fin_acked
     }
 
-    /// Everything the peer sent is written and our `Fin` went out at least
-    /// once. With the link gone, this is as finished as we can confirm: a
-    /// peer that saw our `Fin` exits rather than resuming.
-    pub fn nearly_done(&self) -> bool {
-        self.peer_finished() && self.out.fin_sent_ever
+    /// Both directions' data is confirmed: everything the peer sent is
+    /// written, and the peer acked writing everything we sent. Only our ack
+    /// of its `Fin` may be unconfirmed, so with the link gone nothing can be
+    /// lost by stopping.
+    pub fn delivered(&self) -> bool {
+        self.peer_finished() && self.out.fin_acked
     }
 
-    /// Flushes stdout and stops the writer. Idempotent.
-    pub fn finish(&mut self) {
+    /// Flushes stdout and stops the writer, waiting at most `limit` (or for
+    /// ever) for a blocked stdout. Idempotent.
+    pub fn finish(&mut self, limit: Option<Duration>) {
         self.stdout = None;
-        if let Some(writer) = self.writer.take()
-            && writer.join().is_err()
+        let Some(writer) = self.writer.take() else {
+            return;
+        };
+        if let Some(limit) = limit
+            && self.writer_done.recv_timeout(limit).is_err()
         {
+            // Still blocked on stdout; leave it behind.
+            return;
+        }
+        if writer.join().is_err() {
             eprintln!("minipaw: stdout writer panicked");
         }
     }
 }
 
-fn spawn_stdin(tx: SyncSender<Input>, wake: WaitHandle) {
+fn spawn_stdin(tx: SyncSender<Input>, failure: Failure, wake: WaitHandle) {
     thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
         let mut buf = vec![0u8; MAX_DATA];
@@ -305,10 +365,11 @@ fn spawn_stdin(tx: SyncSender<Input>, wake: WaitHandle) {
             let input = match stdin.read(&mut buf) {
                 Ok(0) => Input::Eof,
                 Ok(n) => Input::Data(buf.get(..n).unwrap_or_default().to_vec()),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => {
-                    eprintln!("minipaw: reading stdin: {e}");
-                    Input::Eof
+                    failure.set(format!("reading stdin: {e}"));
+                    wake.interrupt();
+                    return;
                 }
             };
             let eof = matches!(input, Input::Eof);
@@ -323,19 +384,31 @@ fn spawn_stdin(tx: SyncSender<Input>, wake: WaitHandle) {
     });
 }
 
-fn spawn_stdout(rx: Receiver<Vec<u8>>, written: Arc<AtomicU64>, wake: WaitHandle) -> JoinHandle<()> {
+fn spawn_stdout(
+    rx: Receiver<Vec<u8>>,
+    written: Arc<AtomicU64>,
+    failure: Failure,
+    done: Sender<()>,
+    wake: WaitHandle,
+) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut stdout = std::io::stdout().lock();
-        let mut broken = false;
+        let mut closed = false;
         for data in rx {
-            // Keep counting after a broken pipe (`| head`) so the session
-            // can still finish instead of stalling on acks.
-            if !broken && let Err(e) = stdout.write_all(&data).and_then(|()| stdout.flush()) {
-                eprintln!("minipaw: writing stdout: {e}");
-                broken = true;
+            // A reader that went away (`| head`) wants no more output, like
+            // netcat: keep counting so the session still finishes.
+            if !closed && let Err(e) = stdout.write_all(&data).and_then(|()| stdout.flush()) {
+                if e.kind() != ErrorKind::BrokenPipe {
+                    failure.set(format!("writing stdout: {e}"));
+                    wake.interrupt();
+                    break;
+                }
+                closed = true;
             }
             written.fetch_add(data.len() as u64, Ordering::Release);
             wake.interrupt();
         }
+        // The receiver is gone once the session has ended.
+        if done.send(()).is_err() {}
     })
 }
