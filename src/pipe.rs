@@ -28,11 +28,14 @@ const ACK_DELAY: Duration = Duration::from_millis(10);
 /// this pause.
 pub const BACKPRESSURE_RETRY: Duration = Duration::from_millis(5);
 /// A link that has sent nothing for this long sends a `Ping`.
-const PING_INTERVAL: Duration = Duration::from_secs(3);
+const PING_INTERVAL: Duration = Duration::from_secs(5);
 /// A link that has heard nothing for this long is dead. minip2p does not
 /// always report a relayed circuit closing on one side (deepso7/minip2p#306),
-/// so without this a session could wait on a dead stream for ever.
-const DEAD_AFTER: Duration = Duration::from_secs(10);
+/// so without this a session could wait on a dead stream for ever. A
+/// relayed path delivers whole Yamux frames, up to `MAX_DATA` each, so a
+/// working path slower than `MAX_DATA` per `DEAD_AFTER` (about 1.6 KiB/s)
+/// looks dead too; it then keeps resuming from its last acked byte.
+const DEAD_AFTER: Duration = Duration::from_secs(20);
 
 pub enum SendError {
     /// The stream's send buffer is full; the frame was not queued.

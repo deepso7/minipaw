@@ -65,7 +65,7 @@ any error (including the other side hitting one), `130` on Ctrl-C.
   circuit, a path upgrade, a network blip — the client reconnects and both
   sides resume from the last byte the other received, for up to 60 seconds.
   A quiet session pings every few seconds, so a connection that dies
-  without a word is noticed within 10 seconds too.
+  without a word is noticed within 20 seconds too.
 - **Backpressure.** The receiver acknowledges bytes only once they are
   written to its stdout, so a slow reader slows the sender instead of
   filling memory.
