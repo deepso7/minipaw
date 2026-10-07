@@ -20,9 +20,8 @@ use minip2p::{ConnectionId, Endpoint, Error, PeerId, StreamId, TransportError, W
 use crate::session::{Inbound, Outbound};
 use crate::wire::{Frame, FrameReader, MAX_DATA};
 
-/// Ack at least this often, in written bytes...
-const ACK_EVERY: u64 = 256 * 1024;
-/// ...or this long after the first unacked write.
+/// A non-urgent ack waits this long after the first unacked write, so it
+/// covers more of them.
 const ACK_DELAY: Duration = Duration::from_millis(10);
 /// minip2p has no writable event, so a full send buffer is retried after
 /// this pause.
@@ -131,10 +130,6 @@ pub struct Pipe {
     writer_done: Receiver<()>,
     written: Arc<AtomicU64>,
     failure: Failure,
-    /// Written offset last acked to the peer, and whether that ack covered
-    /// its `Fin`.
-    acked: u64,
-    fin_acked: bool,
     ack_due: Option<Instant>,
     /// Sends paused by backpressure until then.
     blocked_until: Option<Instant>,
@@ -166,8 +161,6 @@ impl Pipe {
             writer_done,
             written,
             failure,
-            acked: 0,
-            fin_acked: false,
             ack_due: None,
             blocked_until: None,
         }
@@ -187,8 +180,8 @@ impl Pipe {
             self.written.load(Ordering::Acquire)
         );
         self.out.rewind(peer_recv)?;
-        self.fin_acked = false;
-        self.ack_due = Some(Instant::now());
+        self.inb.resume();
+        self.ack_due = None;
         self.blocked_until = None;
         Ok(())
     }
@@ -198,8 +191,11 @@ impl Pipe {
             Frame::Data(data) => {
                 self.inb
                     .on_data(data.len(), self.written.load(Ordering::Acquire))?;
+                // A writer that stopped on a local error has already
+                // reported it; what still arrives has nowhere to go.
                 if let Some(stdout) = &self.stdout
                     && stdout.send(data).is_err()
+                    && self.failure.get().is_none()
                 {
                     return Err("stdout writer exited".into());
                 }
@@ -260,19 +256,11 @@ impl Pipe {
         now: Instant,
     ) -> Result<(), SendError> {
         let written = self.written.load(Ordering::Acquire);
-        let fin_consumed = self.inb.fin == Some(written);
-        if written > self.acked || (fin_consumed && !self.fin_acked) {
-            let due = fin_consumed
-                || written - self.acked >= ACK_EVERY
-                || self.ack_due.is_some_and(|due| now >= due);
-            if due {
-                let ack = Frame::Ack {
-                    offset: written,
-                    fin: fin_consumed,
-                };
-                link.try_send(endpoint, &ack)?;
-                self.acked = written;
-                self.fin_acked = fin_consumed;
+        if self.inb.ack_pending(written) {
+            if self.inb.ack_urgent(written) || self.ack_due.is_some_and(|due| now >= due) {
+                let (offset, fin) = self.inb.ack(written);
+                link.try_send(endpoint, &Frame::Ack { offset, fin })?;
+                self.inb.mark_acked(offset, fin);
                 self.ack_due = None;
             } else if self.ack_due.is_none() {
                 self.ack_due = Some(now + ACK_DELAY);
@@ -327,7 +315,7 @@ impl Pipe {
 
     /// Both directions are complete and confirmed.
     pub fn done(&self) -> bool {
-        self.peer_finished() && self.fin_acked && self.out.fin_acked
+        self.inb.finished(self.written.load(Ordering::Acquire)) && self.out.fin_acked
     }
 
     /// Both directions' data is confirmed: everything the peer sent is

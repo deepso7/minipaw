@@ -16,19 +16,31 @@ cargo build -q --release --bin minipaw --example squat || exit 2
 SQUAT=target/release/examples/squat
 
 T=$(mktemp -d)
-CHILDREN=()
 cleanup() {
-  for pid in "${CHILDREN[@]:-}"; do [ -n "$pid" ] && kill "$pid" 2>/dev/null; done
+  reap_all
   stop_relay
-  [ -n "${LIMITED_PID:-}" ] && kill "$LIMITED_PID" 2>/dev/null
+  if [ -n "${LIMITED_PID:-}" ]; then
+    kill "$LIMITED_PID" 2>/dev/null
+    wait "$LIMITED_PID" 2>/dev/null
+    rm -f "$LIMITED_LOG"
+  fi
   rm -rf "$T"
 }
 trap cleanup EXIT
 ensure_relay
 
+# Each check reports exactly one result; one that ends without any is a
+# failure too.
 FAILED=()
-pass() { printf 'PASS  %-18s %s\n' "$CHECK" "$*"; }
+RESULT=
+pass() {
+  [ -n "$RESULT" ] && return
+  RESULT=pass
+  printf 'PASS  %-18s %s\n' "$CHECK" "$*"
+}
 fail() {
+  [ -n "$RESULT" ] && return
+  RESULT=fail
   printf 'FAIL  %-18s %s\n' "$CHECK" "$*"
   FAILED+=("$CHECK")
   if [ -n "${SHOW_LOGS:-}" ]; then
@@ -38,24 +50,27 @@ fail() {
 elapsed() { echo $(($(date +%s) - $1)); }
 
 # A transfer both ways; data must arrive byte for byte and both exit 0.
+# Fails the check and returns 1 otherwise.
 transfer() { # transfer <up-bytes> <down-bytes>
   head -c "$1" /dev/urandom >"$T/up"
   head -c "$2" /dev/urandom >"$T/down"
-  start_server "$T/down" "$T/server.out" "$T/server.err" || return 1
+  start_server "$T/down" "$T/server.out" "$T/server.err" || { fail "no ticket"; return 1; }
   local client=0 server=0
   "$BIN" -v "$TICKET" <"$T/up" >"$T/client.out" 2>"$T/client.err" &
+  track $!
   wait_upto $! 120 || client=$?
   wait_upto "$SERVER_PID" 30 || server=$?
-  cmp -s "$T/up" "$T/server.out" || { fail "upload differs"; return; }
-  cmp -s "$T/down" "$T/client.out" || { fail "download differs"; return; }
-  [ "$client$server" = 00 ] || { fail "exit codes client=$client server=$server"; return; }
-  pass "$(($1 / 1000000)) MB up, $(($2 / 1000000)) MB down"
+  cmp -s "$T/up" "$T/server.out" || { fail "upload differs"; return 1; }
+  cmp -s "$T/down" "$T/client.out" || { fail "download differs"; return 1; }
+  [ "$client$server" = 00 ] || { fail "exit codes client=$client server=$server"; return 1; }
 }
 
-check_transfer() { transfer 30000000 10000000; }
+check_transfer() {
+  transfer 30000000 10000000 && pass "30 MB up, 10 MB down"
+}
 
 check_forced_relay() {
-  MINIPAW_FORCE_RELAY=1 transfer 5000000 5000000
+  MINIPAW_FORCE_RELAY=1 transfer 5000000 5000000 && pass "5 MB each way, relay only"
 }
 
 # A relay with default circuit limits (128 KiB per direction) cuts the
@@ -68,10 +83,12 @@ check_resume() {
     LIMITED=$RELAY LIMITED_PID=$RELAY_PID LIMITED_LOG=$RELAY_LOG
     RELAY=$saved RELAY_PID=$saved_pid RELAY_LOG=$saved_log
   fi
-  RELAY=$LIMITED MINIPAW_FORCE_RELAY=1 transfer 2000000 500000
-  local circuits
-  circuits=$(grep -c 'circuit opened' "$LIMITED_LOG")
-  [ "$circuits" -gt 5 ] || fail "only $circuits circuits: the relay never cut the session"
+  local before
+  before=$(grep -c 'circuit opened' "$LIMITED_LOG")
+  RELAY=$LIMITED MINIPAW_FORCE_RELAY=1 transfer 2000000 500000 || return
+  local circuits=$(($(grep -c 'circuit opened' "$LIMITED_LOG") - before))
+  [ "$circuits" -gt 5 ] || { fail "only $circuits circuits: the relay never cut the session"; return; }
+  pass "2 MB up, 0.5 MB down across $circuits relay circuits"
 }
 
 # Ctrl-C on one side ends both: it exits 130, the peer exits 1, promptly.
@@ -80,25 +97,26 @@ interrupt() { # interrupt <client|server|blocked>
   if [ "$who" = blocked ]; then
     # The server floods a client whose stdout reader never reads.
     mkfifo "$server_in"
-    (echo from-server; head -c 50000000 /dev/zero; sleep 60) >"$server_in" &
+    (echo from-server; head -c 50000000 /dev/zero; exec sleep 60) >"$server_in" &
   else
     mkfifo "$server_in"
-    (echo from-server; sleep 60) >"$server_in" &
+    (echo from-server; exec sleep 60) >"$server_in" &
   fi
-  CHILDREN+=($!)
+  track $!
   start_server "$server_in" "$T/server.out" "$T/server.err" || { fail "no ticket"; return; }
   local client_out=$T/client.out
   if [ "$who" = blocked ]; then
     mkfifo "$T/stuck"
     sleep 120 <"$T/stuck" &
-    CHILDREN+=($!)
+    track $!
     client_out=$T/stuck
   fi
   mkfifo "$T/client.in"
-  (echo from-client; sleep 60) >"$T/client.in" &
-  CHILDREN+=($!)
+  (echo from-client; exec sleep 60) >"$T/client.in" &
+  track $!
   "$BIN" -v "$TICKET" <"$T/client.in" >"$client_out" 2>"$T/client.err" &
   local client=$!
+  track $client
   for _ in $(seq 1 100); do
     grep -q from-client "$T/server.out" 2>/dev/null && break
     sleep 0.1
@@ -129,7 +147,7 @@ check_interrupt_blocked() { interrupt blocked; }
 check_wrong_token() {
   mkfifo "$T/server.in"
   sleep 30 >"$T/server.in" &
-  CHILDREN+=($!)
+  track $!
   start_server "$T/server.in" /dev/null "$T/server.err" || { fail "no ticket"; return; }
   local bad
   bad=$(python3 -c '
@@ -140,6 +158,7 @@ raw[2] ^= 1
 print("mp" + base64.urlsafe_b64encode(bytes(raw)).decode().rstrip("="))' "$TICKET")
   local code=0
   echo hi | "$BIN" "$bad" >/dev/null 2>"$T/client.err" &
+  track $!
   wait_upto $! 30 || code=$?
   kill "$SERVER_PID" 2>/dev/null
   [ "$code" = 1 ] && grep -q "wrong token" "$T/client.err" ||
@@ -151,19 +170,20 @@ print("mp" + base64.urlsafe_b64encode(bytes(raw)).decode().rstrip("="))' "$TICKE
 check_busy() {
   mkfifo "$T/server.in"
   sleep 30 >"$T/server.in" &
-  CHILDREN+=($!)
+  track $!
   start_server "$T/server.in" /dev/null "$T/server.err" || { fail "no ticket"; return; }
   mkfifo "$T/first.in"
   sleep 30 >"$T/first.in" &
-  CHILDREN+=($!)
+  track $!
   "$BIN" "$TICKET" <"$T/first.in" >/dev/null 2>"$T/first.err" &
-  CHILDREN+=($!)
+  track $!
   for _ in $(seq 1 100); do
     grep -q "connection from" "$T/server.err" && break
     sleep 0.1
   done
   local code=0
   echo hi | "$BIN" "$TICKET" >/dev/null 2>"$T/client.err" &
+  track $!
   wait_upto $! 30 || code=$?
   kill "$SERVER_PID" 2>/dev/null
   [ "$code" = 1 ] && grep -q "busy" "$T/client.err" ||
@@ -174,14 +194,14 @@ check_busy() {
 # Streams that never say Hello must not lock out a real client.
 check_squatters() {
   mkfifo "$T/server.in"
-  (echo from-server; sleep 40) >"$T/server.in" &
-  CHILDREN+=($!)
+  (echo from-server; exec sleep 40) >"$T/server.in" &
+  track $!
   start_server "$T/server.in" "$T/server.out" "$T/server.err" || { fail "no ticket"; return; }
   local port peer
   port=$(sed -n 's#^\# bound /ip4/0\.0\.0\.0/udp/\([0-9]*\)/.*#\1#p' "$T/server.err" | head -1)
   peer=$(sed -n 's#^\# bound /ip4/0\.0\.0\.0/udp/[0-9]*/quic-v1/p2p/\(.*\)#\1#p' "$T/server.err" | head -1)
   "$SQUAT" "/ip4/127.0.0.1/udp/$port/quic-v1/p2p/$peer" 16 30 2>"$T/squat.err" &
-  CHILDREN+=($!)
+  track $!
   for _ in $(seq 1 100); do
     grep -q "streams held" "$T/squat.err" && break
     sleep 0.1
@@ -190,6 +210,7 @@ check_squatters() {
   local code=0
   "$BIN" "$TICKET" < <(echo from-client) >"$T/client.out" 2>"$T/client.err" &
   local client=$!
+  track $client
   for _ in $(seq 1 100); do
     grep -q from-server "$T/client.out" && break
     sleep 0.1
@@ -206,10 +227,11 @@ check_squatters() {
 check_stdin_error() {
   mkfifo "$T/server.in"
   sleep 30 >"$T/server.in" &
-  CHILDREN+=($!)
+  track $!
   start_server "$T/server.in" /dev/null "$T/server.err" || { fail "no ticket"; return; }
   local code=0
   "$BIN" "$TICKET" </ >/dev/null 2>"$T/client.err" &
+  track $!
   wait_upto $! 30 || code=$?
   local listening=no
   kill -0 "$SERVER_PID" 2>/dev/null && listening=yes
@@ -228,6 +250,7 @@ check_stdout_error() {
   # Past a 1-block file size limit (with SIGXFSZ ignored), writes fail with
   # EFBIG. A closed stdout would not do: Rust treats EBADF there as success.
   (trap '' XFSZ; ulimit -f 1; exec "$BIN" "$TICKET" </dev/null >"$T/client.out" 2>"$T/client.err") &
+  track $!
   wait_upto $! 30 || code=$?
   wait_upto "$SERVER_PID" 30 || server=$?
   [ "$code" = 1 ] && [ "$server" = 1 ] && grep -q "writing stdout" "$T/client.err" ||
@@ -239,13 +262,19 @@ check_stdout_error() {
 check_closed_reader() {
   head -c 5000000 /dev/urandom >"$T/down"
   start_server "$T/down" /dev/null "$T/server.err" || { fail "no ticket"; return; }
+  mkfifo "$T/client.pipe"
+  local client=0
+  "$BIN" "$TICKET" </dev/null 2>"$T/client.err" >"$T/client.pipe" &
+  local pid=$!
+  track $pid
   local got
-  got=$("$BIN" "$TICKET" </dev/null 2>"$T/client.err" | head -c 1000 | wc -c | tr -d ' ')
-  local codes=("${PIPESTATUS[@]}")
+  # The reader takes 1000 bytes and leaves; the client then hits a closed pipe.
+  got=$(head -c 1000 <"$T/client.pipe" | wc -c | tr -d ' ')
+  wait_upto $pid 30 || client=$?
   local server=0
   wait_upto "$SERVER_PID" 30 || server=$?
-  [ "$got" = 1000 ] && [ "${codes[0]}" = 0 ] && [ "$server" = 0 ] ||
-    { fail "got=$got client=${codes[0]} server=$server: $(cat "$T/client.err")"; return; }
+  [ "$got" = 1000 ] && [ "$client" = 0 ] && [ "$server" = 0 ] ||
+    { fail "got=$got client=$client server=$server: $(cat "$T/client.err")"; return; }
   pass "both exit 0"
 }
 
@@ -261,6 +290,9 @@ for CHECK in ${@:-$ALL}; do
     exit 2
   fi
   rm -rf "${T:?}"/*
+  RESULT=
   "check_$CHECK"
+  [ -n "$RESULT" ] || fail "ended without a result"
+  reap_all
 done
 [ ${#FAILED[@]} -eq 0 ] || { echo "failed: ${FAILED[*]}"; exit 1; }

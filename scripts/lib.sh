@@ -8,6 +8,26 @@
 #
 #   cd ../minip2p && cargo build --release -p minip2p-relay-server-example
 
+# Background processes the scripts started, killed and reaped by reap_all.
+BG_PIDS=()
+
+# Registers a background PID for reap_all. When it is a subshell, end the
+# subshell with `exec` (`(echo hi; exec sleep 60) &`) so the PID is the
+# process that lingers, not a shell that would leave it orphaned.
+track() { BG_PIDS+=("$1"); }
+
+reap_all() {
+  local pid
+  for pid in "${BG_PIDS[@]:-}"; do
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+  done
+  for pid in "${BG_PIDS[@]:-}"; do
+    [ -n "$pid" ] && wait "$pid" 2>/dev/null
+  done
+  BG_PIDS=()
+  return 0
+}
+
 # Starts the local relay unless RELAY is already set, and exports RELAY.
 # Pass extra relay flags to replace the no-limits defaults.
 ensure_relay() {
@@ -60,6 +80,7 @@ start_server() {
   # shellcheck disable=SC2086 # SERVER_WRAP is a word list
   ${SERVER_WRAP:-} "$BIN" -v --relay "$RELAY" "$@" <"$in" >"$out" 2>"$err" &
   SERVER_PID=$!
+  track "$SERVER_PID"
   TICKET=
   for _ in $(seq 1 150); do
     TICKET=$(awk '/^minipaw mp/{print $2}' "$err")

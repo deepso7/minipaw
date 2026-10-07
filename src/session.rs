@@ -20,6 +20,9 @@ pub const WINDOW: usize = 4 * 1024 * 1024;
 /// window plus the one stdin read that may overshoot it. More is a protocol
 /// violation.
 pub const RECV_LIMIT: u64 = (WINDOW + MAX_DATA) as u64;
+/// Ack at least every this many written bytes, so the sender's window keeps
+/// moving.
+pub const ACK_EVERY: u64 = 256 * 1024;
 
 /// Our half of the session: bytes on their way to the peer.
 #[derive(Default)]
@@ -125,7 +128,8 @@ impl Outbound {
     }
 }
 
-/// The peer's half: bytes arriving from it.
+/// The peer's half: bytes arriving from it, and our acks of them. `written`
+/// arguments are how much of the session we have written out so far.
 #[derive(Default)]
 pub struct Inbound {
     /// Session bytes received so far (handed to the output, maybe not yet
@@ -133,13 +137,22 @@ pub struct Inbound {
     pub recv: u64,
     /// Where the peer's `Fin` put the end of its data.
     pub fin: Option<u64>,
+    /// Written offset last acked, and whether that ack covered the `Fin`.
+    acked: u64,
+    fin_acked: bool,
+    /// A new stream is attached: the last ack may have died with the old
+    /// one, so ack again even if nothing new was written.
+    ack_required: bool,
 }
 
 impl Inbound {
-    /// `written` is how much of the session we have written out so far.
     pub fn on_data(&mut self, len: usize, written: u64) -> Result<(), String> {
         if self.fin.is_some() {
             return Err("peer sent data after its Fin".into());
+        }
+        if len == 0 {
+            // Costs us a queue entry without counting against the window.
+            return Err("peer sent an empty Data frame".into());
         }
         let recv = self.recv + len as u64;
         if recv - written > RECV_LIMIT {
@@ -163,6 +176,42 @@ impl Inbound {
                 Ok(())
             }
         }
+    }
+
+    fn fin_written(&self, written: u64) -> bool {
+        self.fin == Some(written)
+    }
+
+    /// Whether an ack would tell the peer anything new.
+    pub fn ack_pending(&self, written: u64) -> bool {
+        self.ack_required || written > self.acked || (self.fin_written(written) && !self.fin_acked)
+    }
+
+    /// Whether a pending ack should go out now rather than after a short
+    /// delay that batches it with more writes.
+    pub fn ack_urgent(&self, written: u64) -> bool {
+        self.ack_required || self.fin_written(written) || written - self.acked >= ACK_EVERY
+    }
+
+    /// The ack frame's contents: offset and whether it covers the `Fin`.
+    pub fn ack(&self, written: u64) -> (u64, bool) {
+        (written, self.fin_written(written))
+    }
+
+    pub fn mark_acked(&mut self, offset: u64, fin: bool) {
+        self.acked = offset;
+        self.fin_acked = fin;
+        self.ack_required = false;
+    }
+
+    /// A new stream is attached.
+    pub fn resume(&mut self) {
+        self.ack_required = true;
+    }
+
+    /// Everything the peer sent is written and our ack of its `Fin` went out.
+    pub fn finished(&self, written: u64) -> bool {
+        self.fin_written(written) && self.fin_acked
     }
 }
 
@@ -246,6 +295,41 @@ mod tests {
         inb.on_fin(4).unwrap();
         inb.on_fin(4).unwrap();
         assert!(inb.on_data(1, 4).is_err());
+    }
+
+    #[test]
+    fn resuming_repeats_an_ack_lost_with_the_old_stream() {
+        let mut inb = Inbound::default();
+        inb.on_data(1000, 0).unwrap();
+        // All written and acked; then the stream carrying the ack died.
+        inb.mark_acked(1000, false);
+        assert!(!inb.ack_pending(1000));
+        inb.resume();
+        assert!(inb.ack_pending(1000), "the lost ack must be resent");
+        assert!(inb.ack_urgent(1000));
+        assert_eq!(inb.ack(1000), (1000, false));
+        inb.mark_acked(1000, false);
+        assert!(!inb.ack_pending(1000));
+    }
+
+    #[test]
+    fn fin_ack_is_resent_after_resume() {
+        let mut inb = Inbound::default();
+        inb.on_data(10, 0).unwrap();
+        inb.on_fin(10).unwrap();
+        assert!(inb.ack_urgent(10));
+        assert_eq!(inb.ack(10), (10, true));
+        inb.mark_acked(10, true);
+        assert!(inb.finished(10));
+        inb.resume();
+        assert!(inb.ack_pending(10));
+        assert_eq!(inb.ack(10), (10, true));
+    }
+
+    #[test]
+    fn empty_data_frames_are_rejected() {
+        let mut inb = Inbound::default();
+        assert!(inb.on_data(0, 0).is_err());
     }
 
     #[test]

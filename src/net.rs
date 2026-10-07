@@ -12,7 +12,7 @@ use minip2p::{
 
 use crate::pipe::{Link, Pipe};
 use crate::wire::{Frame, PROTOCOL};
-use minip2p::PeerId;
+use minip2p::{ConnectionId, PeerId, StreamId};
 
 const AGENT: &str = concat!("minipaw/", env!("CARGO_PKG_VERSION"));
 
@@ -29,8 +29,9 @@ pub const LINGER: Duration = Duration::from_secs(2);
 pub const DELIVERED_GRACE: Duration = Duration::from_secs(10);
 /// On Ctrl-C or an error, how long we wait for a blocked stdout to drain.
 const STDOUT_GRACE: Duration = Duration::from_secs(1);
-/// After Ctrl-C mid-migration, how long we wait for the session's stream to
-/// come back so the peer can be told, rather than left waiting to resume.
+/// After Ctrl-C or a local failure, how long we try to tell the peer: first
+/// waiting for a stream if the session is between streams, then for the
+/// peer to confirm it got the news.
 pub const ABORT_GRACE: Duration = Duration::from_secs(3);
 
 pub fn default_relay() -> Option<PeerAddr> {
@@ -192,10 +193,91 @@ pub enum Exit {
     /// All data in both directions is confirmed, but the stream is gone and
     /// the peer did not come back for our last ack.
     Delivered,
-    /// Ctrl-C: tell the peer, then stop.
+    /// Ctrl-C or a local failure.
+    Stopped(Stop),
+}
+
+/// A session ending on our side's initiative. Once seen it is the outcome,
+/// even if the transfer completes meanwhile.
+///
+/// The loop keeps running while stopping, so the session's usual resume
+/// machinery carries the news: the `Error` goes out on whatever stream is
+/// up, again on a fresh one if that stream dies first, until the peer
+/// confirms by half-closing a stream we sent it on, or `by` passes.
+pub struct Stop {
+    reason: StopReason,
+    pub by: Instant,
+    /// Streams the `Error` went out on.
+    told: Vec<(PeerId, ConnectionId, StreamId)>,
+}
+
+enum StopReason {
     Interrupted,
-    /// A local I/O error: tell the peer, then fail.
     Failed(String),
+}
+
+impl Stop {
+    /// Ctrl-C or the pipe's first local I/O error, if either happened.
+    pub fn check(pipe: &Pipe) -> Option<Stop> {
+        let reason = if interrupted() {
+            StopReason::Interrupted
+        } else {
+            StopReason::Failed(pipe.failure()?)
+        };
+        crate::debug!("stopping; telling the peer");
+        Some(Stop {
+            reason,
+            by: Instant::now() + ABORT_GRACE,
+            told: Vec::new(),
+        })
+    }
+
+    fn message(&self) -> &'static str {
+        match self.reason {
+            StopReason::Interrupted => "interrupted",
+            StopReason::Failed(_) => "the other side hit a local I/O error",
+        }
+    }
+
+    /// Sends the `Error` on `link` and half-closes it, once per stream.
+    pub fn tell(&mut self, endpoint: &mut Endpoint, link: &Link) {
+        let key = (link.peer.clone(), link.conn, link.stream);
+        if self.told.contains(&key) {
+            return;
+        }
+        if let Err(e) = link.send(endpoint, &Frame::Error(self.message().into())) {
+            crate::debug!("stop not sent: {e}");
+        }
+        if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
+            crate::debug!("close stream: {e}");
+        }
+        self.told.push(key);
+    }
+
+    /// Whether `event` is the peer half-closing a stream we told it on,
+    /// which it does once it has read the `Error`.
+    pub fn confirmed_by(&self, event: &EndpointEvent) -> bool {
+        match event {
+            EndpointEvent::StreamRemoteWriteClosed {
+                peer_id,
+                conn_id,
+                stream_id,
+            }
+            | EndpointEvent::StreamClosed {
+                peer_id,
+                conn_id,
+                stream_id,
+            } => self
+                .told
+                .iter()
+                .any(|(p, c, s)| p == peer_id && c == conn_id && s == stream_id),
+            _ => false,
+        }
+    }
+
+    pub fn is_due(&self) -> bool {
+        Instant::now() >= self.by
+    }
 }
 
 /// Ends a session however it ended: tells the peer when it should know,
@@ -220,25 +302,32 @@ pub fn finish(
             pipe.finish(None);
             Ok(())
         }
-        Ok(Exit::Interrupted) => {
-            abort(endpoint, link, peer, "interrupted");
-            pipe.finish(Some(STDOUT_GRACE));
-            Err(Interrupted.into())
-        }
-        Ok(Exit::Failed(message)) => {
-            abort(endpoint, link, peer, "the other side hit a local I/O error");
-            pipe.finish(Some(STDOUT_GRACE));
-            Err(message.into())
-        }
-        Err(e) if e.is::<PeerEnded>() => {
-            pipe.finish(Some(STDOUT_GRACE));
+        Ok(Exit::Stopped(stop)) => {
+            // The loop already told the peer, or gave up trying.
+            drop(link);
             if let Err(e) = endpoint.close() {
                 crate::debug!("close endpoint: {e}");
             }
+            pipe.finish(Some(STDOUT_GRACE));
+            Err(match stop.reason {
+                StopReason::Interrupted => Interrupted.into(),
+                StopReason::Failed(message) => message.into(),
+            })
+        }
+        Err(e) if e.is::<PeerEnded>() => {
+            pipe.finish(Some(STDOUT_GRACE));
+            // Half-closing back confirms to the peer that its Error landed.
+            linger_and_close(endpoint, link);
             Err(e)
         }
         Err(e) => {
-            abort(endpoint, link, peer, "the other side failed");
+            abort(
+                endpoint,
+                link,
+                peer,
+                "the other side failed",
+                Instant::now() + ABORT_GRACE,
+            );
             pipe.finish(Some(STDOUT_GRACE));
             Err(e)
         }
@@ -290,27 +379,53 @@ impl fmt::Display for PeerEnded {
 impl Error for PeerEnded {}
 
 /// Ends the session after a local action rather than a quiet disconnect,
-/// so the peer exits now instead of waiting out [`RESUME_TIMEOUT`]. The
-/// `Error` on the current stream can be lost if the peer is just moving to
-/// a new path, so for a short while we also answer the peer's resume
-/// attempts with it, leaving once the peer disconnects.
-fn abort(mut endpoint: Endpoint, link: Option<Link>, peer: Option<PeerId>, reason: &str) {
+/// so the peer exits now instead of waiting out [`RESUME_TIMEOUT`].
+///
+/// The `Error` can be lost with its stream, for instance when the peer is
+/// moving to a new path or a relay cuts the circuit, so until `by` we answer
+/// every stream the peer opens with it too. A lost connection proves
+/// nothing; the peer half-closing a stream we sent the `Error` on does.
+/// `peer` is `None` when the peer holds no session of ours to resume.
+fn abort(
+    mut endpoint: Endpoint,
+    link: Option<Link>,
+    peer: Option<PeerId>,
+    reason: &str,
+    by: Instant,
+) {
     let error = Frame::Error(reason.into());
-    if let Some(link) = &link {
-        if let Err(e) = link.send(&mut endpoint, &error) {
+    let mut told: Vec<Link> = Vec::new();
+    let tell = |endpoint: &mut Endpoint, told: &mut Vec<Link>, link: Link| {
+        if let Err(e) = link.send(endpoint, &error) {
             crate::debug!("abort not sent: {e}");
         }
         if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
             crate::debug!("close stream: {e}");
         }
+        told.push(link);
+    };
+    if let Some(link) = link {
+        tell(&mut endpoint, &mut told, link);
     }
     if let Some(peer) = peer {
-        let deadline = Instant::now() + ABORT_GRACE;
         loop {
-            match endpoint.wait(deadline) {
-                Ok(EndpointWaitOutcome::Event(EndpointEvent::ConnectionClosed {
-                    peer_id, ..
-                })) if peer_id == peer => break,
+            // A past deadline makes `wait` return without polling anything.
+            if Instant::now() >= by {
+                break;
+            }
+            match endpoint.wait(by) {
+                Ok(EndpointWaitOutcome::Event(
+                    EndpointEvent::StreamRemoteWriteClosed {
+                        peer_id,
+                        conn_id,
+                        stream_id,
+                    }
+                    | EndpointEvent::StreamClosed {
+                        peer_id,
+                        conn_id,
+                        stream_id,
+                    },
+                )) if told.iter().any(|l| l.is(&peer_id, conn_id, stream_id)) => break,
                 Ok(EndpointWaitOutcome::Event(EndpointEvent::StreamReady {
                     peer_id,
                     conn_id,
@@ -318,14 +433,11 @@ fn abort(mut endpoint: Endpoint, link: Option<Link>, peer: Option<PeerId>, reaso
                     initiated_locally: false,
                     ..
                 })) if peer_id == peer => {
-                    let late = Link::new(peer_id, conn_id, stream_id);
-                    if let Err(e) = late.send(&mut endpoint, &error) {
-                        crate::debug!("abort not sent on the resumed stream: {e}");
-                    }
-                    if let Err(e) = endpoint.close_stream_write(&late.peer, late.conn, late.stream)
-                    {
-                        crate::debug!("close stream: {e}");
-                    }
+                    tell(
+                        &mut endpoint,
+                        &mut told,
+                        Link::new(peer_id, conn_id, stream_id),
+                    );
                 }
                 Ok(EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted) => {}
                 Ok(EndpointWaitOutcome::Deadline) | Err(_) => break,

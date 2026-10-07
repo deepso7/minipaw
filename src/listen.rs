@@ -12,7 +12,7 @@ use minip2p::{
     StreamId,
 };
 
-use crate::net::{self, ABORT_GRACE, DELIVERED_GRACE, Exit, RESUME_TIMEOUT};
+use crate::net::{self, DELIVERED_GRACE, Exit, RESUME_TIMEOUT, Stop};
 use crate::pipe::{Link, Pipe};
 use crate::ticket::Ticket;
 use crate::wire::{Frame, FrameReader, PROTOCOL, SessionId, Token};
@@ -39,9 +39,8 @@ struct Server {
     lost_since: Option<Instant>,
     /// The user has been told the client is on a direct path.
     told_direct: bool,
-    /// Set by Ctrl-C while the client is between streams: give up waiting
-    /// for it to resume by then.
-    abort_by: Option<Instant>,
+    /// Ctrl-C or a local failure, once seen.
+    stop: Option<Stop>,
 }
 
 pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
@@ -64,7 +63,7 @@ pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
         pending: HashMap::new(),
         lost_since: None,
         told_direct: false,
-        abort_by: None,
+        stop: None,
     };
 
     eprintln!("# reserving a slot on relay {}…", relay.peer_id());
@@ -86,7 +85,7 @@ impl Server {
                 self.lost_since
                     .filter(|_| self.pipe.delivered())
                     .map(|t| t + DELIVERED_GRACE),
-                self.abort_by,
+                self.stop.as_ref().map(|stop| stop.by),
                 self.pending.values().map(|(_, deadline)| *deadline).min(),
             ]
             .into_iter()
@@ -106,24 +105,36 @@ impl Server {
                 if let EndpointEvent::Nat(NatEvent::RelayReservationLost { .. }) = &event {
                     eprintln!("# lost the relay reservation; reacquiring");
                 }
+                if self
+                    .stop
+                    .as_ref()
+                    .is_some_and(|stop| stop.confirmed_by(&event))
+                {
+                    return Ok(Exit::Stopped(self.stop.take().ok_or("no stop")?));
+                }
                 self.on_event(event)?;
             }
             self.expire_pending();
-            if net::interrupted() && self.ready_to_abort() {
-                return Ok(Exit::Interrupted);
-            }
             if !announced && !warned && started.elapsed() >= RESERVE_WARNING {
                 warned = true;
                 eprintln!("# still no relay reservation; is the relay reachable over UDP?");
             }
 
-            if let Err(e) = self.pipe.pump(&mut self.endpoint, self.link.as_ref()) {
-                self.lose(&format!("send failed: {e}"));
+            if self.stop.is_none() {
+                if let Err(e) = self.pipe.pump(&mut self.endpoint, self.link.as_ref()) {
+                    self.lose(&format!("send failed: {e}"));
+                }
+                self.stop = Stop::check(&self.pipe);
             }
-            if let Some(message) = self.pipe.failure()
-                && self.ready_to_abort()
-            {
-                return Ok(Exit::Failed(message));
+            if let Some(stop) = &mut self.stop {
+                // A server with no client has nobody to tell.
+                if self.client.is_none() || stop.is_due() {
+                    return Ok(Exit::Stopped(self.stop.take().ok_or("no stop")?));
+                }
+                if let Some(link) = &self.link {
+                    stop.tell(&mut self.endpoint, link);
+                }
+                continue;
             }
             if self.pipe.done() {
                 return Ok(Exit::Done);
@@ -288,20 +299,6 @@ impl Server {
         }
         self.link = Some(link);
         self.lost_since = None;
-    }
-
-    /// Whether Ctrl-C or a local failure can end the session now: the
-    /// client's stream is up to carry the news, there is no client, or the
-    /// grace ran out.
-    fn ready_to_abort(&mut self) -> bool {
-        if self.link.is_some() || self.client.is_none() {
-            return true;
-        }
-        let by = *self.abort_by.get_or_insert_with(|| {
-            crate::debug!("stopping between streams; waiting briefly to tell the client");
-            Instant::now() + ABORT_GRACE
-        });
-        Instant::now() >= by
     }
 
     fn evict_oldest_pending(&mut self) {
