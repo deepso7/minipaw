@@ -46,7 +46,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo test
+      # Linux only: the checks are the same on every platform, and macOS
+      # runners hit minip2p#306 (a relayed transfer can hang when hole
+      # punching fails). Run them locally on macOS.
       - name: End-to-end checks
+        if: runner.os == 'Linux'
         run: scripts/check.sh
         env:
           SHOW_LOGS: "1"
