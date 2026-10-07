@@ -41,14 +41,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # minip2p publishes relay binaries for Linux only; macOS builds one
+      # from the same tag and caches it.
+      - name: Download relay
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="minip2p-relay-server-$MINIP2P_REF-x86_64-unknown-linux-gnu"
+          cd "$RUNNER_TEMP"
+          gh release download "$MINIP2P_REF" -R deepso7/minip2p -p "$name.tar.gz" -p SHA256SUMS
+          grep " $name.tar.gz\$" SHA256SUMS | sha256sum -c -
+          tar xzf "$name.tar.gz"
+          mkdir -p relay-bin
+          mv "$name/minip2p-relay" relay-bin/
       - name: Cache relay
+        if: runner.os != 'Linux'
         id: relay-cache
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/relay-bin
           key: minip2p-relay-${{ runner.os }}-${{ env.MINIP2P_REF }}
       - name: Build relay
-        if: steps.relay-cache.outputs.cache-hit != 'true'
+        if: runner.os != 'Linux' && steps.relay-cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch "$MINIP2P_REF" https://github.com/deepso7/minip2p "$RUNNER_TEMP/minip2p"
           cargo build --release --manifest-path "$RUNNER_TEMP/minip2p/Cargo.toml" -p minip2p-relay-server-example
