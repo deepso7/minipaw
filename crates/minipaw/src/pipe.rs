@@ -9,6 +9,7 @@
 //! claiming a complete transfer.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -163,7 +164,8 @@ pub struct Stats {
 pub enum LocalFailure {
     /// Reading local input failed.
     Read(std::io::Error),
-    /// Writing local output failed (a closed reader is not a failure).
+    /// Writing local output failed (for [`Io::stdio`], a closed reader is
+    /// not a failure).
     Write(std::io::Error),
 }
 
@@ -213,6 +215,8 @@ pub struct Pipe {
     inb: Inbound,
     stdin: Receiver<Input>,
     stdin_open: bool,
+    /// Input read before the peer's `Fin` closed ours, still to be sent.
+    held: VecDeque<Vec<u8>>,
     /// Interactive stdin never ends on its own, so the peer finishing ends
     /// our side too; piped input is always sent through to its EOF.
     close_on_peer_fin: bool,
@@ -233,6 +237,7 @@ impl Pipe {
             input,
             output,
             close_on_peer_fin,
+            quiet_broken_pipe,
         } = io;
         let failure = Failure::default();
         let (stdin_tx, stdin) = mpsc::sync_channel(8);
@@ -241,6 +246,7 @@ impl Pipe {
         let (done_tx, writer_done) = mpsc::channel();
         let writer = spawn_output(
             output,
+            quiet_broken_pipe,
             stdout_rx,
             stats.clone(),
             failure.clone(),
@@ -252,6 +258,7 @@ impl Pipe {
             inb: Inbound::default(),
             stdin,
             stdin_open: true,
+            held: VecDeque::new(),
             close_on_peer_fin,
             stdout: Some(stdout),
             writer: Some(writer),
@@ -312,12 +319,14 @@ impl Pipe {
             }
             Frame::Fin { offset } => {
                 self.inb.on_fin(offset)?;
-                if self.close_on_peer_fin {
-                    // Input already read still goes out; only what was not
-                    // read yet is cut off.
-                    self.pull_stdin();
+                if self.close_on_peer_fin && self.stdin_open {
+                    // Input already read still goes out, even past a full
+                    // window; only what was not read yet is cut off.
                     self.stdin_open = false;
-                    self.out.close();
+                    while let Ok(Input::Data(data)) = self.stdin.try_recv() {
+                        self.held.push_back(data);
+                    }
+                    self.pull_stdin();
                 }
             }
             Frame::Error(message) => {
@@ -401,12 +410,20 @@ impl Pipe {
     }
 
     fn pull_stdin(&mut self) {
-        while self.stdin_open && self.out.has_room() {
+        if !self.stdin_open {
+            while self.out.has_room()
+                && let Some(data) = self.held.pop_front()
+            {
+                self.push_input(&data);
+            }
+            if self.held.is_empty() {
+                self.out.close();
+            }
+            return;
+        }
+        while self.out.has_room() {
             match self.stdin.try_recv() {
-                Ok(Input::Data(data)) => {
-                    self.out.push(&data);
-                    self.stats.read.store(self.out.end(), Ordering::Relaxed);
-                }
+                Ok(Input::Data(data)) => self.push_input(&data),
                 Ok(Input::Eof) | Err(TryRecvError::Disconnected) => {
                     self.stdin_open = false;
                     self.out.close();
@@ -414,6 +431,11 @@ impl Pipe {
                 Err(TryRecvError::Empty) => break,
             }
         }
+    }
+
+    fn push_input(&mut self, data: &[u8]) {
+        self.out.push(data);
+        self.stats.read.store(self.out.end(), Ordering::Relaxed);
     }
 
     /// When `pump` next has timed work on `link`: a backpressure retry, or
@@ -502,6 +524,7 @@ fn spawn_input(
 
 fn spawn_output(
     mut output: Box<dyn Write + Send>,
+    quiet_broken_pipe: bool,
     rx: Receiver<Vec<u8>>,
     stats: Arc<Stats>,
     failure: Failure,
@@ -511,10 +534,11 @@ fn spawn_output(
     thread::spawn(move || {
         let mut closed = false;
         for data in rx {
-            // A reader that went away (`| head`) wants no more output, like
-            // netcat: keep counting so the session still finishes.
+            // A stdout reader that went away (`| head`) wants no more
+            // output, like netcat: keep counting so the session still
+            // finishes. Any other writer failing is an error.
             if !closed && let Err(e) = output.write_all(&data).and_then(|()| output.flush()) {
-                if e.kind() != ErrorKind::BrokenPipe {
+                if !(quiet_broken_pipe && e.kind() == ErrorKind::BrokenPipe) {
                     failure.set(LocalFailure::Write(e));
                     wake.interrupt();
                     break;
@@ -530,4 +554,90 @@ fn spawn_output(
         // The receiver is gone once the session has ended.
         if done.send(()).is_err() {}
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+    use crate::window::WINDOW;
+
+    /// Yields the chunks sent to it, then blocks until the sender is gone,
+    /// counting its `read` calls.
+    struct ChunkReader(Receiver<Vec<u8>>, Arc<AtomicUsize>);
+
+    impl Read for ChunkReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            let Ok(chunk) = self.0.recv() else {
+                return Ok(0);
+            };
+            buf[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
+        }
+    }
+
+    struct BrokenWriter;
+
+    impl Write for BrokenWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn pipe(io: Io) -> Pipe {
+        Pipe::new(&WaitHandle::new(|| {}), io, Arc::default())
+    }
+
+    #[test]
+    fn peer_fin_sends_input_already_read_past_a_full_window() {
+        let (tx, rx) = mpsc::channel();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let io = Io::new(ChunkReader(rx, reads.clone()), io::sink()).close_on_peer_fin(true);
+        let mut pipe = pipe(io);
+        let chunks = WINDOW / MAX_DATA + 3;
+        for _ in 0..chunks {
+            tx.send(vec![1; MAX_DATA]).unwrap();
+        }
+        // The window fills, and once the reader is asked for more than we
+        // sent, every chunk it returned is queued for the pipe.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pipe.out.has_room() || reads.load(Ordering::SeqCst) <= chunks {
+            assert!(Instant::now() < deadline, "input never filled the window");
+            pipe.pull_stdin();
+            thread::yield_now();
+        }
+
+        pipe.on_frame(Frame::Fin { offset: 0 }).unwrap();
+        for _ in 0..=chunks {
+            while pipe.out.next_chunk().is_some() {}
+            pipe.out.ack(pipe.out.end(), false).unwrap();
+            pipe.pull_stdin();
+        }
+        assert_eq!(pipe.out.end(), (chunks * MAX_DATA) as u64);
+        assert_eq!(pipe.out.fin_due(), Some(pipe.out.end()));
+    }
+
+    #[test]
+    fn broken_pipe_from_a_custom_writer_is_an_error() {
+        let mut pipe = pipe(Io::new(io::empty(), BrokenWriter));
+        pipe.on_frame(Frame::Data(vec![1; 16])).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match pipe.take_failure() {
+                Some(LocalFailure::Write(e)) => {
+                    assert_eq!(e.kind(), ErrorKind::BrokenPipe);
+                    break;
+                }
+                Some(other) => panic!("unexpected failure: {other}"),
+                None => assert!(Instant::now() < deadline, "no write failure"),
+            }
+            thread::yield_now();
+        }
+    }
 }

@@ -118,6 +118,16 @@ A blocking read cannot be cancelled, so the input thread can outlive
 may take one more chunk of stdin that way, so run one stdio session per
 process.
 
+The output thread can outlive `run` as well: when a session stops or fails,
+`run` waits up to a second for a blocked write, then returns. The thread
+finishes writing the data it already received and only then drops the
+writer; unblock a writer you own (`shutdown` a socket) to end it early.
+
+`Io::stdio()` treats stdout's reader going away (`| head`) as netcat does:
+the rest of the peer's data is discarded and the session still succeeds.
+For writers passed to `Io::new`, any write error, `BrokenPipe` included,
+ends the session with `Error::Output`.
+
 ## Events and logging
 
 `Event` reports milestones: reserving, holding, losing and regaining a relay

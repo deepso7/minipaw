@@ -14,10 +14,18 @@ use std::io::{IsTerminal as _, Read, Write};
 /// socket, `shutdown`; for a channel, drop the sender). With
 /// [`Io::stdio`], the thread may take one more chunk of stdin, so run one
 /// stdio session per process.
+///
+/// The output thread can outlive it too: when the session stops or fails,
+/// `run` waits up to a second for a blocked `write`, then leaves the thread
+/// behind. It still owns `output`, finishes writing the data it had already
+/// received, and drops `output` after that. With a writer you own, unblock
+/// it to end it early (for a socket, `shutdown`).
 pub struct Io {
     pub(crate) input: Box<dyn Read + Send>,
     pub(crate) output: Box<dyn Write + Send>,
     pub(crate) close_on_peer_fin: bool,
+    /// A closed stdout reader (`| head`) is not an error.
+    pub(crate) quiet_broken_pipe: bool,
 }
 
 impl Io {
@@ -28,14 +36,19 @@ impl Io {
             input: Box::new(input),
             output: Box::new(output),
             close_on_peer_fin: false,
+            quiet_broken_pipe: false,
         }
     }
 
     /// The process's stdin and stdout. Interactive stdin never ends on its
     /// own, so when it is a terminal the peer finishing ends our side too.
+    /// As with netcat, stdout's reader going away (`| head`) is not an
+    /// error: the rest of the peer's data is discarded.
     pub fn stdio() -> Self {
-        Io::new(std::io::stdin(), std::io::stdout())
-            .close_on_peer_fin(std::io::stdin().is_terminal())
+        let mut io = Io::new(std::io::stdin(), std::io::stdout())
+            .close_on_peer_fin(std::io::stdin().is_terminal());
+        io.quiet_broken_pipe = true;
+        io
     }
 
     /// Whether the peer finishing its side also ends ours, as if `input`
