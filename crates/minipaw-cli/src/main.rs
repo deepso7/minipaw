@@ -3,6 +3,7 @@
 //! control plane. Connection details travel out of band as a ticket.
 
 mod args;
+mod serve;
 mod ui;
 
 use std::process::ExitCode;
@@ -32,10 +33,26 @@ fn main() -> ExitCode {
                 }
             };
         }
+        Some(Command::Serve {
+            forward,
+            identity,
+            new,
+            max_sessions,
+            relay,
+        }) => {
+            ui::log::install(args.verbose, false);
+            return serve::run(&serve::Options {
+                forward,
+                identity: identity.as_deref(),
+                new: *new,
+                max_sessions: *max_sessions,
+                relay: relay.as_deref(),
+            });
+        }
         None => {}
     }
     term::install_panic_hook();
-    ui::log::install(args.verbose);
+    ui::log::install(args.verbose, args.quiet);
     let mut config = match args::config(&args) {
         Ok(config) => config,
         Err(e) => {
@@ -44,10 +61,10 @@ fn main() -> ExitCode {
         }
     };
     if let Some(path) = &args.identity {
-        match args::load_identity(Some(path)) {
+        match args::load_identity(Some(path), false) {
             // An existing identity is the usual case; only a new one is news.
             Ok((identity, path, created)) => {
-                if created {
+                if created && !args.quiet {
                     eprintln!("{}", args::identity_line(&path, created));
                 }
                 config.identity = Some(identity);
@@ -58,7 +75,7 @@ fn main() -> ExitCode {
             }
         }
     }
-    let mode = ui::choose_mode(args.plain);
+    let mode = ui::choose_mode(args.quiet, args.plain);
     let result = ui::run(mode, Launch::new(args.ticket, config, args.verbose));
     // Errors print on a restored terminal.
     term::restore();

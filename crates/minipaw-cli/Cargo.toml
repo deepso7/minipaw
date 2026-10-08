@@ -19,5 +19,8 @@ ctrlc.workspace = true
 log.workspace = true
 ratatui.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true
+
 [lints]
 workspace = true

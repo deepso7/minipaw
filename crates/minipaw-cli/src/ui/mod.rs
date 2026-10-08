@@ -3,7 +3,8 @@
 //!
 //! - [`plain`]: `#` status lines on stderr, as scripts expect;
 //! - [`panel`]: an inline status panel on stderr while stdout carries data;
-//! - [`chat`]: a chat in an inline box when stdin and stdout are a terminal.
+//! - [`chat`]: a chat in an inline box when stdin and stdout are a terminal;
+//! - quiet (`-q`, in [`plain`]): nothing at all, for ssh's ProxyCommand.
 //!
 //! The interfaces here and in [`state`], [`fmt`], [`term`] and [`log`] are
 //! what the panel and chat build on.
@@ -30,23 +31,28 @@ pub enum Mode {
     Panel,
     /// A chat in an inline box; stdin and stdout are the terminal.
     Chat,
+    /// Nothing on stderr but a fatal error, from `main`.
+    Quiet,
 }
 
 /// The smallest terminal, as `(columns, rows)`, the panel and chat draw
 /// in; anything smaller gets [`Mode::Plain`].
 pub const MIN_SIZE: (u16, u16) = (40, 8);
 
-/// Picks the mode from the facts that decide it: `--plain`, which of
+/// Picks the mode from the facts that decide it: `-q`, `--plain`, which of
 /// stdin, stdout and stderr are terminals, and whether `TERM` is dumb or
 /// unset.
 pub fn select_mode(
+    quiet: bool,
     plain: bool,
     stdin_tty: bool,
     stdout_tty: bool,
     stderr_tty: bool,
     dumb: bool,
 ) -> Mode {
-    if plain || !stderr_tty || dumb {
+    if quiet {
+        Mode::Quiet
+    } else if plain || !stderr_tty || dumb {
         Mode::Plain
     } else if stdin_tty && stdout_tty {
         Mode::Chat
@@ -59,16 +65,17 @@ pub fn select_mode(
 
 /// [`select_mode`] for this process, falling back to [`Mode::Plain`] when
 /// the terminal is smaller than [`MIN_SIZE`] or its size is unknown.
-pub fn choose_mode(plain: bool) -> Mode {
+pub fn choose_mode(quiet: bool, plain: bool) -> Mode {
     let dumb = std::env::var_os("TERM").is_none_or(|term| term.is_empty() || term == "dumb");
     let mode = select_mode(
+        quiet,
         plain,
         std::io::stdin().is_terminal(),
         std::io::stdout().is_terminal(),
         std::io::stderr().is_terminal(),
         dumb,
     );
-    if mode == Mode::Plain {
+    if matches!(mode, Mode::Plain | Mode::Quiet) {
         return mode;
     }
     match term::size() {
@@ -157,11 +164,12 @@ pub enum UiMsg {
     Log(::log::Level, String),
 }
 
-/// Runs the session in `mode`. The logger is installed (`-v` decides the
-/// level) and the terminal is restored by the caller.
+/// Runs the session in `mode`. The logger is installed (`-v` and `-q`
+/// decide the level) and the terminal is restored by the caller.
 pub fn run(mode: Mode, launch: Launch) -> Result<Outcome, Error> {
-    log::install(launch.verbose);
+    log::install(launch.verbose, mode == Mode::Quiet);
     match mode {
+        Mode::Quiet => plain::run_quiet(launch),
         Mode::Plain => plain::run(launch),
         Mode::Panel => panel::run(launch),
         Mode::Chat => chat::run(launch),
@@ -174,7 +182,7 @@ mod tests {
 
     #[test]
     fn mode_table() {
-        use Mode::{Chat, Panel, Plain};
+        use Mode::{Chat, Panel, Plain, Quiet};
         // (plain, stdin, stdout, stderr, dumb) -> mode
         let table = [
             ((false, true, true, true, false), Chat),
@@ -191,10 +199,13 @@ mod tests {
         ];
         for ((plain, stdin, stdout, stderr, dumb), want) in table {
             assert_eq!(
-                select_mode(plain, stdin, stdout, stderr, dumb),
+                select_mode(false, plain, stdin, stdout, stderr, dumb),
                 want,
                 "plain={plain} stdin={stdin} stdout={stdout} stderr={stderr} dumb={dumb}"
             );
+            // -q wins over everything: a ProxyCommand's stderr is the
+            // user's terminal, and its stdin and stdout are pipes.
+            assert_eq!(select_mode(true, plain, stdin, stdout, stderr, dumb), Quiet);
         }
     }
 }

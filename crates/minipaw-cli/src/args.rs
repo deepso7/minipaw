@@ -1,8 +1,13 @@
 //! The command line, and the settings it and the environment make.
 
 use std::ffi::OsString;
+use std::fmt;
+use std::net::{SocketAddr, ToSocketAddrs as _};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::time::Duration;
 
+use clap::builder::RangedU64ValueParser;
 use clap::error::ErrorKind;
 use clap::{CommandFactory as _, Parser, Subcommand};
 use minipaw::{Config, Identity, Multiaddr, PeerAddr, Ticket};
@@ -16,17 +21,20 @@ use minipaw::{Config, Identity, Multiaddr, PeerAddr, Ticket};
 #[command(
     name = "minipaw",
     version,
-    override_usage = "minipaw [OPTIONS] [TICKET]\n       minipaw [-v] parse <TICKET>\n       minipaw [-v] ticket [--identity PATH] [--relay MULTIADDR]",
+    override_usage = "minipaw [OPTIONS] [TICKET]\n       minipaw [-v] parse <TICKET>\n       minipaw [-v] ticket [--identity PATH] [--relay MULTIADDR]\n       minipaw [-v] serve [--forward HOST:PORT|PORT] [--identity PATH] [--new] [--max-sessions N] [--relay MULTIADDR]",
     after_help = "\
 Examples:
   minipaw <big.iso                 send a file; prints a ticket
   minipaw <ticket> >big.iso        receive it on another machine
   minipaw / minipaw <ticket>       chat, when run in a terminal on both ends
   minipaw --identity my.key        listen with the same ticket every run
+  minipaw serve                    forward every session to local port 22
+  ssh -o ProxyCommand='minipaw -q <ticket>' user@host
+                                   ssh to that machine through it
 
 Environment:
   MINIPAW_RELAY   relay to use when --relay is not given (empty: the built-in relay)
-  MINIPAW_HOME    where `minipaw ticket` keeps serve.key (default:
+  MINIPAW_HOME    where `minipaw ticket` and `serve` keep serve.key (default:
                   $XDG_CONFIG_HOME/minipaw, else ~/.config/minipaw)"
 )]
 pub struct Args {
@@ -52,6 +60,12 @@ pub struct Args {
     #[arg(short, long, global = true)]
     pub verbose: bool,
 
+    /// Print nothing on stderr but a fatal error: no UI, no status lines,
+    /// no log, even with -v. For ssh's ProxyCommand, which shares stderr
+    /// with the ssh session.
+    #[arg(short, long, global = true)]
+    pub quiet: bool,
+
     /// Print plain status lines instead of the terminal UI.
     #[arg(long)]
     pub plain: bool,
@@ -62,7 +76,8 @@ pub struct Args {
 
 impl Args {
     /// Parses `argv` (program name first). Session options cannot go with
-    /// a subcommand; `-v` goes with anything.
+    /// a subcommand; `-v` goes with anything, and `-q` with anything but
+    /// `ticket` and `serve`, whose status lines are their output.
     ///
     /// # Errors
     ///
@@ -84,6 +99,17 @@ impl Args {
                     format!("{name} cannot be used with a subcommand"),
                 ));
             }
+        }
+        if args.quiet
+            && matches!(
+                args.command,
+                Some(Command::Ticket { .. } | Command::Serve { .. })
+            )
+        {
+            return Err(Self::command().error(
+                ErrorKind::ArgumentConflict,
+                "--quiet cannot be used with ticket or serve",
+            ));
         }
         Ok(args)
     }
@@ -111,6 +137,115 @@ pub enum Command {
         #[arg(long, value_name = "MULTIADDR")]
         relay: Option<String>,
     },
+    /// Listen with a stable ticket and forward every session to a local
+    /// TCP port, several at once, until Ctrl-C. Status goes to stderr as
+    /// `#` lines.
+    Serve {
+        /// Where to connect each session: HOST:PORT, or a PORT on
+        /// 127.0.0.1. Resolved once, at startup.
+        #[arg(long, value_name = "HOST:PORT", default_value = "127.0.0.1:22")]
+        forward: Forward,
+        /// The identity file, created if missing. Defaults to serve.key in
+        /// $MINIPAW_HOME, else $XDG_CONFIG_HOME/minipaw, else
+        /// ~/.config/minipaw.
+        #[arg(long, value_name = "PATH")]
+        identity: Option<PathBuf>,
+        /// Replace the identity with a new one first, so the old ticket
+        /// stops working.
+        #[arg(long)]
+        new: bool,
+        /// How many sessions to serve at once; more are refused as busy.
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = minipaw::DEFAULT_MAX_SESSIONS,
+            value_parser = RangedU64ValueParser::<usize>::new().range(1..),
+        )]
+        max_sessions: usize,
+        /// Circuit Relay v2 server (QUIC) to listen through; it is part of
+        /// the ticket. Defaults to $MINIPAW_RELAY, then the built-in relay.
+        #[arg(long, value_name = "MULTIADDR")]
+        relay: Option<String>,
+    },
+}
+
+/// Where `serve` forwards to, as given: a host (name or IP) and a port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Forward {
+    /// A name or an IP address, without brackets.
+    pub host: String,
+    /// The port.
+    pub port: u16,
+}
+
+impl Forward {
+    /// The addresses to connect to, in order: resolved now, once, so a
+    /// name that stops resolving later cannot fail a session.
+    ///
+    /// # Errors
+    ///
+    /// When it does not resolve, with the message to print.
+    pub fn resolve(&self) -> Result<Vec<SocketAddr>, String> {
+        let addrs: Vec<SocketAddr> = (self.host.as_str(), self.port)
+            .to_socket_addrs()
+            .map_err(|e| format!("cannot resolve {self}: {e}"))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(format!("cannot resolve {self}: no addresses"));
+        }
+        Ok(addrs)
+    }
+}
+
+/// A bare port means 127.0.0.1; an IPv6 host goes in brackets.
+impl FromStr for Forward {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let port = |p: &str| match p.parse::<u16>() {
+            Ok(0) | Err(_) => Err(format!("invalid port '{p}': expected 1-65535")),
+            Ok(port) => Ok(port),
+        };
+        if !s.contains(':') {
+            if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+                return Ok(Forward {
+                    host: "127.0.0.1".into(),
+                    port: port(s)?,
+                });
+            }
+            return Err(format!("expected HOST:PORT or PORT, got '{s}'"));
+        }
+        let (host, p) = s
+            .rsplit_once(':')
+            .ok_or_else(|| format!("expected HOST:PORT or PORT, got '{s}'"))?;
+        let host = match host.strip_prefix('[') {
+            Some(inner) => inner
+                .strip_suffix(']')
+                .ok_or_else(|| format!("unclosed '[' in '{s}'"))?,
+            // A bare IPv6 address would be ambiguous: `::1:22`.
+            None if host.contains(':') => {
+                return Err(format!("put an IPv6 host in brackets: '[{host}]:PORT'"));
+            }
+            None => host,
+        };
+        if host.is_empty() {
+            return Err(format!("expected HOST:PORT or PORT, got '{s}'"));
+        }
+        Ok(Forward {
+            host: host.to_owned(),
+            port: port(p)?,
+        })
+    }
+}
+
+impl fmt::Display for Forward {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.host.contains(':') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
+    }
 }
 
 /// The session settings from `args` and the `MINIPAW_*` environment.
@@ -133,16 +268,7 @@ fn config_with(args: &Args, env: impl Fn(&str) -> Option<OsString>) -> Result<Co
     match &args.ticket {
         None => {
             config.relay = relay(args.relay.as_deref())?;
-            // Test hook: the listener forgets its stream after this many
-            // bytes.
-            if let Some(raw) = var("MINIPAW_TEST_DROP_LINK_AFTER") {
-                config.test_drop_link_after =
-                    Some(raw.parse().map_err(|e| {
-                        format!("invalid MINIPAW_TEST_DROP_LINK_AFTER '{raw}': {e}")
-                    })?);
-            }
-            // Test hook: the listener never sends its first Welcome.
-            config.test_drop_welcome = env("MINIPAW_TEST_DROP_WELCOME").is_some();
+            listener_hooks(&mut config, &env)?;
         }
         Some(ticket) => {
             // Tickets carry their relay; only one without needs ours.
@@ -162,6 +288,72 @@ fn config_with(args: &Args, env: impl Fn(&str) -> Option<OsString>) -> Result<Co
         }
     }
     Ok(config)
+}
+
+/// The test hooks a listener and a server share.
+fn listener_hooks(
+    config: &mut Config,
+    env: impl Fn(&str) -> Option<OsString>,
+) -> Result<(), String> {
+    // Test hook: the listener forgets its stream after this many bytes.
+    if let Some(raw) = env("MINIPAW_TEST_DROP_LINK_AFTER").and_then(|v| v.into_string().ok()) {
+        config.test_drop_link_after = Some(
+            raw.parse()
+                .map_err(|e| format!("invalid MINIPAW_TEST_DROP_LINK_AFTER '{raw}': {e}"))?,
+        );
+    }
+    // Test hook: the listener never sends its first Welcome.
+    config.test_drop_welcome = env("MINIPAW_TEST_DROP_WELCOME").is_some();
+    Ok(())
+}
+
+/// What `serve` runs with besides its target and identity.
+#[derive(Debug)]
+pub struct ServeConfig {
+    /// The server's settings, without the identity.
+    pub config: Config,
+    /// Test hook `MINIPAW_TEST_CONNECT_DELAY` (seconds): how long each
+    /// session waits before connecting to the target, to hold it in its
+    /// connecting state.
+    pub connect_delay: Option<Duration>,
+}
+
+/// The settings for `serve` from its flags and the `MINIPAW_*`
+/// environment.
+///
+/// # Errors
+///
+/// When a setting is invalid, with the message to print.
+pub fn serve_config(relay: Option<&str>, max_sessions: usize) -> Result<ServeConfig, String> {
+    serve_config_with(relay, max_sessions, |name| std::env::var_os(name))
+}
+
+/// [`serve_config`] with `env` standing in for the environment.
+fn serve_config_with(
+    relay: Option<&str>,
+    max_sessions: usize,
+    env: impl Fn(&str) -> Option<OsString>,
+) -> Result<ServeConfig, String> {
+    let mut config = Config::default();
+    config.force_relay = env("MINIPAW_FORCE_RELAY").is_some();
+    config.relay = relay_with(relay, &env)?;
+    config.max_sessions = max_sessions;
+    listener_hooks(&mut config, &env)?;
+    let connect_delay = match env("MINIPAW_TEST_CONNECT_DELAY").and_then(|v| v.into_string().ok()) {
+        None => None,
+        Some(raw) => Some(
+            raw.parse::<f64>()
+                .ok()
+                .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
+                .ok_or_else(|| {
+                    format!("invalid MINIPAW_TEST_CONNECT_DELAY '{raw}': expected seconds")
+                })?,
+        ),
+    };
+    Ok(ServeConfig {
+        config,
+        connect_delay,
+    })
 }
 
 /// `--relay`, else `MINIPAW_RELAY`; empty or neither means the default.
@@ -195,14 +387,14 @@ fn default_identity_with(env: impl Fn(&str) -> Option<OsString>) -> Result<PathB
 }
 
 /// Loads the identity at `path`, creating it if missing, and says whether
-/// it was created. Without a `path` it is the default one, whose directory
-/// is created (mode 0700) if missing; an existing directory is never
-/// changed.
+/// it was created. With `new`, a fresh one replaces whatever is there.
+/// Without a `path` it is the default one, whose directory is created
+/// (mode 0700) if missing; an existing directory is never changed.
 ///
 /// # Errors
 ///
 /// When the identity cannot be loaded or created, with the message to print.
-pub fn load_identity(path: Option<&Path>) -> Result<(Identity, PathBuf, bool), String> {
+pub fn load_identity(path: Option<&Path>, new: bool) -> Result<(Identity, PathBuf, bool), String> {
     let path = match path {
         Some(path) => path.to_owned(),
         None => {
@@ -213,6 +405,11 @@ pub fn load_identity(path: Option<&Path>) -> Result<(Identity, PathBuf, bool), S
             path
         }
     };
+    if new {
+        let identity = Identity::generate().map_err(|e| e.to_string())?;
+        identity.replace(&path).map_err(|e| e.to_string())?;
+        return Ok((identity, path, true));
+    }
     let (identity, created) = Identity::load_or_create(&path).map_err(|e| e.to_string())?;
     Ok((identity, path, created))
 }
@@ -241,7 +438,7 @@ pub fn stable_ticket(
     relay: Option<&str>,
 ) -> Result<(Ticket, PathBuf, bool), String> {
     let relay = relay_with(relay, |name| std::env::var_os(name))?;
-    let (identity, path, created) = load_identity(identity)?;
+    let (identity, path, created) = load_identity(identity, false)?;
     Ok((identity.ticket(relay.as_ref()), path, created))
 }
 
@@ -331,6 +528,105 @@ mod tests {
     }
 
     #[test]
+    fn serve_and_its_defaults() {
+        let args = parse(&["serve"]).expect("serve");
+        let Some(Command::Serve {
+            forward,
+            identity,
+            new,
+            max_sessions,
+            relay,
+        }) = args.command
+        else {
+            panic!("not serve");
+        };
+        assert_eq!(forward.to_string(), "127.0.0.1:22");
+        assert!(identity.is_none() && !new && relay.is_none());
+        assert_eq!(max_sessions, minipaw::DEFAULT_MAX_SESSIONS);
+
+        let argv = [
+            "-v",
+            "serve",
+            "--forward",
+            "2222",
+            "--identity",
+            "s.key",
+            "--new",
+            "--max-sessions",
+            "3",
+            "--relay",
+            RELAY,
+        ];
+        let args = parse(&argv).expect("serve");
+        assert!(args.verbose);
+        let Some(Command::Serve {
+            forward,
+            identity,
+            new,
+            max_sessions,
+            relay,
+        }) = args.command
+        else {
+            panic!("not serve");
+        };
+        assert_eq!(forward.to_string(), "127.0.0.1:2222");
+        assert_eq!(identity.as_deref(), Some(Path::new("s.key")));
+        assert!(new);
+        assert_eq!(max_sessions, 3);
+        assert_eq!(relay.as_deref(), Some(RELAY));
+    }
+
+    #[test]
+    fn forward_targets() {
+        let ok = |s: &str| s.parse::<Forward>().expect(s);
+        let fwd = |host: &str, port| Forward {
+            host: host.into(),
+            port,
+        };
+        assert_eq!(ok("22"), fwd("127.0.0.1", 22));
+        assert_eq!(ok("example.com:8022"), fwd("example.com", 8022));
+        assert_eq!(ok("10.0.0.5:22"), fwd("10.0.0.5", 22));
+        assert_eq!(ok("[::1]:2222"), fwd("::1", 2222));
+        assert_eq!(ok("[::1]:2222").to_string(), "[::1]:2222");
+        for bad in [
+            "",
+            "host",
+            "host:",
+            ":22",
+            "host:0",
+            "host:65536",
+            "0",
+            "99999",
+            "::1:22",
+            "[::1:22",
+            "[]:22",
+            "host:x",
+        ] {
+            assert!(bad.parse::<Forward>().is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            ok("127.0.0.1:22").resolve().expect("resolve"),
+            ["127.0.0.1:22".parse::<SocketAddr>().expect("addr")]
+        );
+        assert_eq!(
+            parse(&["serve", "--forward", "nope"]).unwrap_err().kind(),
+            ErrorKind::ValueValidation
+        );
+    }
+
+    #[test]
+    fn quiet_goes_with_sessions_and_overrides_nothing_else() {
+        let args = parse(&["-q", "-v", TICKET]).expect("quiet dial");
+        assert!(args.quiet && args.verbose);
+        let args = parse(&[TICKET, "--quiet"]).expect("quiet dial");
+        assert!(args.quiet);
+        let args = parse(&["-q", "--identity", "my.key"]).expect("quiet listen");
+        assert!(args.quiet);
+        let args = parse(&["-q", "parse", TICKET]).expect("quiet parse");
+        assert!(args.quiet);
+    }
+
+    #[test]
     fn usage_errors() {
         let kind = |argv: &[&str]| parse(argv).map(|_| ()).unwrap_err().kind();
         assert_eq!(
@@ -364,6 +660,28 @@ mod tests {
             assert_eq!(kind(&argv), ErrorKind::ArgumentConflict, "{argv:?}");
         }
         assert_eq!(kind(&["ticket", TICKET]), ErrorKind::UnknownArgument);
+        // `serve` takes no ticket or session flags, and its status lines
+        // are its output, so neither it nor `ticket` goes quiet.
+        for argv in [
+            &[TICKET, "serve"][..],
+            &["--plain", "serve"],
+            &["--relay", RELAY, "serve"],
+            &["--identity", "my.key", "serve"],
+            &["-q", "serve"],
+            &["serve", "--quiet"],
+            &["-q", "ticket"],
+        ] {
+            assert_eq!(kind(argv), ErrorKind::ArgumentConflict, "{argv:?}");
+        }
+        assert_eq!(kind(&["serve", TICKET]), ErrorKind::UnknownArgument);
+        assert_eq!(kind(&["serve", "--plain"]), ErrorKind::UnknownArgument);
+        for n in ["0", "x", "1.5"] {
+            assert_eq!(
+                kind(&["serve", "--max-sessions", n]),
+                ErrorKind::ValueValidation,
+                "{n}"
+            );
+        }
         assert_eq!(kind(&["ticket", "--plain"]), ErrorKind::UnknownArgument);
         assert_eq!(parse(&["parse", "x"]).unwrap_err().exit_code(), 2);
     }
@@ -400,6 +718,40 @@ mod tests {
         // The dialer uses MINIPAW_RELAY for a ticket without a relay.
         let config = config_with(&dial, env(&[("MINIPAW_RELAY", RELAY)])).expect("config");
         assert!(config.relay.is_some());
+    }
+
+    #[test]
+    fn serve_config_from_the_environment() {
+        let config = serve_config_with(None, 4, env(&[])).expect("config");
+        assert_eq!(config.config.max_sessions, 4);
+        assert!(config.config.relay.is_none() && !config.config.force_relay);
+        assert!(config.connect_delay.is_none());
+
+        let vars = [
+            ("MINIPAW_FORCE_RELAY", ""),
+            ("MINIPAW_RELAY", RELAY),
+            ("MINIPAW_TEST_DROP_LINK_AFTER", "1000"),
+            ("MINIPAW_TEST_DROP_WELCOME", "1"),
+            ("MINIPAW_TEST_CONNECT_DELAY", "2.5"),
+        ];
+        let config = serve_config_with(None, 16, env(&vars)).expect("config");
+        assert!(config.config.force_relay && config.config.relay.is_some());
+        assert_eq!(config.config.test_drop_link_after, Some(1000));
+        assert!(config.config.test_drop_welcome);
+        assert_eq!(config.connect_delay, Some(Duration::from_millis(2500)));
+
+        let err = |vars: &[(&str, &str)]| serve_config_with(None, 1, env(vars)).unwrap_err();
+        for raw in ["soon", "-1", "inf"] {
+            assert_eq!(
+                err(&[("MINIPAW_TEST_CONNECT_DELAY", raw)]),
+                format!("invalid MINIPAW_TEST_CONNECT_DELAY '{raw}': expected seconds")
+            );
+        }
+        assert!(
+            serve_config_with(Some("nope"), 1, env(&[]))
+                .unwrap_err()
+                .starts_with("invalid relay address 'nope': ")
+        );
     }
 
     #[test]

@@ -28,15 +28,23 @@ static LOGGER: Logger = Logger {
     sink: Mutex::new(Sink::Stderr),
 };
 
-/// Installs the logger: debug records with `verbose`, warnings and errors
-/// otherwise. Later calls do nothing.
-pub fn install(verbose: bool) {
+/// Installs the logger at [`level`]. Later calls do nothing.
+pub fn install(verbose: bool, quiet: bool) {
     if log::set_logger(&LOGGER).is_ok() {
-        log::set_max_level(if verbose {
-            log::LevelFilter::Debug
-        } else {
-            log::LevelFilter::Warn
-        });
+        log::set_max_level(level(verbose, quiet));
+    }
+}
+
+/// Debug records with `verbose`, warnings and errors otherwise, and none
+/// at all with `quiet`, which wins: under ssh's ProxyCommand stderr is the
+/// user's terminal, shared with the ssh session.
+pub fn level(verbose: bool, quiet: bool) -> log::LevelFilter {
+    if quiet {
+        log::LevelFilter::Off
+    } else if verbose {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Warn
     }
 }
 
@@ -102,5 +110,13 @@ mod tests {
         assert_eq!(plain_line(log::Level::Info, "hi"), "# hi");
         assert_eq!(plain_line(log::Level::Warn, "uh oh"), "minipaw: uh oh");
         assert_eq!(plain_line(log::Level::Error, "bad"), "minipaw: bad");
+    }
+
+    #[test]
+    fn quiet_overrides_verbose() {
+        assert_eq!(level(false, false), log::LevelFilter::Warn);
+        assert_eq!(level(true, false), log::LevelFilter::Debug);
+        assert_eq!(level(false, true), log::LevelFilter::Off);
+        assert_eq!(level(true, true), log::LevelFilter::Off);
     }
 }

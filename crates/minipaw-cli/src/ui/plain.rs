@@ -15,6 +15,25 @@ pub fn run(launch: Launch) -> Result<Outcome, Error> {
     session.run()
 }
 
+/// Runs the session over stdin and stdout printing nothing, for `-q`;
+/// `main` prints a fatal error. Ctrl-C stops it, as in plain mode.
+///
+/// SIGHUP is ignored. As a ProxyCommand, ssh closes our stdin and stdout
+/// and hangs up on us as it exits, which would kill us while the session
+/// is finishing on its own; the server would then hold it until it gave
+/// up on the link (over a minute), counting against its session limit.
+pub fn run_quiet(launch: Launch) -> Result<Outcome, Error> {
+    #[cfg(unix)]
+    {
+        let hung_up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        signal_hook::flag::register(signal_hook::consts::SIGHUP, hung_up)
+            .map_err(|e| Error::Other(format!("ignoring SIGHUP: {e}")))?;
+    }
+    let session = launch.session(Io::stdio());
+    term::install_interrupts(session.handle()).map_err(Error::Other)?;
+    session.run()
+}
+
 /// Prints a session event as a `#` status line on stderr, if it has one.
 pub fn print_event(event: &Event) {
     if let Some(text) = event_text(event) {

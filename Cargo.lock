@@ -1388,6 +1388,7 @@ dependencies = [
  "log",
  "minipaw",
  "ratatui",
+ "signal-hook",
 ]
 
 [[package]]
