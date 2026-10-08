@@ -49,7 +49,7 @@ const MAX_MSGS_PER_TICK: usize = 1000;
 const INLINE_HEIGHT: u16 = 3;
 /// The box's key hints, left out when the box is narrow.
 const INLINE_HINTS: &str = "Ctrl-D end · Ctrl-C quit";
-/// Narrower than this, the box leaves out its hints and the peer.
+/// Narrower than this, the box leaves out the peer.
 const INLINE_WIDE: u16 = 80;
 
 /// Runs the session as a chat.
@@ -353,7 +353,10 @@ impl Chat {
         for line in self.splitter.finish() {
             self.push(Who::Peer, line);
         }
-        self.state.finish(&result, Instant::now());
+        // The last tick may predate the session's last bytes.
+        let now = Instant::now();
+        self.state.tick(now, handle.progress());
+        self.state.finish(&result, now);
         Ok(result)
     }
 
@@ -674,11 +677,14 @@ impl Chat {
             sep(),
             Span::styled(fmt::duration(state.elapsed(now)), t.hint),
         ]);
-        if wide {
+        let status = Line::from(status);
+        // The hints only where they fit beside the status, with a gap.
+        let room = usize::from(status_area.width).saturating_sub(status.width());
+        if room >= INLINE_HINTS.chars().count() + 2 {
             let hints = Line::styled(INLINE_HINTS, t.hint).right_aligned();
             frame.render_widget(Paragraph::new(hints), status_area);
         }
-        frame.render_widget(Paragraph::new(Line::from(status)), status_area);
+        frame.render_widget(Paragraph::new(status), status_area);
     }
 
     /// Prints what is left in place of the box, leaving the cursor after
@@ -795,6 +801,11 @@ mod tests {
             "{rows:?}"
         );
         assert!(rows[2].ends_with("Ctrl-D end · Ctrl-C quit"), "{rows:?}");
+
+        // Where the hints would run into the status, they are left out.
+        let rows = box_rows(&chat, 82, t0);
+        assert!(rows[2].contains("12D3KooW…tLdf"), "{rows:?}");
+        assert!(!rows[2].contains("Ctrl-"), "{rows:?}");
 
         // Narrow: no hints, no peer.
         let rows = box_rows(&chat, 50, t0);
