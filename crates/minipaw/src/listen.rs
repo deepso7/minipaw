@@ -16,7 +16,7 @@ use minip2p::{
 use crate::config::Config;
 use crate::event::{Event, Events, PathKind};
 use crate::io::Io;
-use crate::net::{self, DELIVERED_GRACE, Disconnected, Exit, RESUME_TIMEOUT, Stop};
+use crate::net::{self, DELIVERED_GRACE, Disconnected, Exit, HANDOVER_GRACE, RESUME_TIMEOUT, Stop};
 use crate::pipe::{Link, Pipe};
 use crate::session::{Outcome, Shared};
 use crate::ticket::Ticket;
@@ -44,6 +44,10 @@ struct Server {
     lost_since: Option<Instant>,
     /// The user has been told the client is on a direct path.
     told_direct: bool,
+    /// The stream was dropped as the client moved onto a direct
+    /// connection: its loss and resume go unreported unless it takes
+    /// [`HANDOVER_GRACE`].
+    handover: bool,
     /// A stop request or a local failure, once seen.
     stop: Option<Stop>,
     shared: Arc<Shared>,
@@ -84,6 +88,7 @@ pub fn run(
         pending: HashMap::new(),
         lost_since: None,
         told_direct: false,
+        handover: false,
         stop: None,
         shared,
         events,
@@ -130,6 +135,9 @@ impl Server {
                 self.lost_since
                     .filter(|_| self.pipe.delivered())
                     .map(|t| t + DELIVERED_GRACE),
+                self.lost_since
+                    .filter(|_| self.handover)
+                    .map(|t| t + HANDOVER_GRACE),
                 self.stop.as_ref().map(Stop::wake_at),
                 self.pending.values().map(|(_, deadline)| *deadline).min(),
             ]
@@ -200,6 +208,12 @@ impl Server {
                 return Ok(Exit::Done);
             }
             if let Some(since) = self.lost_since {
+                if self.handover && since.elapsed() >= HANDOVER_GRACE {
+                    self.handover = false;
+                    self.events.emit(Event::LinkLost {
+                        reason: "connection closed".to_owned(),
+                    });
+                }
                 if self.pipe.delivered() && since.elapsed() >= DELIVERED_GRACE {
                     return Ok(Exit::Delivered);
                 }
@@ -288,21 +302,11 @@ impl Server {
                     self.lose("stream closed");
                 }
             }
-            EndpointEvent::ConnectionClosed { peer_id, conn_id }
-            | EndpointEvent::ConnectionReplaced {
-                peer_id,
-                old: conn_id,
-                ..
-            } => {
-                self.pending
-                    .retain(|(peer, conn, _), _| *peer != peer_id || *conn != conn_id);
-                if self
-                    .link
-                    .as_ref()
-                    .is_some_and(|l| l.peer == peer_id && l.conn == conn_id)
-                {
-                    self.lose("connection closed");
-                }
+            EndpointEvent::ConnectionClosed { peer_id, conn_id } => {
+                self.drop_conn(&peer_id, conn_id, false);
+            }
+            EndpointEvent::ConnectionReplaced { peer_id, old, new } => {
+                self.drop_conn(&peer_id, old, net::is_upgrade(old, new));
             }
             _ => {}
         }
@@ -361,7 +365,9 @@ impl Server {
 
         if resuming {
             log::debug!("client resumed at offset {recv}");
-            self.events.emit(Event::Resumed);
+            if !std::mem::take(&mut self.handover) {
+                self.events.emit(Event::Resumed);
+            }
         } else {
             let direct = net::is_direct(&self.endpoint, &link.peer);
             self.told_direct = direct;
@@ -431,14 +437,35 @@ impl Server {
         Ok(())
     }
 
+    /// Forgets streams on a connection that is gone. If it carried the
+    /// session and was a relayed circuit replaced by a direct connection,
+    /// the client is moving over, so the loss is not reported.
+    fn drop_conn(&mut self, peer: &PeerId, conn: ConnectionId, upgrade: bool) {
+        self.pending.retain(|(p, c, _), _| p != peer || *c != conn);
+        if self
+            .link
+            .as_ref()
+            .is_some_and(|l| l.peer == *peer && l.conn == conn)
+        {
+            self.handover = upgrade;
+            self.lose(if upgrade {
+                "moving to the direct connection"
+            } else {
+                "connection closed"
+            });
+        }
+    }
+
     fn lose(&mut self, reason: &str) {
         if let Some(link) = self.link.take() {
             log::debug!("lost the client stream ({reason}); waiting for it to resume");
             link.abandon(&mut self.endpoint);
             self.lost_since = Some(Instant::now());
-            self.events.emit(Event::LinkLost {
-                reason: reason.to_owned(),
-            });
+            if !self.handover {
+                self.events.emit(Event::LinkLost {
+                    reason: reason.to_owned(),
+                });
+            }
         }
     }
 }

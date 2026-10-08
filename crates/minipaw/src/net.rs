@@ -23,6 +23,9 @@ pub const LINGER: Duration = Duration::from_secs(2);
 /// With all data confirmed but the stream lost, how long we keep the
 /// session open so the peer can resume and collect our last ack.
 pub const DELIVERED_GRACE: Duration = Duration::from_secs(10);
+/// How long moving a session from a relayed circuit onto a direct
+/// connection may take before it is reported as a lost link.
+pub const HANDOVER_GRACE: Duration = Duration::from_secs(3);
 /// On a stop or an error, how long we wait for a blocked output to drain.
 const STDOUT_GRACE: Duration = Duration::from_secs(1);
 /// After a stop request or a local failure, how long we try to tell the peer: first
@@ -66,6 +69,12 @@ pub fn random16() -> Result<[u8; 16], Box<dyn Error>> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| format!("system randomness: {e}"))?;
     Ok(bytes)
+}
+
+/// Whether a replaced connection is a relayed circuit giving way to a
+/// direct one: a planned move rather than a lost link.
+pub fn is_upgrade(old: ConnectionId, new: ConnectionId) -> bool {
+    old.is_circuit() && !new.is_circuit()
 }
 
 /// Whether the endpoint's current connection to `peer` skips the relay.

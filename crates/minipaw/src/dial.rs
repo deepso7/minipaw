@@ -14,7 +14,7 @@ use minip2p::{
 use crate::config::Config;
 use crate::event::{Event, Events, PathKind};
 use crate::io::Io;
-use crate::net::{self, DELIVERED_GRACE, Disconnected, Exit, RESUME_TIMEOUT, Stop};
+use crate::net::{self, DELIVERED_GRACE, Disconnected, Exit, HANDOVER_GRACE, RESUME_TIMEOUT, Stop};
 use crate::pipe::{Link, Pipe};
 use crate::session::{Outcome, Shared};
 use crate::ticket::Ticket;
@@ -63,6 +63,9 @@ struct Client {
     hello_sent: bool,
     /// The user has been told the session runs on a direct path.
     told_direct: bool,
+    /// The stream was dropped to move onto a direct connection: its loss
+    /// and resume go unreported unless it takes [`HANDOVER_GRACE`].
+    handover: bool,
     /// A stop request or a local failure, once seen.
     stop: Option<Stop>,
     shared: Arc<Shared>,
@@ -106,6 +109,7 @@ pub fn run(
         was_up: false,
         hello_sent: false,
         told_direct: false,
+        handover: false,
         stop: None,
         shared,
         events,
@@ -147,6 +151,9 @@ impl Client {
                 self.phase_deadline(),
                 self.stop.as_ref().map(Stop::wake_at),
                 delivered_by,
+                self.lost_since
+                    .filter(|_| self.handover)
+                    .map(|t| t + HANDOVER_GRACE),
             ]
             .into_iter()
             .flatten()
@@ -238,6 +245,15 @@ impl Client {
                 "could not reach the server"
             })
             .into());
+        }
+        if self.handover
+            && let Some(since) = self.lost_since
+            && now.duration_since(since) >= HANDOVER_GRACE
+        {
+            self.handover = false;
+            self.events.emit(Event::LinkLost {
+                reason: "connection closed".to_owned(),
+            });
         }
         match &self.phase {
             Phase::Idle { at } if now >= *at => self.start(),
@@ -360,11 +376,19 @@ impl Client {
                 ..
             } if self.carries(&peer_id, conn_id, Some(stream_id)) => self.lose("stream closed"),
             EndpointEvent::ConnectionClosed { peer_id, conn_id }
-            | EndpointEvent::ConnectionReplaced {
-                peer_id,
-                old: conn_id,
-                ..
-            } if self.carries(&peer_id, conn_id, None) => self.lose("connection closed"),
+                if self.carries(&peer_id, conn_id, None) =>
+            {
+                self.lose("connection closed");
+            }
+            EndpointEvent::ConnectionReplaced { peer_id, old, new }
+                if self.carries(&peer_id, old, None) =>
+            {
+                if net::is_upgrade(old, new) {
+                    self.hand_over();
+                } else {
+                    self.lose("connection closed");
+                }
+            }
             EndpointEvent::Nat(NatEvent::PathUpgraded { peer, .. }) if peer == *self.peer() => {
                 if self.was_up && !self.told_direct {
                     self.told_direct = true;
@@ -376,7 +400,7 @@ impl Client {
                 if let Some(conn) = self.phase_conn()
                     && Some(conn) != current
                 {
-                    self.lose("path upgraded");
+                    self.hand_over();
                 }
             }
             _ => {}
@@ -413,7 +437,9 @@ impl Client {
                     else {
                         return Ok(());
                     };
-                    if self.was_up {
+                    if std::mem::take(&mut self.handover) {
+                        log::debug!("session moved to the direct connection");
+                    } else if self.was_up {
                         log::debug!("session resumed");
                         self.events.emit(Event::Resumed);
                     } else {
@@ -486,13 +512,22 @@ impl Client {
             Phase::Handshaking { link, .. } => link.abandon(&mut self.endpoint),
             Phase::Up { link } => {
                 link.abandon(&mut self.endpoint);
-                self.events.emit(Event::LinkLost {
-                    reason: reason.to_owned(),
-                });
+                if !self.handover {
+                    self.events.emit(Event::LinkLost {
+                        reason: reason.to_owned(),
+                    });
+                }
             }
             Phase::Idle { .. } | Phase::Connecting { .. } => {}
         }
         self.retry(reason);
+    }
+
+    /// Moves the session off a relayed circuit onto the direct connection
+    /// that replaced it; a planned move, so not reported as a lost link.
+    fn hand_over(&mut self) {
+        self.handover = matches!(self.phase, Phase::Up { .. });
+        self.lose("moving to the direct connection");
     }
 
     fn retry(&mut self, reason: &str) {
