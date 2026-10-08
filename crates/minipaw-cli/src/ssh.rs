@@ -108,7 +108,7 @@ fn client_args(
 /// Option values and the remote command after it are left alone.
 fn swap_destination(args: &[OsString]) -> Result<(Ticket, Vec<OsString>), String> {
     let mut out = args.to_vec();
-    let at = *operands(Tool::Ssh, args)
+    let at = *operands(Tool::Ssh, args, false)
         .first()
         .ok_or("no destination; expected [USER@]TICKET")?;
     let (user, ticket) = args[at].to_str().and_then(user_ticket).ok_or_else(|| {
@@ -128,7 +128,7 @@ fn swap_destination(args: &[OsString]) -> Result<(Ticket, Vec<OsString>), String
 fn swap_paths(args: &[OsString]) -> Result<(Ticket, Vec<OsString>), String> {
     let mut found: Option<(Ticket, String)> = None;
     let mut out = args.to_vec();
-    for at in operands(Tool::Cp, args) {
+    for at in operands(Tool::Cp, args, scp_permutes()) {
         let Some((user, ticket, path)) = remote_path(&args[at])? else {
             continue;
         };
@@ -150,6 +150,13 @@ fn swap_paths(args: &[OsString]) -> Result<(Ticket, Vec<OsString>), String> {
     Ok((ticket, out))
 }
 
+/// Whether scp takes options among its operands: glibc's getopt does,
+/// unless $POSIXLY_CORRECT is set, even empty; BSD's and musl's do not.
+fn scp_permutes() -> bool {
+    cfg!(all(target_os = "linux", target_env = "gnu"))
+        && std::env::var_os("POSIXLY_CORRECT").is_none()
+}
+
 /// The host ssh sees in place of `ticket`: one per server identity.
 fn host(ticket: &Ticket) -> String {
     format!("minipaw-{}", ticket.peer())
@@ -157,17 +164,15 @@ fn host(ticket: &Ticket) -> String {
 
 /// The positions of the operands in `args`, read as ssh and scp read
 /// their command lines: options may be grouped (`-vp22`, `-vp 22`), and
-/// `--` ends them. They end at the first operand too, except for scp with
-/// glibc, whose getopt takes options among the operands. For ssh, only the
-/// first operand, its destination, is returned: what follows is the
-/// remote command.
-fn operands(tool: Tool, args: &[OsString]) -> Vec<usize> {
+/// `--` ends them. They end at the first operand too, unless `permute`
+/// (see [`scp_permutes`]). For ssh, only the first operand, its
+/// destination, is returned: what follows is the remote command.
+fn operands(tool: Tool, args: &[OsString], permute: bool) -> Vec<usize> {
     // The single-letter options that take a value, from ssh(1) and scp(1).
     let with_value = match tool {
         Tool::Ssh => "BbcDEeFIiJLlmOoPpQRSWw",
         Tool::Cp => "cDFiJloPSX",
     };
-    let permute = tool == Tool::Cp && cfg!(all(target_os = "linux", target_env = "gnu"));
     let mut found = Vec::new();
     let mut options = true;
     let mut i = 0;
@@ -191,7 +196,7 @@ fn operands(tool: Tool, args: &[OsString]) -> Vec<usize> {
             if tool == Tool::Ssh {
                 break;
             }
-            options = permute;
+            options &= permute;
         }
     }
     found
@@ -439,14 +444,16 @@ mod tests {
         let want = ["-i", "{T}:k", "a", "-rP22", "{H}:b", "--", "-x"].map(t);
         assert_eq!(got[4..], want);
 
-        let argv = ["a", "-i", "{T}:f", "."].map(t);
-        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let got = args(Tool::Cp, "/m", &argv);
-        if cfg!(all(target_os = "linux", target_env = "gnu")) {
-            assert!(got.is_err(), "{got:?}");
-        } else {
-            assert_eq!(got.expect("args")[4..], ["a", "-i", "{H}:f", "."].map(t));
-        }
+        // Whether options may follow operands depends on scp's getopt.
+        let argv: Vec<OsString> = ["a", "-i", "b", "--", "-c", "d"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(operands(Tool::Cp, &argv, false), [0, 1, 2, 3, 4, 5]);
+        assert_eq!(operands(Tool::Cp, &argv, true), [0, 4, 5]);
+        // After `--`, an operand does not bring options back.
+        let argv: Vec<OsString> = ["--", "a", "-i", "b"].iter().map(OsString::from).collect();
+        assert_eq!(operands(Tool::Cp, &argv, true), [1, 2, 3]);
     }
 
     #[test]
