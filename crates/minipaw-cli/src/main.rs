@@ -4,6 +4,7 @@
 
 mod args;
 mod serve;
+mod ssh;
 mod ui;
 
 use std::process::ExitCode;
@@ -12,8 +13,12 @@ use args::{Args, Command};
 use ui::{Launch, term};
 
 fn main() -> ExitCode {
+    let argv: Vec<_> = std::env::args_os().collect();
+    if let Some((tool, args)) = ssh::split_argv(&argv) {
+        return ssh::run(tool, args);
+    }
     // Usage errors exit 2, --help and --version 0.
-    let args = Args::try_from_argv(std::env::args_os()).unwrap_or_else(|e| e.exit());
+    let args = Args::try_from_argv(argv).unwrap_or_else(|e| e.exit());
     match &args.command {
         Some(Command::Parse { ticket }) => {
             args::print_ticket(ticket);
@@ -49,6 +54,8 @@ fn main() -> ExitCode {
                 relay: relay.as_deref(),
             });
         }
+        Some(Command::Ssh { args }) => return ssh::run(ssh::Tool::Ssh, args),
+        Some(Command::Cp { args }) => return ssh::run(ssh::Tool::Cp, args),
         None => {}
     }
     term::install_panic_hook();

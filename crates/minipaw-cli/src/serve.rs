@@ -151,7 +151,7 @@ impl Printer {
                 let line = plain::event_text(&Event::Listening {
                     ticket: ticket.clone(),
                 })?;
-                format!("{line}\n# ssh: ssh -o ProxyCommand='minipaw -q {ticket}' user@host")
+                format!("{line}\n# ssh: minipaw ssh user@{ticket}")
             }
             ServeEvent::Server(Event::Stopping) => match self.opened.len() {
                 0 => "# stopping".to_owned(),

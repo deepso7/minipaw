@@ -21,7 +21,7 @@ use minipaw::{Config, Identity, Multiaddr, PeerAddr, Ticket};
 #[command(
     name = "minipaw",
     version,
-    override_usage = "minipaw [OPTIONS] [TICKET]\n       minipaw [-v] parse <TICKET>\n       minipaw [-v] ticket [--identity PATH] [--relay MULTIADDR]\n       minipaw [-v] serve [--forward HOST:PORT|PORT] [--identity PATH] [--new] [--max-sessions N] [--relay MULTIADDR]",
+    override_usage = "minipaw [OPTIONS] [TICKET]\n       minipaw [-v] parse <TICKET>\n       minipaw [-v] ticket [--identity PATH] [--relay MULTIADDR]\n       minipaw [-v] serve [--forward HOST:PORT|PORT] [--identity PATH] [--new] [--max-sessions N] [--relay MULTIADDR]\n       minipaw ssh [SSH OPTIONS] [USER@]TICKET [COMMAND]\n       minipaw cp [SCP OPTIONS] SOURCE... TARGET",
     after_help = "\
 Examples:
   minipaw <big.iso                 send a file; prints a ticket
@@ -29,8 +29,8 @@ Examples:
   minipaw / minipaw <ticket>       chat, when run in a terminal on both ends
   minipaw --identity my.key        listen with the same ticket every run
   minipaw serve                    forward every session to local port 22
-  ssh -o ProxyCommand='minipaw -q <ticket>' user@host
-                                   ssh to that machine through it
+  minipaw ssh <ticket>             ssh to that machine through it
+  minipaw cp f <ticket>:           copy a file to it with scp
 
 Environment:
   MINIPAW_RELAY   relay to use when --relay is not given (empty: the built-in relay)
@@ -166,6 +166,39 @@ pub enum Command {
         /// the ticket. Defaults to $MINIPAW_RELAY, then the built-in relay.
         #[arg(long, value_name = "MULTIADDR")]
         relay: Option<String>,
+    },
+    /// ssh to a machine running `minipaw serve`, its ticket in place of the
+    /// host.
+    ///
+    /// `minipaw ssh [SSH OPTIONS] [USER@]TICKET [COMMAND]` runs the system's
+    /// ssh with every other argument as is, reaching the host through
+    /// `minipaw -q TICKET`. Its host key is filed in known_hosts as
+    /// minipaw-<peer id>. $MINIPAW_SSH names another ssh to run.
+    Ssh {
+        /// ssh's arguments, with the ticket as the destination.
+        #[arg(
+            value_name = "SSH ARGS",
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            required = true
+        )]
+        args: Vec<OsString>,
+    },
+    /// Copy files to or from a machine running `minipaw serve` with scp.
+    ///
+    /// `minipaw cp [SCP OPTIONS] SOURCE... TARGET` runs the system's scp
+    /// with remote paths written `[USER@]TICKET:PATH`, all with the same
+    /// ticket, and every other argument as is. $MINIPAW_SCP names another
+    /// scp to run.
+    Cp {
+        /// scp's arguments, with remote paths as TICKET:PATH.
+        #[arg(
+            value_name = "SCP ARGS",
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            required = true
+        )]
+        args: Vec<OsString>,
     },
 }
 
