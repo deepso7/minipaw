@@ -63,8 +63,8 @@ const LABEL_WIDTH: usize = 6;
 
 const FOOTER: &str = "Enter send · Ctrl-D end · Ctrl-C quit · PgUp/PgDn scroll";
 
-/// The inline box's height: the input line and a status line.
-const INLINE_HEIGHT: u16 = 2;
+/// The inline box's height: a blank line, the input line and a status line.
+const INLINE_HEIGHT: u16 = 3;
 /// The inline box's key hints, left out when the box is narrow.
 const INLINE_HINTS: &str = "Ctrl-D end · Ctrl-C quit";
 /// Narrower than this, the inline box leaves out its hints and the peer.
@@ -254,6 +254,16 @@ impl Who {
             Who::You => "  you› ",
             Who::Peer => " peer› ",
             Who::Note | Who::Warn => "     · ",
+        }
+    }
+
+    /// The label inline: left-aligned, so the text starts in one column
+    /// after `you›` and `peer›`, and notes read like the `#` lines above.
+    fn inline_label(self) -> &'static str {
+        match self {
+            Who::You => "you›  ",
+            Who::Peer => "peer› ",
+            Who::Note | Who::Warn => "· ",
         }
     }
 
@@ -850,8 +860,10 @@ impl Chat {
         backend.clear_region(ClearType::AfterCursor)?;
         let theme = &self.theme;
         for entry in self.outbox.drain(..) {
-            let label =
-                StyledContent::new(theme.label(entry.who).into_crossterm(), entry.who.label());
+            let label = StyledContent::new(
+                theme.label(entry.who).into_crossterm(),
+                entry.who.inline_label(),
+            );
             let text = StyledContent::new(theme.body(entry.who).into_crossterm(), entry.text);
             queue!(
                 backend,
@@ -863,13 +875,16 @@ impl Chat {
         io::Write::flush(backend)
     }
 
-    /// Inline: the box: a prompt with the input line, and a dim status
-    /// line under it.
+    /// Inline: the box: a blank line setting it off from the conversation,
+    /// a prompt with the input line, and a dim status line under it.
     fn draw_inline(&self, frame: &mut Frame<'_>, now: Instant) {
         let t = &self.theme;
         let state = &self.state;
-        let [input, status_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(frame.area());
+        let [_, input, status_area] =
+            Layout::vertical([Constraint::Length(1); 3]).areas(frame.area());
+        // Under the input text, past the prompt.
+        let [_, status_area] =
+            Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).areas(status_area);
         let wide = status_area.width >= INLINE_WIDE;
         let sep = || Span::styled(" · ", t.hint);
 
@@ -1101,17 +1116,18 @@ mod tests {
         let mut chat = Chat::new(state, input_tx, false, true);
 
         let rows = inline_rows(&chat, 90, t0);
-        assert_eq!(rows[0], "› type a message", "{rows:?}");
+        assert_eq!(rows[0], "", "{rows:?}");
+        assert_eq!(rows[1], "› type a message", "{rows:?}");
         assert!(
-            rows[1].starts_with("● connected · via relay · 12D3KooW…tLdf · ↑ 0 B  ↓ 0 B · 0:00"),
+            rows[2].starts_with("  ● connected · via relay · 12D3KooW…tLdf · ↑ 0 B  ↓ 0 B · 0:00"),
             "{rows:?}"
         );
-        assert!(rows[1].ends_with("Ctrl-D end · Ctrl-C quit"), "{rows:?}");
+        assert!(rows[2].ends_with("Ctrl-D end · Ctrl-C quit"), "{rows:?}");
 
         // Narrow: no hints, no peer.
         let rows = inline_rows(&chat, 50, t0);
         assert_eq!(
-            rows[1], "● connected · via relay · ↑ 0 B  ↓ 0 B · 0:00",
+            rows[2], "  ● connected · via relay · ↑ 0 B  ↓ 0 B · 0:00",
             "{rows:?}"
         );
 
