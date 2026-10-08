@@ -1,5 +1,7 @@
 //! Session settings.
 
+use std::time::Duration;
+
 use minip2p::{Multiaddr, PeerAddr};
 
 use crate::{Error, Identity};
@@ -55,6 +57,11 @@ pub struct Config {
     /// session.
     #[doc(hidden)]
     pub test_drop_welcome: bool,
+    /// Test hook: how long a listener waits for a client that lost its
+    /// stream to resume, instead of the usual minute, so a test can see a
+    /// client come back after the session ended.
+    #[doc(hidden)]
+    pub test_resume_timeout: Option<Duration>,
 }
 
 /// The default [`Config::max_sessions`].
@@ -70,6 +77,7 @@ impl Default for Config {
             max_sessions: DEFAULT_MAX_SESSIONS,
             test_drop_link_after: None,
             test_drop_welcome: false,
+            test_resume_timeout: None,
         }
     }
 }

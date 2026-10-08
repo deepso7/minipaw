@@ -304,7 +304,21 @@ fn listener_hooks(
     }
     // Test hook: the listener never sends its first Welcome.
     config.test_drop_welcome = env("MINIPAW_TEST_DROP_WELCOME").is_some();
+    // Test hook: how long the listener waits for a client to resume.
+    config.test_resume_timeout = seconds(&env, "MINIPAW_TEST_RESUME_TIMEOUT")?;
     Ok(())
+}
+
+/// A test hook's duration in (fractional) seconds, if it is set.
+fn seconds(env: impl Fn(&str) -> Option<OsString>, name: &str) -> Result<Option<Duration>, String> {
+    let Some(raw) = env(name).and_then(|v| v.into_string().ok()) else {
+        return Ok(None);
+    };
+    raw.parse::<f64>()
+        .ok()
+        .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
+        .map(Some)
+        .ok_or_else(|| format!("invalid {name} '{raw}': expected seconds"))
 }
 
 /// What `serve` runs with besides its target and identity.
@@ -339,17 +353,7 @@ fn serve_config_with(
     config.relay = relay_with(relay, &env)?;
     config.max_sessions = max_sessions;
     listener_hooks(&mut config, &env)?;
-    let connect_delay = match env("MINIPAW_TEST_CONNECT_DELAY").and_then(|v| v.into_string().ok()) {
-        None => None,
-        Some(raw) => Some(
-            raw.parse::<f64>()
-                .ok()
-                .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
-                .ok_or_else(|| {
-                    format!("invalid MINIPAW_TEST_CONNECT_DELAY '{raw}': expected seconds")
-                })?,
-        ),
-    };
+    let connect_delay = seconds(&env, "MINIPAW_TEST_CONNECT_DELAY")?;
     Ok(ServeConfig {
         config,
         connect_delay,
@@ -697,12 +701,18 @@ mod tests {
             ("MINIPAW_RELAY", RELAY),
             ("MINIPAW_TEST_DROP_LINK_AFTER", "1000"),
             ("MINIPAW_TEST_DROP_WELCOME", "1"),
+            ("MINIPAW_TEST_RESUME_TIMEOUT", "0.5"),
         ];
         let config = config_with(&listen, env(&vars)).expect("config");
         assert!(config.force_relay);
         assert!(config.relay.is_some());
         assert_eq!(config.test_drop_link_after, Some(1000));
         assert!(config.test_drop_welcome);
+        assert_eq!(config.test_resume_timeout, Some(Duration::from_millis(500)));
+        assert_eq!(
+            config_with(&listen, env(&[("MINIPAW_TEST_RESUME_TIMEOUT", "x")])).unwrap_err(),
+            "invalid MINIPAW_TEST_RESUME_TIMEOUT 'x': expected seconds"
+        );
 
         // An empty MINIPAW_RELAY is unset.
         let config = config_with(&listen, env(&[("MINIPAW_RELAY", "")])).expect("config");
@@ -739,6 +749,13 @@ mod tests {
         assert_eq!(config.config.test_drop_link_after, Some(1000));
         assert!(config.config.test_drop_welcome);
         assert_eq!(config.connect_delay, Some(Duration::from_millis(2500)));
+        assert!(config.config.test_resume_timeout.is_none());
+        let config = serve_config_with(None, 1, env(&[("MINIPAW_TEST_RESUME_TIMEOUT", "2")]))
+            .expect("config");
+        assert_eq!(
+            config.config.test_resume_timeout,
+            Some(Duration::from_secs(2))
+        );
 
         let err = |vars: &[(&str, &str)]| serve_config_with(None, 1, env(vars)).unwrap_err();
         for raw in ["soon", "-1", "inf"] {

@@ -130,6 +130,9 @@ pub struct ServerCore<H> {
     drop_link_after: Option<u64>,
     /// Test hook ([`Config::test_drop_welcome`]).
     drop_welcome: bool,
+    /// How long a session that lost its stream waits for the client:
+    /// [`RESUME_TIMEOUT`] unless [`Config::test_resume_timeout`] says.
+    resume_timeout: Duration,
 }
 
 /// A peer's time to authenticate.
@@ -253,6 +256,7 @@ impl<H: Host> ServerCore<H> {
             warned: false,
             drop_link_after: config.test_drop_link_after,
             drop_welcome: config.test_drop_welcome,
+            resume_timeout: config.test_resume_timeout.unwrap_or(RESUME_TIMEOUT),
         }
     }
 
@@ -311,7 +315,11 @@ impl<H: Host> ServerCore<H> {
             self.shutdown_by,
         ];
         core.into_iter()
-            .chain(self.sessions.values().map(Slot::deadline))
+            .chain(
+                self.sessions
+                    .values()
+                    .map(|s| s.deadline(self.resume_timeout)),
+            )
             .flatten()
             .min()
             .unwrap_or_else(|| now + Duration::from_secs(1))
@@ -974,7 +982,7 @@ impl<H: Host> ServerCore<H> {
         if live.pipe.delivered() && since.elapsed() >= DELIVERED_GRACE {
             return Some(End::Delivered);
         }
-        if since.elapsed() >= RESUME_TIMEOUT {
+        if since.elapsed() >= self.resume_timeout {
             return Some(End::Failed(
                 Disconnected("client disconnected and did not come back").into(),
             ));
@@ -1104,7 +1112,9 @@ impl Slot {
         }
     }
 
-    fn deadline(&self) -> Option<Instant> {
+    /// When the loop must wake for this slot; `resume_timeout` is how long
+    /// a running session without a stream waits for the client.
+    fn deadline(&self, resume_timeout: Duration) -> Option<Instant> {
         match &self.state {
             State::Running(live) => {
                 let lost = |grace| live.lost_since.map(|t| t + grace);
@@ -1113,7 +1123,7 @@ impl Slot {
                     live.link.as_ref().map(Link::dead_at),
                     lost(DELIVERED_GRACE).filter(|_| live.pipe.delivered()),
                     lost(HANDOVER_GRACE).filter(|_| live.handover),
-                    lost(RESUME_TIMEOUT),
+                    lost(resume_timeout),
                 ]
                 .into_iter()
                 .flatten()

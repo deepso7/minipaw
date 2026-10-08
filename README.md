@@ -211,8 +211,11 @@ accumulate in `bench/results.tsv`, one row per run with the commit.
 A few environment variables exist for testing only:
 `MINIPAW_FORCE_RELAY=1` disables direct connections,
 `MINIPAW_DIRECT=<multiaddr>` makes the client also dial the server directly,
-and `MINIPAW_TEST_DROP_LINK_AFTER=<bytes>` makes the server go silent on its
-stream once, after that many bytes.
+`MINIPAW_TEST_DROP_LINK_AFTER=<bytes>` makes the server go silent on its
+stream once, after that many bytes, `MINIPAW_TEST_DROP_WELCOME=1` makes it
+drop its first `Welcome`, `MINIPAW_TEST_RESUME_TIMEOUT=<secs>` shortens how
+long it waits for a client to resume, and `MINIPAW_TEST_CONNECT_DELAY=<secs>`
+makes `serve` wait that long before each connection to its target.
 
 ## License
 
