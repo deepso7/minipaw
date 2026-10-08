@@ -1266,7 +1266,9 @@ impl Ending {
         match end {
             End::Done => {
                 ending.clean = true;
-                ending.linger = linger(live);
+                // Without a stream, still wait: the client may come back
+                // on a fresh one for our last ack.
+                ending.linger = linger(live).or(Some(now + LINGER));
             }
             End::Delivered => {
                 ending.clean = true;
