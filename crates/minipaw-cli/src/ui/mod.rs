@@ -3,7 +3,7 @@
 //!
 //! - [`plain`]: `#` status lines on stderr, as scripts expect;
 //! - [`panel`]: an inline status panel on stderr while stdout carries data;
-//! - [`chat`]: a full-screen chat when stdin and stdout are a terminal.
+//! - [`chat`]: a chat in an inline box when stdin and stdout are a terminal.
 //!
 //! The interfaces here and in [`state`], [`fmt`], [`term`] and [`log`] are
 //! what the panel and chat build on.
@@ -28,7 +28,7 @@ pub enum Mode {
     Plain,
     /// An inline status panel on stderr; stdout carries data.
     Panel,
-    /// A full-screen chat; stdin and stdout are the terminal.
+    /// A chat in an inline box; stdin and stdout are the terminal.
     Chat,
 }
 

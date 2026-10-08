@@ -60,9 +60,10 @@ minipaw picks how to show status from where its streams point:
   shows the ticket, the connection state, relay or direct, bytes sent and
   received, rates, and an ETA when sending a regular file. Nothing but data
   ever goes to stdout.
-- **Chat** when stdin and stdout are both terminals: a full-screen view
-  with the conversation and an input line. Enter sends, Ctrl-D ends your
-  side, Ctrl-C stops.
+- **Chat** when stdin and stdout are both terminals: the conversation
+  prints into your terminal's normal scrollback, above a small input box
+  that shows the connection state and traffic. Enter sends, Ctrl-D ends
+  your side, Ctrl-C stops.
 - **Plain `#` lines** when stderr isn't a terminal, or with `--plain`. This
   is what scripts and logs see.
 
