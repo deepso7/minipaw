@@ -142,13 +142,15 @@ pub fn interrupt() {
 /// A ratatui backend drawing on stderr.
 ///
 /// It delegates to [`CrosstermBackend`] except for
-/// [`get_cursor_position`](Backend::get_cursor_position), which reports
-/// the bottom-left cell instead of asking the terminal: crossterm's query
-/// writes `ESC[6n` to stdout, which may be the session's data. An inline
-/// viewport therefore starts at the bottom of the screen. It also records
-/// hiding the cursor, so [`restore`] shows it again.
+/// [`get_cursor_position`](Backend::get_cursor_position), which by default
+/// reports the bottom-left cell instead of asking the terminal: crossterm's
+/// query writes `ESC[6n` to stdout, which may be the session's data. An
+/// inline viewport therefore starts at the bottom of the screen. It also
+/// records hiding the cursor, so [`restore`] shows it again.
 pub struct StderrBackend {
     inner: CrosstermBackend<Stderr>,
+    /// Whether to ask the terminal where the cursor is.
+    query_cursor: bool,
 }
 
 impl StderrBackend {
@@ -156,6 +158,17 @@ impl StderrBackend {
     pub fn new() -> Self {
         StderrBackend {
             inner: CrosstermBackend::new(io::stderr()),
+            query_cursor: false,
+        }
+    }
+
+    /// A backend that asks the terminal where the cursor is, so an inline
+    /// viewport starts right below the text already printed. Only for when
+    /// stdout is the terminal and raw mode is on, as in chat mode.
+    pub fn querying_cursor() -> Self {
+        StderrBackend {
+            query_cursor: true,
+            ..StderrBackend::new()
         }
     }
 }
@@ -203,6 +216,13 @@ impl Backend for StderrBackend {
     }
 
     fn get_cursor_position(&mut self) -> io::Result<Position> {
+        if self.query_cursor {
+            // Stdout is the terminal here; see `querying_cursor`.
+            #[allow(clippy::disallowed_methods)]
+            if let Ok((x, y)) = cursor::position() {
+                return Ok(Position { x, y });
+            }
+        }
         let rows = self.inner.size().map_or(1, |size| size.height);
         Ok(Position {
             x: 0,

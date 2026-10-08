@@ -1,28 +1,35 @@
-//! Chat mode: a full-screen chat when stdin and stdout are the terminal.
+//! Chat mode: a chat when stdin and stdout are the terminal.
 //!
 //! Until a peer connects, status lines (and the ticket) print as in plain
 //! mode, so they stay in the scrollback where they can be copied, and
-//! Ctrl-C is an ordinary SIGINT. Once connected, the chat takes over the
-//! alternate screen in raw mode: a status bar, the conversation, and an
-//! input line. The session's input and output are channels to this UI (see
-//! [`chat_io`](super::chat_io)); what the peer sends is split into lines and
-//! sanitised before it is drawn. When the session ends, the terminal is
-//! restored and the end of the conversation printed, so it is not lost.
+//! Ctrl-C is an ordinary SIGINT. Once connected, the terminal goes into raw
+//! mode and a small inline box (input line, status in its borders) sits
+//! below the conversation, which is printed into the ordinary scrollback
+//! line by line. The session's input and output are channels to this UI
+//! (see [`chat_io`](super::chat_io)); what the peer sends is split into
+//! lines and sanitised before it is printed. When the session ends, the box
+//! is cleared and the terminal restored.
+//!
+//! For now, `MINIPAW_FULLSCREEN=1` gives the earlier full-screen chat
+//! instead (status bar, scrollable log, input line on the alternate
+//! screen), which prints the end of the conversation once it closes.
 
 use std::collections::VecDeque;
+use std::io;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use minipaw::{Error, Event, Handle, Io, Outcome, PathKind};
+use ratatui::backend::{Backend as _, ClearType};
 use ratatui::crossterm::event::{
     self as term_event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
-use ratatui::{Frame, Terminal};
+use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Widget as _};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 use super::chat_io::{
     ChannelReader, ChannelWriter, LineEdit, LineSplitter, OUTPUT_CAPACITY, sanitize_str,
@@ -54,6 +61,15 @@ const LABEL_WIDTH: usize = 6;
 
 const FOOTER: &str = "Enter send · Ctrl-D end · Ctrl-C quit · PgUp/PgDn scroll";
 
+/// The inline box's height: the input line between two borders.
+const INLINE_HEIGHT: u16 = 3;
+/// The inline box's key hints, left out when the box is narrow.
+const INLINE_HINTS: &str = " Enter send · Ctrl-D end · Ctrl-C quit ";
+/// Narrower than this, the inline box leaves out its hints and the peer.
+const INLINE_WIDE: u16 = 80;
+/// Rows printed above the inline box per call, bounding its buffer.
+const PRINT_CHUNK: usize = 256;
+
 /// Runs the session as a chat.
 pub fn run(launch: Launch) -> Result<Outcome, Error> {
     let (ui_tx, ui_rx) = std::sync::mpsc::channel();
@@ -84,7 +100,13 @@ pub fn run(launch: Launch) -> Result<Outcome, Error> {
         return result;
     };
 
-    let mut terminal = match enter_full_screen() {
+    let inline = std::env::var_os("MINIPAW_FULLSCREEN").is_none_or(|v| v.is_empty());
+    let terminal = if inline {
+        enter_inline()
+    } else {
+        enter_full_screen()
+    };
+    let mut terminal = match terminal {
         Ok(terminal) => terminal,
         Err(e) => {
             term::restore();
@@ -96,9 +118,13 @@ pub fn run(launch: Launch) -> Result<Outcome, Error> {
         }
     };
 
-    let mut chat = Chat::new(state, input_tx, color_enabled());
+    let mut chat = Chat::new(state, input_tx, color_enabled(), inline);
     chat.on_event(&first);
     let result = chat.run(&mut terminal, &ui_rx, &output_rx, &handle, session);
+    if inline {
+        let ok = matches!(result, Ok(Ok(_)));
+        let _ = chat.close_inline(&mut terminal, ok);
+    }
 
     drop(terminal);
     term::restore();
@@ -107,7 +133,9 @@ pub fn run(launch: Launch) -> Result<Outcome, Error> {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
     };
-    chat.print_transcript();
+    if !inline {
+        chat.print_transcript();
+    }
     result
 }
 
@@ -166,6 +194,35 @@ fn enter_full_screen() -> std::io::Result<Terminal<term::StderrBackend>> {
     Ok(terminal)
 }
 
+/// Turns on raw mode and sets up ratatui in a small box right below what
+/// has been printed.
+fn enter_inline() -> io::Result<Terminal<term::StderrBackend>> {
+    term::enable_raw_mode()?;
+    inline_terminal()
+}
+
+/// A ratatui terminal with the inline box at the cursor.
+fn inline_terminal() -> io::Result<Terminal<term::StderrBackend>> {
+    Terminal::with_options(
+        term::StderrBackend::querying_cursor(),
+        TerminalOptions {
+            viewport: Viewport::Inline(INLINE_HEIGHT),
+        },
+    )
+}
+
+/// Clears the inline box and everything below it, leaving the cursor at
+/// the start of its top row.
+fn clear_inline(terminal: &mut Terminal<term::StderrBackend>) -> io::Result<()> {
+    let area = terminal.get_frame().area();
+    // After a shrink, the box's old top may be off the screen.
+    let rows = term::size().map_or(area.bottom(), |(_, rows)| rows);
+    let top = area.y.min(rows.saturating_sub(area.height.max(1)));
+    let backend = terminal.backend_mut();
+    backend.set_cursor_position(Position::new(0, top))?;
+    backend.clear_region(ClearType::AfterCursor)
+}
+
 /// Whether to use colour: `NO_COLOR` set to anything non-empty turns it
 /// off.
 fn color_enabled() -> bool {
@@ -216,6 +273,8 @@ struct Entry {
 struct Theme {
     bar: Style,
     brand: Style,
+    /// The name in the inline box's border.
+    logo: Style,
     sep: Style,
     you: Style,
     peer: Style,
@@ -238,6 +297,7 @@ impl Theme {
             Theme {
                 bar,
                 brand: bar.fg(Color::Indexed(215)).add_modifier(Modifier::BOLD),
+                logo: bold.fg(Color::Indexed(215)),
                 sep: bar.fg(Color::Indexed(242)),
                 you: bold.fg(Color::Cyan),
                 peer: bold.fg(Color::Magenta),
@@ -254,6 +314,7 @@ impl Theme {
             Theme {
                 bar,
                 brand: bar.add_modifier(Modifier::BOLD),
+                logo: bold,
                 sep: bar,
                 you: bold,
                 peer: bold,
@@ -268,10 +329,10 @@ impl Theme {
         }
     }
 
-    /// The status dot's style for `phase`.
-    fn dot(&self, phase: Phase) -> Style {
+    /// The status dot's style for `phase`, on `base`.
+    fn dot(&self, phase: Phase, base: Style) -> Style {
         if !self.color {
-            return self.bar;
+            return base;
         }
         let color = match phase {
             Phase::Connected | Phase::Done => Color::Green,
@@ -279,7 +340,7 @@ impl Theme {
             Phase::Resuming | Phase::Connecting | Phase::Stopping => Color::Yellow,
             _ => Color::Indexed(244),
         };
-        self.bar.fg(color)
+        base.fg(color)
     }
 
     fn label(&self, who: Who) -> Style {
@@ -300,9 +361,16 @@ impl Theme {
     }
 }
 
-/// The full-screen chat's state.
+/// The chat's state.
 struct Chat {
     state: State,
+    /// Whether the chat is the inline box rather than full screen.
+    inline: bool,
+    /// Inline: lines not yet printed above the box.
+    outbox: Vec<Entry>,
+    /// Inline: the terminal's size when the box was last anchored.
+    size: Option<(u16, u16)>,
+    /// Full screen: the conversation so far.
     entries: VecDeque<Entry>,
     /// The bytes of text in [`entries`](Self::entries).
     entry_bytes: usize,
@@ -323,9 +391,12 @@ struct Chat {
 }
 
 impl Chat {
-    fn new(state: State, sender: Sender<Vec<u8>>, color: bool) -> Self {
+    fn new(state: State, sender: Sender<Vec<u8>>, color: bool, inline: bool) -> Self {
         Chat {
             state,
+            inline,
+            outbox: Vec::new(),
+            size: term::size(),
             entries: VecDeque::new(),
             entry_bytes: 0,
             dropped: 0,
@@ -359,7 +430,11 @@ impl Chat {
             self.state.tick(now, handle.progress());
             // A failed draw (the terminal went away) is not worth ending
             // the session for; the next one may work.
-            let _ = terminal.draw(|frame| self.draw(frame, now));
+            if self.inline {
+                let _ = self.show_inline(terminal, now);
+            } else {
+                let _ = terminal.draw(|frame| self.draw(frame, now));
+            }
         }
         let result = session.join()?;
         // Everything the peer sent was acked once written here; keep it all.
@@ -487,6 +562,11 @@ impl Chat {
     }
 
     fn push(&mut self, who: Who, text: String) {
+        if self.inline {
+            // Printed, and so let go of, on the next tick.
+            self.outbox.push(Entry { who, text });
+            return;
+        }
         while self.entries.len() >= MAX_ENTRIES
             || (!self.entries.is_empty() && self.entry_bytes + text.len() > MAX_ENTRY_BYTES)
         {
@@ -596,7 +676,7 @@ impl Chat {
         let mut spans = vec![
             Span::styled(" 🐾 minipaw", t.brand),
             sep(),
-            Span::styled("● ", t.dot(state.phase)),
+            Span::styled("● ", t.dot(state.phase, t.bar)),
             Span::styled(state.phase.label(), t.bar),
         ];
         if let Some(path) = state.path {
@@ -670,7 +750,14 @@ impl Chat {
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        if !open {
+        self.draw_input_line(frame, inner);
+    }
+
+    /// The input line in `inner`, with the cursor; or, once we ended our
+    /// side, what we are waiting for.
+    fn draw_input_line(&self, frame: &mut Frame<'_>, inner: Rect) {
+        let t = &self.theme;
+        if self.sender.is_none() {
             let text = Span::styled(
                 "waiting for the peer to finish · Ctrl-C to quit now",
                 t.hint,
@@ -728,8 +815,125 @@ impl Chat {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    /// Prints the end of the conversation to stderr, on the restored
-    /// terminal.
+    /// Inline: re-anchors the box after a resize, prints new lines above
+    /// it, and draws it.
+    fn show_inline(
+        &mut self,
+        terminal: &mut Terminal<term::StderrBackend>,
+        now: Instant,
+    ) -> io::Result<()> {
+        let size = term::size();
+        if size != self.size {
+            clear_inline(terminal)?;
+            *terminal = inline_terminal()?;
+            self.size = size;
+        }
+        self.print_outbox(terminal)?;
+        terminal.draw(|frame| self.draw_inline(frame, now))?;
+        Ok(())
+    }
+
+    /// Inline: prints the lines not yet shown above the box, into the
+    /// terminal's own scrollback.
+    fn print_outbox(&mut self, terminal: &mut Terminal<term::StderrBackend>) -> io::Result<()> {
+        if self.outbox.is_empty() {
+            return Ok(());
+        }
+        let width = usize::from(terminal.size()?.width.saturating_sub(1)).max(LABEL_WIDTH + 4);
+        let rows: Vec<Line<'static>> = std::mem::take(&mut self.outbox)
+            .iter()
+            .flat_map(|entry| wrap(entry, width, &self.theme))
+            .collect();
+        for chunk in rows.chunks(PRINT_CHUNK) {
+            let height = u16::try_from(chunk.len()).unwrap_or(u16::MAX);
+            terminal.insert_before(height, |buf| {
+                Paragraph::new(chunk.to_vec()).render(buf.area, buf);
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Inline: the box, with the input line inside and the status in its
+    /// borders: name and state on top, keys and traffic below.
+    fn draw_inline(&self, frame: &mut Frame<'_>, now: Instant) {
+        let t = &self.theme;
+        let state = &self.state;
+        let area = frame.area();
+        let wide = area.width >= INLINE_WIDE;
+        let sep = || Span::styled(" · ", t.hint);
+
+        let mut status = vec![
+            Span::raw(" "),
+            Span::styled("● ", t.dot(state.phase, Style::new())),
+            Span::styled(state.phase.label(), t.text),
+        ];
+        if let Some(path) = state.path {
+            let path = match (path, state.upgraded) {
+                (PathKind::Direct, true) => "direct (upgraded)".to_owned(),
+                (path, _) => path.to_string(),
+            };
+            status.extend([sep(), Span::styled(path, t.note)]);
+        }
+        if wide && let Some(peer) = &state.peer {
+            status.extend([sep(), Span::styled(fmt::short_peer(peer), t.note)]);
+        }
+        status.push(Span::raw(" "));
+
+        let traffic = Line::from(vec![
+            Span::styled(
+                format!(
+                    " ↑ {}  ↓ {}",
+                    fmt::bytes(state.progress.acked),
+                    fmt::bytes(state.progress.written)
+                ),
+                t.note,
+            ),
+            sep(),
+            Span::styled(format!("{} ", fmt::duration(state.elapsed(now))), t.note),
+        ])
+        .right_aligned();
+
+        let open = self.sender.is_some();
+        let mut block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .padding(Padding::horizontal(1))
+            .border_style(if open { t.border } else { t.border_closed })
+            .title_top(Span::styled(" 🐾 minipaw ", t.logo))
+            .title_top(Line::from(status).right_aligned())
+            .title_bottom(traffic);
+        if wide {
+            block = block.title_bottom(Span::styled(INLINE_HINTS, t.hint));
+        }
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        self.draw_input_line(frame, inner);
+    }
+
+    /// Inline: prints what is left and clears the box, leaving the cursor
+    /// where it was, for whatever is printed next.
+    fn close_inline(
+        &mut self,
+        terminal: &mut Terminal<term::StderrBackend>,
+        ok: bool,
+    ) -> io::Result<()> {
+        if ok {
+            let state = &self.state;
+            let mut line = format!(
+                "chat ended: {} sent, {} received",
+                fmt::bytes(state.progress.acked),
+                fmt::bytes(state.progress.written)
+            );
+            if let Some(path) = state.path {
+                line.push_str(&format!(" ({path})"));
+            }
+            self.push(Who::Note, line);
+        }
+        self.print_outbox(terminal)?;
+        clear_inline(terminal)
+    }
+
+    /// Full screen: prints the end of the conversation to stderr, on the
+    /// restored terminal.
     fn print_transcript(&self) {
         let skip = self.entries.len().saturating_sub(TRANSCRIPT_LINES);
         let hidden = self.dropped + skip;
@@ -812,7 +1016,7 @@ mod tests {
     fn ticks_take_a_bounded_share_but_the_end_takes_everything() {
         let launch = Launch::new(None, minipaw::Config::default(), false);
         let (input_tx, _input_rx) = std::sync::mpsc::channel();
-        let mut chat = Chat::new(State::new(&launch, Instant::now()), input_tx, false);
+        let mut chat = Chat::new(State::new(&launch, Instant::now()), input_tx, false, false);
         let (_ui_tx, ui_rx) = std::sync::mpsc::channel::<UiMsg>();
         let (out_tx, out_rx) = std::sync::mpsc::channel();
         // 1 MiB of 1 KiB lines, four times what a tick may take.
@@ -830,7 +1034,7 @@ mod tests {
     fn ticks_take_a_bounded_number_of_messages() {
         let launch = Launch::new(None, minipaw::Config::default(), false);
         let (input_tx, _input_rx) = std::sync::mpsc::channel();
-        let mut chat = Chat::new(State::new(&launch, Instant::now()), input_tx, false);
+        let mut chat = Chat::new(State::new(&launch, Instant::now()), input_tx, false, false);
         let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiMsg>();
         let (_out_tx, out_rx) = std::sync::mpsc::channel();
         for i in 0..MAX_MSGS_PER_TICK + 10 {
@@ -848,7 +1052,7 @@ mod tests {
     fn the_log_keeps_a_bounded_number_of_bytes() {
         let launch = Launch::new(None, minipaw::Config::default(), false);
         let (input_tx, _input_rx) = std::sync::mpsc::channel();
-        let mut chat = Chat::new(State::new(&launch, Instant::now()), input_tx, false);
+        let mut chat = Chat::new(State::new(&launch, Instant::now()), input_tx, false, false);
         let line = "x".repeat(MAX_LINE);
         let fit = MAX_ENTRY_BYTES / MAX_LINE;
         for i in 0..fit + 3 {
@@ -859,6 +1063,59 @@ mod tests {
         assert_eq!(chat.entry_bytes, fit * MAX_LINE);
         // The oldest went first.
         assert!(chat.entries[0].text.starts_with("00003"));
+    }
+
+    /// The inline box drawn `width` cells wide, as text rows.
+    fn inline_rows(chat: &Chat, width: u16, now: Instant) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, INLINE_HEIGHT);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| chat.draw_inline(frame, now)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..INLINE_HEIGHT)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_inline_box_shows_status_in_its_borders() {
+        let launch = Launch::new(None, minipaw::Config::default(), false);
+        let (input_tx, _input_rx) = std::sync::mpsc::channel();
+        let t0 = Instant::now();
+        let mut state = State::new(&launch, t0);
+        let peer: minipaw::PeerId = "12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf"
+            .parse()
+            .expect("peer id");
+        state.apply_at(
+            &Event::Accepted {
+                peer,
+                path: PathKind::Relayed,
+            },
+            t0,
+        );
+        let mut chat = Chat::new(state, input_tx, false, true);
+
+        let rows = inline_rows(&chat, 90, t0);
+        assert!(rows[0].starts_with("╭ 🐾") && rows[0].contains("minipaw"), "{rows:?}");
+        assert!(rows[0].contains("● connected · via relay · 12D3KooW…tLdf ╮"), "{rows:?}");
+        assert!(rows[1].contains("type a message"), "{rows:?}");
+        assert!(rows[2].contains("Enter send"), "{rows:?}");
+        assert!(rows[2].contains("↑ 0 B  ↓ 0 B · 0:00"), "{rows:?}");
+
+        // Narrow: no hints, no peer; the rest still fits.
+        let rows = inline_rows(&chat, 50, t0);
+        assert!(!rows[2].contains("Enter send"), "{rows:?}");
+        assert!(rows[0].contains("● connected · via relay ╮"), "{rows:?}");
+
+        // Lines wait for the next tick instead of piling up in the log.
+        chat.push(Who::Peer, "hi".into());
+        assert_eq!(chat.outbox.len(), 1);
+        assert!(chat.entries.is_empty());
     }
 
     #[test]
