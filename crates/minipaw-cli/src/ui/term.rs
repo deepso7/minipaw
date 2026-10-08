@@ -7,9 +7,9 @@
 //! `ratatui::init`/`restore` and `crossterm::cursor::position` (which writes
 //! `ESC[6n` to stdout) are banned in `clippy.toml`.
 //!
-//! Terminal modes are switched on only through [`enable_raw_mode`],
-//! [`enter_alternate_screen`] and [`StderrBackend`] (which tracks the
-//! cursor's visibility), so [`restore`] knows what to undo.
+//! Terminal modes are switched on only through [`enable_raw_mode`] and
+//! [`StderrBackend`] (which tracks the cursor's visibility), so [`restore`]
+//! knows what to undo.
 
 use std::io::{self, Stderr, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +22,6 @@ use ratatui::crossterm::{cursor, execute, terminal};
 use ratatui::layout::{Position, Size};
 
 static RAW_MODE: AtomicBool = AtomicBool::new(false);
-static ALTERNATE_SCREEN: AtomicBool = AtomicBool::new(false);
 static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 /// Held for the whole of [`restore`], so a second caller waits until the
 /// terminal is back instead of exiting while the first is still writing.
@@ -56,16 +55,8 @@ pub fn raw_mode_works() -> bool {
     off
 }
 
-/// Switches stderr's terminal to the alternate screen, for [`restore`] to
-/// undo.
-pub fn enter_alternate_screen() -> io::Result<()> {
-    execute!(io::stderr(), terminal::EnterAlternateScreen)?;
-    ALTERNATE_SCREEN.store(true, Ordering::SeqCst);
-    Ok(())
-}
-
-/// Undoes whatever terminal state this module set up: raw mode, the
-/// alternate screen, a hidden cursor. Idempotent and safe from any thread,
+/// Undoes whatever terminal state this module set up: raw mode and a
+/// hidden cursor. Idempotent and safe from any thread,
 /// including the panic hook and the Ctrl-C handler; errors are ignored.
 pub fn restore() {
     let _restoring = RESTORING.lock().unwrap_or_else(PoisonError::into_inner);
@@ -73,9 +64,6 @@ pub fn restore() {
         let _ = terminal::disable_raw_mode();
     }
     let mut stderr = io::stderr();
-    if ALTERNATE_SCREEN.swap(false, Ordering::SeqCst) {
-        let _ = execute!(stderr, terminal::LeaveAlternateScreen);
-    }
     if CURSOR_HIDDEN.swap(false, Ordering::SeqCst) {
         let _ = execute!(stderr, cursor::Show);
     }
