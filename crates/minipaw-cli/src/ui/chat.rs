@@ -63,10 +63,10 @@ const LABEL_WIDTH: usize = 6;
 
 const FOOTER: &str = "Enter send · Ctrl-D end · Ctrl-C quit · PgUp/PgDn scroll";
 
-/// The inline box's height: the input line between two borders.
-const INLINE_HEIGHT: u16 = 3;
+/// The inline box's height: the input line and a status line.
+const INLINE_HEIGHT: u16 = 2;
 /// The inline box's key hints, left out when the box is narrow.
-const INLINE_HINTS: &str = " Enter send · Ctrl-D end · Ctrl-C quit ";
+const INLINE_HINTS: &str = "Ctrl-D end · Ctrl-C quit";
 /// Narrower than this, the inline box leaves out its hints and the peer.
 const INLINE_WIDE: u16 = 80;
 
@@ -278,8 +278,6 @@ struct Entry {
 struct Theme {
     bar: Style,
     brand: Style,
-    /// The name in the inline box's border.
-    logo: Style,
     sep: Style,
     you: Style,
     peer: Style,
@@ -302,7 +300,6 @@ impl Theme {
             Theme {
                 bar,
                 brand: bar.fg(Color::Indexed(215)).add_modifier(Modifier::BOLD),
-                logo: bold.fg(Color::Indexed(215)),
                 sep: bar.fg(Color::Indexed(242)),
                 you: bold.fg(Color::Cyan),
                 peer: bold.fg(Color::Magenta),
@@ -319,7 +316,6 @@ impl Theme {
             Theme {
                 bar,
                 brand: bar.add_modifier(Modifier::BOLD),
-                logo: bold,
                 sep: bar,
                 you: bold,
                 peer: bold,
@@ -867,60 +863,51 @@ impl Chat {
         io::Write::flush(backend)
     }
 
-    /// Inline: the box, with the input line inside and the status in its
-    /// borders: name and state on top, keys and traffic below.
+    /// Inline: the box: a prompt with the input line, and a dim status
+    /// line under it.
     fn draw_inline(&self, frame: &mut Frame<'_>, now: Instant) {
         let t = &self.theme;
         let state = &self.state;
-        let area = frame.area();
-        let wide = area.width >= INLINE_WIDE;
+        let [input, status_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(frame.area());
+        let wide = status_area.width >= INLINE_WIDE;
         let sep = || Span::styled(" · ", t.hint);
 
+        let open = self.sender.is_some();
+        let prompt = Span::styled("› ", if open { t.you } else { t.hint });
+        frame.render_widget(Paragraph::new(prompt), input);
+        let [_, text] =
+            Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).areas(input);
+        self.draw_input_line(frame, text);
+
         let mut status = vec![
-            Span::raw(" "),
             Span::styled("● ", t.dot(state.phase, Style::new())),
-            Span::styled(state.phase.label(), t.text),
+            Span::styled(state.phase.label(), t.hint),
         ];
         if let Some(path) = state.path {
-            let path = match (path, state.upgraded) {
-                (PathKind::Direct, true) => "direct (upgraded)".to_owned(),
-                (path, _) => path.to_string(),
-            };
-            status.extend([sep(), Span::styled(path, t.note)]);
+            status.extend([sep(), Span::styled(path.to_string(), t.hint)]);
         }
         if wide && let Some(peer) = &state.peer {
-            status.extend([sep(), Span::styled(fmt::short_peer(peer), t.note)]);
+            status.extend([sep(), Span::styled(fmt::short_peer(peer), t.hint)]);
         }
-        status.push(Span::raw(" "));
-
-        let traffic = Line::from(vec![
+        status.extend([
+            sep(),
             Span::styled(
                 format!(
-                    " ↑ {}  ↓ {}",
+                    "↑ {}  ↓ {}",
                     fmt::bytes(state.progress.acked),
                     fmt::bytes(state.progress.written)
                 ),
-                t.note,
+                t.hint,
             ),
             sep(),
-            Span::styled(format!("{} ", fmt::duration(state.elapsed(now))), t.note),
-        ])
-        .right_aligned();
-
-        let open = self.sender.is_some();
-        let mut block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .padding(Padding::horizontal(1))
-            .border_style(if open { t.border } else { t.border_closed })
-            .title_top(Span::styled(" 🐾 minipaw ", t.logo))
-            .title_top(Line::from(status).right_aligned())
-            .title_bottom(traffic);
+            Span::styled(fmt::duration(state.elapsed(now)), t.hint),
+        ]);
         if wide {
-            block = block.title_bottom(Span::styled(INLINE_HINTS, t.hint));
+            let hints = Line::styled(INLINE_HINTS, t.hint).right_aligned();
+            frame.render_widget(Paragraph::new(hints), status_area);
         }
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        self.draw_input_line(frame, inner);
+        frame.render_widget(Paragraph::new(Line::from(status)), status_area);
     }
 
     /// Inline: prints what is left and clears the box, leaving the cursor
@@ -1096,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn the_inline_box_shows_status_in_its_borders() {
+    fn the_inline_box_is_a_prompt_and_a_status_line() {
         let launch = Launch::new(None, minipaw::Config::default(), false);
         let (input_tx, _input_rx) = std::sync::mpsc::channel();
         let t0 = Instant::now();
@@ -1114,22 +1101,19 @@ mod tests {
         let mut chat = Chat::new(state, input_tx, false, true);
 
         let rows = inline_rows(&chat, 90, t0);
+        assert_eq!(rows[0], "› type a message", "{rows:?}");
         assert!(
-            rows[0].starts_with("╭ 🐾") && rows[0].contains("minipaw"),
+            rows[1].starts_with("● connected · via relay · 12D3KooW…tLdf · ↑ 0 B  ↓ 0 B · 0:00"),
             "{rows:?}"
         );
-        assert!(
-            rows[0].contains("● connected · via relay · 12D3KooW…tLdf ╮"),
-            "{rows:?}"
-        );
-        assert!(rows[1].contains("type a message"), "{rows:?}");
-        assert!(rows[2].contains("Enter send"), "{rows:?}");
-        assert!(rows[2].contains("↑ 0 B  ↓ 0 B · 0:00"), "{rows:?}");
+        assert!(rows[1].ends_with("Ctrl-D end · Ctrl-C quit"), "{rows:?}");
 
-        // Narrow: no hints, no peer; the rest still fits.
+        // Narrow: no hints, no peer.
         let rows = inline_rows(&chat, 50, t0);
-        assert!(!rows[2].contains("Enter send"), "{rows:?}");
-        assert!(rows[0].contains("● connected · via relay ╮"), "{rows:?}");
+        assert_eq!(
+            rows[1], "● connected · via relay · ↑ 0 B  ↓ 0 B · 0:00",
+            "{rows:?}"
+        );
 
         // Lines wait for the next tick instead of piling up in the log.
         chat.push(Who::Peer, "hi".into());
