@@ -75,7 +75,7 @@ impl Host for Listener {
         None
     }
 
-    fn unused(&mut self, pipe: Pipe) {
+    fn unused(&mut self, _id: u64, pipe: Pipe) {
         self.pipe = Some(pipe);
     }
 
@@ -90,6 +90,8 @@ impl Host for Listener {
     fn server_event(&mut self, event: Event) {
         self.events.emit(event);
     }
+
+    fn refused(&mut self, _peer: &PeerId, _reason: &str) {}
 
     fn session_event(&mut self, _id: u64, event: Event) {
         self.events.emit(event);

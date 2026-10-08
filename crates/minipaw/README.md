@@ -103,6 +103,55 @@ and `Identity::ticket(relay)` gives the ticket a listener with it prints,
 the same every run. `Identity::replace` rotates it. On Unix the file must be
 a regular file only you can read, in a directory only you can write.
 
+## Serve
+
+`minipaw::serve` keeps listening and serves every dialer with the ticket,
+up to `Config::max_sessions` (16) at once, each in a session of its own.
+Its `accept` callback makes each session's local end, such as a fresh
+connection to a port being forwarded:
+
+```rust,no_run
+use std::net::{SocketAddr, TcpStream};
+use std::time::Duration;
+
+use minipaw::{Config, Event, Io, ServeEvent};
+
+fn main() -> Result<(), minipaw::Error> {
+    let target: SocketAddr = "127.0.0.1:22".parse().expect("address");
+    let server = minipaw::serve(Config::default(), move |_peer| {
+        let stream = TcpStream::connect_timeout(&target, Duration::from_secs(5))?;
+        stream.set_nodelay(true)?;
+        Io::tcp(stream)
+    })
+    .on_event(|event| match event {
+        ServeEvent::Server(Event::Listening { ticket }) => eprintln!("connect with: {ticket}"),
+        ServeEvent::Opened { session, peer, path } => eprintln!("[{session}] {peer} ({path})"),
+        ServeEvent::Ended { session, result, progress, .. } => {
+            eprintln!("[{session}] {result:?}: {} bytes in", progress.written);
+        }
+        ServeEvent::Refused { peer, reason } => eprintln!("refused {peer}: {reason}"),
+        _ => {}
+    });
+    // `server.handle().stop()`, say from a Ctrl-C handler, ends it.
+    server.run()
+}
+```
+
+`accept` runs on a worker thread, so a slow one holds up no other
+session, but it must return promptly: it cannot be cancelled, and each
+call counts toward `max_sessions` until it returns. A failing one refuses
+the dialer with its error. A session failing never ends the server; it is
+reported in `ServeEvent::Ended`. `Handle::stop` stops every session (each
+dialer is told), gives them a few seconds between them, and `run` returns
+`Ok(())`. `Handle::progress` adds up every session served, ended ones
+included.
+
+With an `Identity` the ticket stays the same across restarts, but sessions
+do not survive one: a dialer connected at the time gets
+`Error::PeerEnded`. Sessions that cannot hole-punch a direct path share
+the relay's circuits to the server, which a relay may limit in number,
+duration and size.
+
 ## Input and output
 
 `Io::stdio()` uses the process's stdin and stdout, and `Io::tcp` a
@@ -174,7 +223,7 @@ or `Config::force_relay` to skip hole punching.
 - QUIC only: direct paths are QUIC (TLS 1.3), and relays must be QUIC
   addresses. Relayed paths run an end-to-end Noise session, so the relay
   sees only ciphertext.
-- One session per `Session`, one dialer per listener.
+- One session per `Session`, one dialer per listener; `serve` for more.
 
 ## License
 

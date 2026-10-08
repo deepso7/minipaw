@@ -22,8 +22,8 @@ use minip2p::{
 use crate::config::Config;
 use crate::event::{Event, PathKind};
 use crate::net::{
-    self, DELIVERED_GRACE, Disconnected, HANDOVER_GRACE, LINGER, PeerEnded, RESUME_TIMEOUT,
-    STDOUT_GRACE, Stop,
+    self, ABORT_GRACE, DELIVERED_GRACE, Disconnected, HANDOVER_GRACE, LINGER, PeerEnded,
+    RESUME_TIMEOUT, STDOUT_GRACE, Stop,
 };
 use crate::pipe::{Link, LocalFailure, Pipe};
 use crate::session::{Outcome, Shared};
@@ -61,9 +61,9 @@ pub trait Host {
     /// [`unused`](Self::unused).
     fn ready(&mut self) -> Option<(u64, Result<Pipe, String>)>;
 
-    /// Takes back a local end whose session never started: its `Welcome`
-    /// could not be sent, or the session went away first.
-    fn unused(&mut self, pipe: Pipe);
+    /// Takes back session `id`'s local end, which never started: its
+    /// `Welcome` could not be sent, or the session went away first.
+    fn unused(&mut self, id: u64, pipe: Pipe);
 
     /// A local failure that ends the server while it has no session, such
     /// as a pre-created local end failing.
@@ -74,6 +74,10 @@ pub trait Host {
 
     /// A milestone of the server rather than of a session.
     fn server_event(&mut self, event: Event);
+
+    /// A stream from `peer` was turned away with `reason`, which the peer
+    /// is told.
+    fn refused(&mut self, peer: &PeerId, reason: &str);
 
     /// A milestone of session `id`.
     fn session_event(&mut self, id: u64, event: Event);
@@ -109,6 +113,9 @@ pub struct ServerCore<H> {
     next_id: u64,
     /// A stop was requested: no new sessions, and every slot is ending.
     stopping: bool,
+    /// Once stopping, when whatever is still ending is cut short: one
+    /// deadline for the whole server, however many sessions it had.
+    shutdown_by: Option<Instant>,
     shared: Arc<Shared>,
     started: Instant,
     /// The ticket has been announced.
@@ -238,6 +245,7 @@ impl<H: Host> ServerCore<H> {
             sessions: HashMap::new(),
             next_id: 1,
             stopping: false,
+            shutdown_by: None,
             shared,
             started: Instant::now(),
             announced: false,
@@ -300,6 +308,7 @@ impl<H: Host> ServerCore<H> {
             (!self.announced && !self.warned).then(|| self.started + RESERVE_WARNING),
             self.pending.values().map(|(_, deadline)| *deadline).min(),
             self.admission.values().map(|a| a.by).min(),
+            self.shutdown_by,
         ];
         core.into_iter()
             .chain(self.sessions.values().map(Slot::deadline))
@@ -571,7 +580,7 @@ impl<H: Host> ServerCore<H> {
             .map(|(key, _)| key.clone());
         let Some(key) = key else {
             if let Ok(pipe) = result {
-                self.host.unused(pipe);
+                self.host.unused(id, pipe);
             }
             return;
         };
@@ -586,7 +595,7 @@ impl<H: Host> ServerCore<H> {
             (Ok(pipe), Some((link, recv))) => self.start(key, id, pipe, link, recv),
             // The client lost its stream meanwhile. Never welcomed, it
             // comes back as a new session.
-            (Ok(pipe), None) => self.host.unused(pipe),
+            (Ok(pipe), None) => self.host.unused(id, pipe),
             (Err(reason), Some((link, _))) => self.refuse(link, &reason),
             (Err(reason), None) => log::debug!("session {id}: {reason}"),
         }
@@ -596,7 +605,7 @@ impl<H: Host> ServerCore<H> {
     /// `Welcome` is out, the session counts as admitted.
     fn start(&mut self, key: SlotKey, id: u64, pipe: Pipe, link: Link, recv: u64) {
         if let Err(e) = pipe.check_attach(recv) {
-            self.host.unused(pipe);
+            self.host.unused(id, pipe);
             return self.refuse(link, &e);
         }
         let link = if std::mem::take(&mut self.drop_welcome) {
@@ -611,7 +620,7 @@ impl<H: Host> ServerCore<H> {
         ) {
             log::debug!("welcome failed: {e}");
             link.abandon(&mut self.endpoint);
-            self.host.unused(pipe);
+            self.host.unused(id, pipe);
             return;
         } else {
             Some(link)
@@ -733,6 +742,7 @@ impl<H: Host> ServerCore<H> {
     /// with no session is disconnected once the `Error` had time to go out.
     fn refuse(&mut self, link: Link, reason: &str) {
         log::debug!("refusing stream from {}: {reason}", link.peer);
+        self.host.refused(&link.peer, reason);
         if let Err(e) = link.send(&mut self.endpoint, &Frame::Error(reason.into())) {
             log::debug!("refusal not sent: {e}");
         }
@@ -873,6 +883,9 @@ impl<H: Host> ServerCore<H> {
             Stop::failed(self.host.failure()?)
         };
         self.stopping = true;
+        // Telling a peer takes the longest part of a stop; every slot gets
+        // that long, together.
+        self.shutdown_by = Some(Instant::now() + ABORT_GRACE);
         // A session already ending ends as it would have.
         if self.sessions.is_empty()
             || self
@@ -1018,8 +1031,14 @@ impl<H: Host> ServerCore<H> {
         if !ending.drained {
             ending.drained = live.pipe.output_closed() || now >= ending.drain_by;
         }
-        if ending.tell.is_some() || ending.linger.is_some() || !ending.drained {
+        let waiting = ending.tell.is_some() || ending.linger.is_some() || !ending.drained;
+        // Past the server's shutdown deadline, nothing waits any more.
+        let cut_short = waiting && self.shutdown_by.is_some_and(|by| now >= by);
+        if waiting && !cut_short {
             return false;
+        }
+        if cut_short {
+            log::debug!("session {id}: shutting down; cutting its teardown short");
         }
 
         let Some(Slot {
@@ -1031,7 +1050,7 @@ impl<H: Host> ServerCore<H> {
         };
         // A writer still blocked on the output is left behind, unless
         // cancelling ends its write.
-        if ending.clean {
+        if ending.clean && !cut_short {
             live.pipe.cancel_clean();
         } else {
             live.pipe.cancel_abort();
