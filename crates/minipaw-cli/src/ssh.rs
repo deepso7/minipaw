@@ -109,6 +109,7 @@ fn client_args(
 fn swap_destination(args: &[OsString]) -> Result<(Ticket, Vec<OsString>), String> {
     let mut out = args.to_vec();
     let at = *operands(Tool::Ssh, args, false)
+        .operands
         .first()
         .ok_or("no destination; expected [USER@]TICKET")?;
     let (user, ticket) = args[at].to_str().and_then(user_ticket).ok_or_else(|| {
@@ -128,7 +129,9 @@ fn swap_destination(args: &[OsString]) -> Result<(Ticket, Vec<OsString>), String
 fn swap_paths(args: &[OsString]) -> Result<(Ticket, Vec<OsString>), String> {
     let mut found: Option<(Ticket, String)> = None;
     let mut out = args.to_vec();
-    for at in operands(Tool::Cp, args, scp_permutes()) {
+    let parsed = operands(Tool::Cp, args, scp_permutes());
+    let mut remotes = 0;
+    for &at in &parsed.operands {
         let Some((user, ticket, path)) = remote_path(&args[at])? else {
             continue;
         };
@@ -144,6 +147,17 @@ fn swap_paths(args: &[OsString]) -> Result<(Ticket, Vec<OsString>), String> {
         let mut arg = OsString::from(format!("{user}{name}:"));
         arg.push(path);
         out[at] = arg;
+        remotes += 1;
+    }
+    // With -R, a copy between remote paths runs on the source machine,
+    // which has no ProxyCommand and no such host; by default it goes
+    // through this one.
+    if remotes > 1 && parsed.flags.contains(&b'R') {
+        return Err(
+            "-R copies between remote paths from the source machine, which cannot reach a \
+             ticket; leave out -R"
+                .into(),
+        );
     }
     let (ticket, _) =
         found.ok_or("no remote path among the arguments; expected [USER@]TICKET:PATH")?;
@@ -162,18 +176,27 @@ fn host(ticket: &Ticket) -> String {
     format!("minipaw-{}", ticket.peer())
 }
 
-/// The positions of the operands in `args`, read as ssh and scp read
-/// their command lines: options may be grouped (`-vp22`, `-vp 22`), and
-/// `--` ends them. They end at the first operand too, unless `permute`
-/// (see [`scp_permutes`]). For ssh, only the first operand, its
-/// destination, is returned: what follows is the remote command.
-fn operands(tool: Tool, args: &[OsString], permute: bool) -> Vec<usize> {
+/// A command line, as [`operands`] reads it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Parsed {
+    /// The positions of the operands.
+    operands: Vec<usize>,
+    /// The option letters given, without their values.
+    flags: Vec<u8>,
+}
+
+/// Reads `args` as ssh and scp read their command lines: options may be
+/// grouped (`-vp22`, `-vp 22`), and `--` ends them. They end at the first
+/// operand too, unless `permute` (see [`scp_permutes`]). For ssh, only the
+/// first operand, its destination, is read: what follows is the remote
+/// command.
+fn operands(tool: Tool, args: &[OsString], permute: bool) -> Parsed {
     // The single-letter options that take a value, from ssh(1) and scp(1).
     let with_value = match tool {
         Tool::Ssh => "BbcDEeFIiJLlmOoPpQRSWw",
         Tool::Cp => "cDFiJloPSX",
     };
-    let mut found = Vec::new();
+    let mut found = Parsed::default();
     let mut options = true;
     let mut i = 0;
     while i < args.len() {
@@ -184,15 +207,17 @@ fn operands(tool: Tool, args: &[OsString], permute: bool) -> Vec<usize> {
         } else if options && arg.len() > 1 && arg[0] == b'-' {
             // The first option that takes a value takes the rest of the
             // group, or else the next argument.
-            if let Some(k) = arg[1..]
+            let group = &arg[1..];
+            let value = group
                 .iter()
-                .position(|&b| with_value.contains(char::from(b)))
-                && k + 2 == arg.len()
-            {
+                .position(|&b| with_value.contains(char::from(b)));
+            let end = value.map_or(group.len(), |k| k + 1);
+            found.flags.extend_from_slice(&group[..end]);
+            if value == Some(group.len() - 1) {
                 i += 1;
             }
         } else {
-            found.push(i - 1);
+            found.operands.push(i - 1);
             if tool == Tool::Ssh {
                 break;
             }
@@ -206,9 +231,9 @@ fn operands(tool: Tool, args: &[OsString], permute: bool) -> Vec<usize> {
 type Remote<'a> = (&'a str, Ticket, OsString);
 
 /// Splits a remote path, `[USER@]TICKET:PATH`, into its parts, the path
-/// kept as it is; `None` for a local path. As
-/// with scp, a path is local if it starts with `:` or has a `/` before its
-/// first `:` (or none), and on Windows if it starts with a drive (`C:`).
+/// kept as it is; `None` for a local path. As with scp, a path is local if
+/// it starts with `:` or has a `/` before its first `:` (or none), and on
+/// Windows if it starts with a drive (`C:`).
 ///
 /// # Errors
 ///
@@ -449,11 +474,30 @@ mod tests {
             .iter()
             .map(OsString::from)
             .collect();
-        assert_eq!(operands(Tool::Cp, &argv, false), [0, 1, 2, 3, 4, 5]);
-        assert_eq!(operands(Tool::Cp, &argv, true), [0, 4, 5]);
+        assert_eq!(
+            operands(Tool::Cp, &argv, false).operands,
+            [0, 1, 2, 3, 4, 5]
+        );
+        assert_eq!(operands(Tool::Cp, &argv, true).operands, [0, 4, 5]);
         // After `--`, an operand does not bring options back.
         let argv: Vec<OsString> = ["--", "a", "-i", "b"].iter().map(OsString::from).collect();
-        assert_eq!(operands(Tool::Cp, &argv, true), [1, 2, 3]);
+        assert_eq!(operands(Tool::Cp, &argv, true).operands, [1, 2, 3]);
+        // Option letters, but not their values.
+        let argv: Vec<OsString> = ["-rRP22", "-iR", "a", "-v"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(operands(Tool::Cp, &argv, true).flags, b"rRPiv");
+    }
+
+    #[test]
+    fn remote_to_remote_with_r_is_refused() {
+        let (a, b) = (format!("{TICKET}:a"), format!("{TICKET}:b"));
+        let err = args(Tool::Cp, "/m", &["-pR", &a, &b]).expect_err("-R");
+        assert!(err.contains("leave out -R"), "{err}");
+        // Without -R scp goes through here; with one remote path -R is moot.
+        assert!(args(Tool::Cp, "/m", &[&a, &b]).is_ok());
+        assert!(args(Tool::Cp, "/m", &["-R", &a, "."]).is_ok());
     }
 
     #[test]
