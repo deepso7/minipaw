@@ -52,13 +52,16 @@ pub fn run(
         result: None,
     };
     let relay = relay.peer_id().clone();
-    let mut server = ServerCore::new(endpoint, ticket, relay, config, shared, listener, 1);
+    let mut server = ServerCore::new(endpoint, ticket, relay, config, shared.clone(), listener, 1);
     let exit = server.run();
     let mut listener = server.close();
     if let Some(mut pipe) = listener.pipe.take() {
         pipe.finish(Some(STDOUT_GRACE));
     }
     match (listener.result, exit) {
+        // Once asked to stop, the stop is the outcome whatever else went
+        // wrong meanwhile, e.g. the peer stopping at the same moment.
+        (Some(Err(_)), _) if shared.stopped() => Err(crate::Error::Stopped),
         (Some(result), _) => result,
         (None, Ok(Exit::Stopped(e))) => Err(e),
         (None, Err(e)) => Err(crate::Error::from_internal(e)),
