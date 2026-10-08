@@ -29,8 +29,20 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: SDK has no UI dependencies
+        run: |
+          deps=$(cargo tree -p minipaw -e normal --prefix none)
+          if grep -E '^(clap|ratatui|crossterm|ctrlc) ' <<<"$deps"; then
+            echo "::error::the minipaw crate must not depend on UI crates"
+            exit 1
+          fi
+      - name: SDK packages for crates.io
+        run: cargo package -p minipaw --no-verify --allow-dirty
 
   test:
     strategy:
@@ -45,7 +57,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo test
+      - run: cargo test --workspace
       - name: End-to-end checks
         run: scripts/check.sh
         env:

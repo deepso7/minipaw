@@ -2,7 +2,6 @@
 
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use minip2p::{
@@ -10,15 +9,12 @@ use minip2p::{
     ReservationPolicy,
 };
 
-use crate::pipe::{BACKPRESSURE_RETRY, Link, Pipe, SendError};
+use crate::pipe::{BACKPRESSURE_RETRY, Link, LocalFailure, Pipe, SendError};
+use crate::session::{Outcome, Shared};
 use crate::wire::{Frame, PROTOCOL};
 use minip2p::{ConnectionId, PeerId, StreamId};
 
 const AGENT: &str = concat!("minipaw/", env!("CARGO_PKG_VERSION"));
-
-/// The relay a ticket without an embedded relay goes through, unless
-/// `--relay` or `MINIPAW_RELAY` names another.
-pub const DEFAULT_RELAY: &str = "/dns/relay.minip2p.com/udp/19876/quic-v1/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf";
 
 /// How long either side keeps trying to get a lost stream back.
 pub const RESUME_TIMEOUT: Duration = Duration::from_secs(60);
@@ -27,52 +23,32 @@ pub const LINGER: Duration = Duration::from_secs(2);
 /// With all data confirmed but the stream lost, how long we keep the
 /// session open so the peer can resume and collect our last ack.
 pub const DELIVERED_GRACE: Duration = Duration::from_secs(10);
-/// On Ctrl-C or an error, how long we wait for a blocked stdout to drain.
+/// How long moving a session from a relayed circuit onto a direct
+/// connection may take before it is reported as a lost link.
+pub const HANDOVER_GRACE: Duration = Duration::from_secs(3);
+/// On a stop or an error, how long we wait for a blocked output to drain.
 const STDOUT_GRACE: Duration = Duration::from_secs(1);
-/// After Ctrl-C or a local failure, how long we try to tell the peer: first
+/// After a stop request or a local failure, how long we try to tell the peer: first
 /// waiting for a stream if the session is between streams, then for the
 /// peer to confirm it got the news.
 pub const ABORT_GRACE: Duration = Duration::from_secs(3);
 
-pub fn default_relay() -> Option<PeerAddr> {
-    DEFAULT_RELAY.parse().ok()
-}
-
-/// Resolves `--relay`, then `MINIPAW_RELAY`, then the built-in default.
-pub fn resolve_relay(flag: Option<&str>) -> Result<PeerAddr, Box<dyn Error>> {
-    let env = std::env::var("MINIPAW_RELAY").ok();
-    let raw = flag
-        .or(env.as_deref())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_RELAY);
-    if raw.is_empty() {
-        return Err("no relay configured: pass --relay <multiaddr> or set MINIPAW_RELAY".into());
-    }
-    let relay: PeerAddr = raw
-        .parse()
-        .map_err(|e| format!("invalid relay address '{raw}': {e}"))?;
-    crate::ticket::check_relay(&relay)?;
-    if !relay.transport().is_quic_transport() {
-        return Err(format!(
-            "relay must be a QUIC address (…/udp/<port>/quic-v1/p2p/<id>), got '{raw}'"
-        )
-        .into());
-    }
-    Ok(relay)
-}
-
 /// QUIC on every interface, the pipe protocol, and NAT traversal through
 /// `relay`. Servers hold a reservation there to be reachable; clients only
-/// open circuits through it, then hole-punch with DCUtR.
-pub fn bind(relay: &PeerAddr, reserve: bool) -> Result<Endpoint, Box<dyn Error>> {
+/// open circuits through it, then hole-punch with DCUtR. `force_relay`
+/// keeps to the relay: no direct dials or hole punching.
+pub fn bind(
+    relay: &PeerAddr,
+    reserve: bool,
+    force_relay: bool,
+) -> Result<Endpoint, Box<dyn Error>> {
     let nat = NatConfig {
         reservation_policy: if reserve {
             ReservationPolicy::Always
         } else {
             ReservationPolicy::Never
         },
-        // Test hook: relay only, no direct dials or hole punching.
-        force_relay: std::env::var_os("MINIPAW_FORCE_RELAY").is_some(),
+        force_relay,
         ..NatConfig::default()
     };
     let mut endpoint = Endpoint::builder()
@@ -84,7 +60,7 @@ pub fn bind(relay: &PeerAddr, reserve: bool) -> Result<Endpoint, Box<dyn Error>>
         .bind()?;
     // Bound addresses are the local half of the hole-punch candidates.
     for addr in endpoint.listen_all()? {
-        crate::debug!("bound {addr}");
+        log::debug!("bound {addr}");
     }
     Ok(endpoint)
 }
@@ -95,13 +71,15 @@ pub fn random16() -> Result<[u8; 16], Box<dyn Error>> {
     Ok(bytes)
 }
 
+/// Whether a replaced connection is a relayed circuit giving way to a
+/// direct one: a planned move rather than a lost link.
+pub fn is_upgrade(old: ConnectionId, new: ConnectionId) -> bool {
+    old.is_circuit() && !new.is_circuit()
+}
+
 /// Whether the endpoint's current connection to `peer` skips the relay.
 pub fn is_direct(endpoint: &Endpoint, peer: &minip2p::PeerId) -> bool {
     !matches!(endpoint.path(peer), Some(Path::Relayed { .. }))
-}
-
-pub fn path_label(direct: bool) -> &'static str {
-    if direct { "direct" } else { "via relay" }
 }
 
 pub fn path_name(path: &Path) -> &'static str {
@@ -113,40 +91,40 @@ pub fn path_name(path: &Path) -> &'static str {
 }
 
 pub fn log_event(event: &EndpointEvent) {
-    if !crate::verbose() {
+    if !log::log_enabled!(log::Level::Debug) {
         return;
     }
     match event {
         EndpointEvent::ConnectionEstablished { peer_id, conn_id } => {
-            crate::debug!("connected to {peer_id} ({conn_id:?})");
+            log::debug!("connected to {peer_id} ({conn_id:?})");
         }
         EndpointEvent::ConnectionClosed { peer_id, conn_id } => {
-            crate::debug!("disconnected from {peer_id} ({conn_id:?})");
+            log::debug!("disconnected from {peer_id} ({conn_id:?})");
         }
         EndpointEvent::ConnectionReplaced { peer_id, old, new } => {
-            crate::debug!("connection to {peer_id} replaced ({old:?} -> {new:?})");
+            log::debug!("connection to {peer_id} replaced ({old:?} -> {new:?})");
         }
         EndpointEvent::ConnectSettled { outcome, .. } => {
-            crate::debug!("connect attempt settled: {outcome:?}");
+            log::debug!("connect attempt settled: {outcome:?}");
         }
         EndpointEvent::Nat(nat) => match nat {
-            NatEvent::RelayReserved { relay, .. } => crate::debug!("reserved on relay {relay}"),
+            NatEvent::RelayReserved { relay, .. } => log::debug!("reserved on relay {relay}"),
             NatEvent::RelayReservationLost { relay } => {
-                crate::debug!("reservation on relay {relay} lost");
+                log::debug!("reservation on relay {relay} lost");
             }
             NatEvent::PathEstablished { path, .. }
             | NatEvent::InboundPathEstablished { path, .. } => {
-                crate::debug!("path established: {}", path_name(path));
+                log::debug!("path established: {}", path_name(path));
             }
-            NatEvent::PathUpgraded { to, .. } => crate::debug!("path upgraded: {}", path_name(to)),
-            NatEvent::InboundDirectUpgrade { .. } => crate::debug!("path upgraded: direct"),
+            NatEvent::PathUpgraded { to, .. } => log::debug!("path upgraded: {}", path_name(to)),
+            NatEvent::InboundDirectUpgrade { .. } => log::debug!("path upgraded: direct"),
             NatEvent::HolePunchFailed {
                 attempt, reason, ..
-            } => crate::debug!("hole punch attempt {attempt} failed: {reason}"),
-            NatEvent::FellBackToRelay { .. } => crate::debug!("staying on the relay"),
-            other => crate::debug!("{other:?}"),
+            } => log::debug!("hole punch attempt {attempt} failed: {reason}"),
+            NatEvent::FellBackToRelay { .. } => log::debug!("staying on the relay"),
+            other => log::debug!("{other:?}"),
         },
-        EndpointEvent::Error(error) => crate::debug!("endpoint error: {error:?}"),
+        EndpointEvent::Error(error) => log::debug!("endpoint error: {error:?}"),
         _ => {}
     }
 }
@@ -170,14 +148,14 @@ fn flush(endpoint: &mut Endpoint) {
 fn close(mut endpoint: Endpoint) {
     flush(&mut endpoint);
     if let Err(e) = endpoint.close() {
-        crate::debug!("close endpoint: {e}");
+        log::debug!("close endpoint: {e}");
     }
 }
 
 pub fn linger_and_close(mut endpoint: Endpoint, link: Option<Link>) {
     if let Some(link) = link {
         if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
-            crate::debug!("close stream: {e}");
+            log::debug!("close stream: {e}");
         }
         let deadline = Instant::now() + LINGER;
         loop {
@@ -216,7 +194,7 @@ pub enum Exit {
     /// All data in both directions is confirmed, but the stream is gone and
     /// the peer did not come back for our last ack.
     Delivered,
-    /// Ctrl-C or a local failure.
+    /// A stop request or a local failure.
     Stopped(Stop),
 }
 
@@ -240,18 +218,19 @@ pub struct Stop {
 
 enum StopReason {
     Interrupted,
-    Failed(String),
+    Failed(LocalFailure),
 }
 
 impl Stop {
-    /// Ctrl-C or the pipe's first local I/O error, if either happened.
-    pub fn check(pipe: &Pipe) -> Option<Stop> {
-        let reason = if interrupted() {
+    /// A stop request or the pipe's first local I/O error, if either
+    /// happened.
+    pub fn check(shared: &Shared, pipe: &Pipe) -> Option<Stop> {
+        let reason = if shared.stopped() {
             StopReason::Interrupted
         } else {
-            StopReason::Failed(pipe.failure()?)
+            StopReason::Failed(pipe.take_failure()?)
         };
-        crate::debug!("stopping; telling the peer");
+        log::debug!("stopping; telling the peer");
         Some(Stop {
             reason,
             by: Instant::now() + ABORT_GRACE,
@@ -312,7 +291,7 @@ impl Stop {
         match link.try_send(endpoint, &Frame::Error(self.message().into())) {
             Ok(()) => {
                 if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
-                    crate::debug!("close stream: {e}");
+                    log::debug!("close stream: {e}");
                 }
                 self.told.push(key);
                 Ok(false)
@@ -332,8 +311,8 @@ impl Stop {
 }
 
 /// Ends a session however it ended: tells the peer when it should know,
-/// flushes stdout (bounded when the session did not complete), and maps the
-/// outcome to `run`'s result.
+/// flushes the output (bounded when the session did not complete), and
+/// maps the outcome to `run`'s result.
 ///
 /// `peer` is the other end of the session, once there is one.
 pub fn finish(
@@ -342,16 +321,16 @@ pub fn finish(
     link: Option<Link>,
     peer: Option<PeerId>,
     exit: Result<Exit, Box<dyn Error>>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Outcome, crate::Error> {
     match exit {
         Ok(Exit::Done) => {
             pipe.finish(None);
             linger_and_close(endpoint, link);
-            Ok(())
+            Ok(Outcome::Done)
         }
         Ok(Exit::Delivered) => {
             pipe.finish(None);
-            Ok(())
+            Ok(Outcome::Delivered)
         }
         Ok(Exit::Stopped(stop)) => {
             // The loop already told the peer, or gave up trying.
@@ -359,15 +338,16 @@ pub fn finish(
             close(endpoint);
             pipe.finish(Some(STDOUT_GRACE));
             Err(match stop.reason {
-                StopReason::Interrupted => Interrupted.into(),
-                StopReason::Failed(message) => message.into(),
+                StopReason::Interrupted => crate::Error::Stopped,
+                StopReason::Failed(LocalFailure::Read(e)) => crate::Error::Input(e),
+                StopReason::Failed(LocalFailure::Write(e)) => crate::Error::Output(e),
             })
         }
         Err(e) if e.is::<PeerEnded>() => {
             pipe.finish(Some(STDOUT_GRACE));
             // Half-closing back confirms to the peer that its Error landed.
             linger_and_close(endpoint, link);
-            Err(e)
+            Err(crate::Error::from_internal(e))
         }
         Err(e) => {
             abort(
@@ -378,41 +358,22 @@ pub fn finish(
                 Instant::now() + ABORT_GRACE,
             );
             pipe.finish(Some(STDOUT_GRACE));
-            Err(e)
+            Err(crate::Error::from_internal(e))
         }
     }
 }
 
-/// The error `main` turns into exit status 130, silently.
+/// The peer went away and did not come back in time.
 #[derive(Debug)]
-pub struct Interrupted;
+pub struct Disconnected(pub &'static str);
 
-impl fmt::Display for Interrupted {
+impl fmt::Display for Disconnected {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("interrupted")
+        f.write_str(self.0)
     }
 }
 
-impl Error for Interrupted {}
-
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
-/// Routes Ctrl-C to the event loop: the first sets [`interrupted`] and wakes
-/// `wait`; a second exits on the spot.
-pub fn handle_interrupt(wake: minip2p::WaitHandle) -> Result<(), Box<dyn Error>> {
-    ctrlc::set_handler(move || {
-        if INTERRUPTED.swap(true, Ordering::SeqCst) {
-            std::process::exit(130);
-        }
-        wake.interrupt();
-    })
-    .map_err(|e| format!("installing the Ctrl-C handler: {e}"))?;
-    Ok(())
-}
-
-pub fn interrupted() -> bool {
-    INTERRUPTED.load(Ordering::SeqCst)
-}
+impl Error for Disconnected {}
 
 /// The peer ended the session (an `Error` frame). Nothing is owed back, so
 /// we just leave.
@@ -446,10 +407,10 @@ fn abort(
     let mut told: Vec<Link> = Vec::new();
     let tell = |endpoint: &mut Endpoint, told: &mut Vec<Link>, link: Link| {
         if let Err(e) = link.send(endpoint, &error) {
-            crate::debug!("abort not sent: {e}");
+            log::debug!("abort not sent: {e}");
         }
         if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
-            crate::debug!("close stream: {e}");
+            log::debug!("close stream: {e}");
         }
         told.push(link);
     };

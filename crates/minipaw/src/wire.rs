@@ -6,7 +6,9 @@
 //! survives its stream being replaced. `VERSION` in `Hello` is bumped
 //! whenever a peer would misread the other's frames.
 
+/// The libp2p protocol id of a minipaw session stream.
 pub const PROTOCOL: &str = "/minipaw/pipe/1";
+/// The session protocol version a `Hello` carries; peers must match.
 pub const VERSION: u8 = 2;
 
 /// Largest `Data` payload we send.

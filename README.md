@@ -20,8 +20,10 @@ implementation in Rust.
 ## Install
 
 ```sh
-cargo install --git https://github.com/deepso7/minipaw
+cargo install --git https://github.com/deepso7/minipaw minipaw-cli
 ```
+
+This installs the `minipaw` binary.
 
 ## Use
 
@@ -42,12 +44,32 @@ tar cz dir/ | minipaw         # A
 minipaw <ticket> | tar xz     # B
 ```
 
-Status lines start with `#` and go to stderr, so redirecting stdout captures
-only the data. Add `-v` to see connection details. `minipaw parse <ticket>`
-shows what a ticket contains.
+Status goes to stderr (see [Terminal UI](#terminal-ui)), so redirecting
+stdout captures only the data. Add `-v` to see connection details.
+`minipaw parse <ticket>` shows what a ticket contains.
 
 Exit status: `0` when both directions finished and were confirmed, `1` on
 any error (including the other side hitting one), `130` on Ctrl-C.
+
+## Terminal UI
+
+minipaw picks how to show status from where its streams point:
+
+- **Status panel** when stdout is redirected or piped and stderr is a
+  terminal, as when sending or receiving a file. A small panel on stderr
+  shows the ticket, the connection state, relay or direct, bytes sent and
+  received, rates, and an ETA when sending a regular file. Nothing but data
+  ever goes to stdout.
+- **Chat** when stdin and stdout are both terminals: the conversation
+  prints into your terminal's normal scrollback, above a small input box
+  that shows the connection state and traffic. Enter sends, Ctrl-D ends
+  your side, Ctrl-C stops.
+- **Plain `#` lines** when stderr isn't a terminal, or with `--plain`. This
+  is what scripts and logs see.
+
+The panel and chat need stderr to be a terminal, `TERM` set to something
+other than `dumb`, and a terminal of at least 40×8; the chat also needs raw
+mode to work. Otherwise minipaw falls back to plain lines.
 
 ## How it works
 
@@ -90,14 +112,38 @@ which is fine when hole punching succeeds. For peers that can't punch
 through, run it with
 `--max-circuit-bytes 0 --max-circuit-duration 0 --circuit-peer-rate off`.
 
+## Library
+
+The networking lives in the [`minipaw`](crates/minipaw) crate, a blocking
+library you can embed: listen or dial, give it any reader and writer, and
+get events and progress back.
+
+```rust
+use minipaw::{Config, Event, Io};
+
+let outcome = minipaw::listen(Config::default(), Io::stdio())
+    .on_event(|event| {
+        if let Event::Listening { ticket } = event {
+            eprintln!("connect with: {ticket}");
+        }
+    })
+    .run()?;
+```
+
+See [its README](crates/minipaw/README.md) for dialing, stopping and
+custom streams.
+
 ## Development
 
 ```sh
-cargo test                          # unit tests
+cargo test --workspace              # unit tests
 scripts/check.sh                    # end-to-end behaviour checks (~10s)
 scripts/bench.sh                    # loopback throughput, direct + relayed
 scripts/bench-remote.sh <ssh-host>  # real-network throughput
 ```
+
+The workspace has two crates: `crates/minipaw` is the library and
+`crates/minipaw-cli` is the `minipaw` command built on it.
 
 The scripts start a throwaway local relay from a sibling `../minip2p`
 checkout; build it once with
@@ -113,3 +159,8 @@ A few environment variables exist for testing only:
 `MINIPAW_DIRECT=<multiaddr>` makes the client also dial the server directly,
 and `MINIPAW_TEST_DROP_LINK_AFTER=<bytes>` makes the server go silent on its
 stream once, after that many bytes.
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE-APACHE), at your option.

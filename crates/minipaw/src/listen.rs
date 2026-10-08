@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use minip2p::{
@@ -12,8 +13,12 @@ use minip2p::{
     StreamId,
 };
 
-use crate::net::{self, DELIVERED_GRACE, Exit, RESUME_TIMEOUT, Stop};
+use crate::config::Config;
+use crate::event::{Event, Events, PathKind};
+use crate::io::Io;
+use crate::net::{self, DELIVERED_GRACE, Disconnected, Exit, HANDOVER_GRACE, RESUME_TIMEOUT, Stop};
 use crate::pipe::{Link, Pipe};
+use crate::session::{Outcome, Shared};
 use crate::ticket::Ticket;
 use crate::wire::{Frame, FrameReader, PROTOCOL, SessionId, Token};
 
@@ -39,33 +44,41 @@ struct Server {
     lost_since: Option<Instant>,
     /// The user has been told the client is on a direct path.
     told_direct: bool,
-    /// Ctrl-C or a local failure, once seen.
+    /// The stream was dropped as the client moved onto a direct
+    /// connection: its loss and resume go unreported unless it takes
+    /// [`HANDOVER_GRACE`].
+    handover: bool,
+    /// A stop request or a local failure, once seen.
     stop: Option<Stop>,
-    /// Test hook (`MINIPAW_TEST_DROP_LINK_AFTER=<bytes>`): once this many
+    shared: Arc<Shared>,
+    events: Events,
+    /// Test hook ([`Config::test_drop_link_after`]): once this many
     /// session bytes have arrived, forget the link without closing it, as
     /// a relay that drops a circuit and tells only us would. The client
     /// sees its stream go silent.
     drop_link_after: Option<u64>,
 }
 
-pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
-    let endpoint = net::bind(&relay, true)?;
-    let token = net::random16()?;
-    let embed = net::default_relay().is_none_or(|default| default != relay);
+/// Runs a listener's session through `relay`.
+pub fn run(
+    relay: PeerAddr,
+    config: &Config,
+    io: Io,
+    shared: Arc<Shared>,
+    events: Events,
+) -> Result<Outcome, crate::Error> {
+    let endpoint =
+        net::bind(&relay, true, config.force_relay).map_err(crate::Error::from_internal)?;
+    let token = net::random16().map_err(crate::Error::from_internal)?;
+    let embed = crate::config::default_relay().is_none_or(|default| default != relay);
     let ticket = Ticket {
         peer: endpoint.peer_id().clone(),
         token,
         relay: embed.then(|| relay.clone()),
     };
-    net::handle_interrupt(endpoint.wait_handle())?;
-    let pipe = Pipe::new(&endpoint.wait_handle());
-    let drop_link_after = match std::env::var("MINIPAW_TEST_DROP_LINK_AFTER") {
-        Ok(raw) => Some(
-            raw.parse()
-                .map_err(|e| format!("invalid MINIPAW_TEST_DROP_LINK_AFTER '{raw}': {e}"))?,
-        ),
-        Err(_) => None,
-    };
+    shared.set_wake(endpoint.wait_handle());
+    let pipe = Pipe::new(&endpoint.wait_handle(), io, shared.stats.clone());
+    let drop_link_after = config.test_drop_link_after;
     let mut server = Server {
         endpoint,
         pipe,
@@ -75,11 +88,16 @@ pub fn run(relay: PeerAddr) -> Result<(), Box<dyn Error>> {
         pending: HashMap::new(),
         lost_since: None,
         told_direct: false,
+        handover: false,
         stop: None,
+        shared,
+        events,
         drop_link_after,
     };
 
-    eprintln!("# reserving a slot on relay {}…", relay.peer_id());
+    server.events.emit(Event::Reserving {
+        relay: relay.peer_id().clone(),
+    });
     let exit = server.drive(&ticket);
     let link = server.link.take();
     let client = server.client.take().map(|(peer, _)| peer);
@@ -92,7 +110,7 @@ impl Server {
     fn drive(&mut self, ticket: &Ticket) -> Result<Exit, Box<dyn Error>> {
         match self.drive_until_exit(ticket) {
             Err(e) if self.stop.is_some() => {
-                crate::debug!("while stopping: {e}");
+                log::debug!("while stopping: {e}");
                 Ok(Exit::Stopped(self.stop.take().ok_or("no stop")?))
             }
             result => result,
@@ -102,6 +120,8 @@ impl Server {
     fn drive_until_exit(&mut self, ticket: &Ticket) -> Result<Exit, Box<dyn Error>> {
         let started = Instant::now();
         let mut announced = false;
+        // Lost since announced, so getting it back is news.
+        let mut lost = false;
         let mut warned = false;
         loop {
             let deadline = [
@@ -115,6 +135,9 @@ impl Server {
                 self.lost_since
                     .filter(|_| self.pipe.delivered())
                     .map(|t| t + DELIVERED_GRACE),
+                self.lost_since
+                    .filter(|_| self.handover)
+                    .map(|t| t + HANDOVER_GRACE),
                 self.stop.as_ref().map(Stop::wake_at),
                 self.pending.values().map(|(_, deadline)| *deadline).min(),
             ]
@@ -126,14 +149,20 @@ impl Server {
             .max(Instant::now() + Duration::from_millis(1));
 
             if let EndpointWaitOutcome::Event(event) = self.endpoint.wait(deadline)? {
-                if let EndpointEvent::Nat(NatEvent::RelayReserved { .. }) = &event
-                    && !announced
-                {
-                    announced = true;
-                    eprintln!("# 🐾 listening; connect with:\nminipaw {ticket}");
+                if let EndpointEvent::Nat(NatEvent::RelayReserved { .. }) = &event {
+                    if !announced {
+                        announced = true;
+                        self.events.emit(Event::Listening {
+                            ticket: ticket.clone(),
+                        });
+                    } else if lost {
+                        self.events.emit(Event::ReservationRestored);
+                    }
+                    lost = false;
                 }
                 if let EndpointEvent::Nat(NatEvent::RelayReservationLost { .. }) = &event {
-                    eprintln!("# lost the relay reservation; reacquiring");
+                    lost = announced;
+                    self.events.emit(Event::ReservationLost);
                 }
                 if let Some(stop) = &mut self.stop {
                     stop.observe(&event);
@@ -150,14 +179,17 @@ impl Server {
             }
             if !announced && !warned && started.elapsed() >= RESERVE_WARNING {
                 warned = true;
-                eprintln!("# still no relay reservation; is the relay reachable over UDP?");
+                self.events.emit(Event::ReservationSlow);
             }
 
             if self.stop.is_none() {
                 if let Err(e) = self.pipe.pump(&mut self.endpoint, self.link.as_ref()) {
                     self.lose(&format!("send failed: {e}"));
                 }
-                self.stop = Stop::check(&self.pipe);
+                self.stop = Stop::check(&self.shared, &self.pipe);
+                if self.stop.is_some() {
+                    self.events.emit(Event::Stopping);
+                }
             }
             if let Some(stop) = &mut self.stop {
                 // A server with no client has nobody to tell.
@@ -176,11 +208,17 @@ impl Server {
                 return Ok(Exit::Done);
             }
             if let Some(since) = self.lost_since {
+                if self.handover && since.elapsed() >= HANDOVER_GRACE {
+                    self.handover = false;
+                    self.events.emit(Event::LinkLost {
+                        reason: "connection closed".to_owned(),
+                    });
+                }
                 if self.pipe.delivered() && since.elapsed() >= DELIVERED_GRACE {
                     return Ok(Exit::Delivered);
                 }
                 if since.elapsed() >= RESUME_TIMEOUT {
-                    return Err("client disconnected and did not come back".into());
+                    return Err(Disconnected("client disconnected and did not come back").into());
                 }
             }
         }
@@ -197,7 +235,7 @@ impl Server {
                     && !self.told_direct =>
             {
                 self.told_direct = true;
-                eprintln!("# upgraded to a direct connection");
+                self.events.emit(Event::Upgraded);
             }
             EndpointEvent::StreamReady {
                 peer_id,
@@ -236,7 +274,7 @@ impl Server {
                         .is_some_and(|after| self.pipe.recv_offset() >= after)
                     {
                         self.drop_link_after = None;
-                        crate::debug!("test hook: dropping the link without closing it");
+                        log::debug!("test hook: dropping the link without closing it");
                         self.link = None;
                         self.lost_since = Some(Instant::now());
                     }
@@ -264,21 +302,11 @@ impl Server {
                     self.lose("stream closed");
                 }
             }
-            EndpointEvent::ConnectionClosed { peer_id, conn_id }
-            | EndpointEvent::ConnectionReplaced {
-                peer_id,
-                old: conn_id,
-                ..
-            } => {
-                self.pending
-                    .retain(|(peer, conn, _), _| *peer != peer_id || *conn != conn_id);
-                if self
-                    .link
-                    .as_ref()
-                    .is_some_and(|l| l.peer == peer_id && l.conn == conn_id)
-                {
-                    self.lose("connection closed");
-                }
+            EndpointEvent::ConnectionClosed { peer_id, conn_id } => {
+                self.drop_conn(&peer_id, conn_id, false);
+            }
+            EndpointEvent::ConnectionReplaced { peer_id, old, new } => {
+                self.drop_conn(&peer_id, old, net::is_upgrade(old, new));
             }
             _ => {}
         }
@@ -330,21 +358,23 @@ impl Server {
             recv: self.pipe.recv_offset(),
         };
         if let Err(e) = link.send(&mut self.endpoint, &welcome) {
-            crate::debug!("welcome failed: {e}");
+            log::debug!("welcome failed: {e}");
             link.abandon(&mut self.endpoint);
             return Ok(());
         }
 
         if resuming {
-            crate::debug!("client resumed at offset {recv}");
+            log::debug!("client resumed at offset {recv}");
+            if !std::mem::take(&mut self.handover) {
+                self.events.emit(Event::Resumed);
+            }
         } else {
             let direct = net::is_direct(&self.endpoint, &link.peer);
             self.told_direct = direct;
-            eprintln!(
-                "# connection from {} ({})",
-                link.peer,
-                net::path_label(direct)
-            );
+            self.events.emit(Event::Accepted {
+                peer: link.peer.clone(),
+                path: PathKind::from_direct(direct),
+            });
             self.client = Some((link.peer.clone(), session));
         }
         if let Some(old) = self.link.take() {
@@ -367,7 +397,7 @@ impl Server {
             .min_by_key(|(_, (_, deadline))| *deadline)
             .map(|(key, _)| key.clone());
         if let Some((peer, conn, stream)) = oldest {
-            crate::debug!("dropping a stream from {peer}: too many pending");
+            log::debug!("dropping a stream from {peer}: too many pending");
             self.pending.remove(&(peer.clone(), conn, stream));
             Link::new(peer, conn, stream).abandon(&mut self.endpoint);
         }
@@ -383,7 +413,7 @@ impl Server {
             .map(|(key, _)| key.clone())
             .collect();
         for (peer, conn, stream) in expired {
-            crate::debug!("dropping a stream from {peer}: no Hello in time");
+            log::debug!("dropping a stream from {peer}: no Hello in time");
             self.pending.remove(&(peer.clone(), conn, stream));
             Link::new(peer, conn, stream).abandon(&mut self.endpoint);
         }
@@ -391,27 +421,51 @@ impl Server {
 
     /// Turns a pending stream away with an `Error`; an admission outcome.
     fn refused(&mut self, key: StreamKey, reason: &str) -> Result<(), Box<dyn Error>> {
-        crate::debug!("refusing stream from {}: {reason}", key.0);
+        log::debug!("refusing stream from {}: {reason}", key.0);
         self.pending.remove(&key);
         let (peer, conn, stream) = key;
         let link = Link::new(peer, conn, stream);
         if let Err(e) = link.send(&mut self.endpoint, &Frame::Error(reason.into())) {
-            crate::debug!("refusal not sent: {e}");
+            log::debug!("refusal not sent: {e}");
         }
         if let Err(e) = self
             .endpoint
             .close_stream_write(&link.peer, link.conn, link.stream)
         {
-            crate::debug!("close refused stream: {e}");
+            log::debug!("close refused stream: {e}");
         }
         Ok(())
     }
 
+    /// Forgets streams on a connection that is gone. If it carried the
+    /// session and was a relayed circuit replaced by a direct connection,
+    /// the client is moving over, so the loss is not reported.
+    fn drop_conn(&mut self, peer: &PeerId, conn: ConnectionId, upgrade: bool) {
+        self.pending.retain(|(p, c, _), _| p != peer || *c != conn);
+        if self
+            .link
+            .as_ref()
+            .is_some_and(|l| l.peer == *peer && l.conn == conn)
+        {
+            self.handover = upgrade;
+            self.lose(if upgrade {
+                "moving to the direct connection"
+            } else {
+                "connection closed"
+            });
+        }
+    }
+
     fn lose(&mut self, reason: &str) {
         if let Some(link) = self.link.take() {
-            crate::debug!("lost the client stream ({reason}); waiting for it to resume");
+            log::debug!("lost the client stream ({reason}); waiting for it to resume");
             link.abandon(&mut self.endpoint);
             self.lost_since = Some(Instant::now());
+            if !self.handover {
+                self.events.emit(Event::LinkLost {
+                    reason: reason.to_owned(),
+                });
+            }
         }
     }
 }

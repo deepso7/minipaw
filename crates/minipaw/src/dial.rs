@@ -3,15 +3,20 @@
 //! that resumes on a fresh stream whenever the current one dies.
 
 use std::error::Error;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use minip2p::{
     ConnectId, ConnectOutcome, ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome,
-    Multiaddr, NatEvent, PeerAddr, PeerId, StreamId,
+    NatEvent, PeerAddr, PeerId, StreamId,
 };
 
-use crate::net::{self, DELIVERED_GRACE, Exit, RESUME_TIMEOUT, Stop};
+use crate::config::Config;
+use crate::event::{Event, Events, PathKind};
+use crate::io::Io;
+use crate::net::{self, DELIVERED_GRACE, Disconnected, Exit, HANDOVER_GRACE, RESUME_TIMEOUT, Stop};
 use crate::pipe::{Link, Pipe};
+use crate::session::{Outcome, Shared};
 use crate::ticket::Ticket;
 use crate::wire::{Frame, PROTOCOL, SessionId};
 
@@ -58,42 +63,56 @@ struct Client {
     hello_sent: bool,
     /// The user has been told the session runs on a direct path.
     told_direct: bool,
-    /// Ctrl-C or a local failure, once seen.
+    /// The stream was dropped to move onto a direct connection: its loss
+    /// and resume go unreported unless it takes [`HANDOVER_GRACE`].
+    handover: bool,
+    /// A stop request or a local failure, once seen.
     stop: Option<Stop>,
-    /// Test hook (`MINIPAW_DIRECT`): a server address to dial alongside the
+    shared: Arc<Shared>,
+    events: Events,
+    /// Test hook ([`Config::direct`]): a server address to dial alongside the
     /// relay, for benchmarks and paths hole punching cannot find.
     direct: Option<PeerAddr>,
 }
 
-pub fn run(ticket: Ticket, relay: PeerAddr) -> Result<(), Box<dyn Error>> {
-    let endpoint = net::bind(&relay, false)?;
-    net::handle_interrupt(endpoint.wait_handle())?;
-    let pipe = Pipe::new(&endpoint.wait_handle());
-    let direct = match std::env::var("MINIPAW_DIRECT") {
-        Ok(raw) => {
-            let addr: Multiaddr = raw
-                .parse()
-                .map_err(|e| format!("invalid MINIPAW_DIRECT '{raw}': {e}"))?;
-            Some(
-                PeerAddr::new(addr, ticket.peer.clone())
-                    .map_err(|e| format!("invalid MINIPAW_DIRECT '{raw}': {e}"))?,
-            )
-        }
-        Err(_) => None,
+/// Runs a dialer's session to `ticket`'s listener through `relay`.
+pub fn run(
+    ticket: Ticket,
+    relay: PeerAddr,
+    config: &Config,
+    io: Io,
+    shared: Arc<Shared>,
+    events: Events,
+) -> Result<Outcome, crate::Error> {
+    let direct = match &config.direct {
+        Some(addr) => Some(
+            PeerAddr::new(addr.clone(), ticket.peer.clone()).map_err(|e| {
+                crate::Error::Config(format!("invalid direct address '{addr}': {e}"))
+            })?,
+        ),
+        None => None,
     };
+    let endpoint =
+        net::bind(&relay, false, config.force_relay).map_err(crate::Error::from_internal)?;
+    let session = net::random16().map_err(crate::Error::from_internal)?;
+    shared.set_wake(endpoint.wait_handle());
+    let pipe = Pipe::new(&endpoint.wait_handle(), io, shared.stats.clone());
     let now = Instant::now();
     let mut client = Client {
         endpoint,
         pipe,
         ticket,
-        session: net::random16()?,
+        session,
         phase: Phase::Idle { at: now },
         backoff: Duration::ZERO,
         lost_since: Some(now),
         was_up: false,
         hello_sent: false,
         told_direct: false,
+        handover: false,
         stop: None,
+        shared,
+        events,
         direct,
     };
 
@@ -109,7 +128,7 @@ impl Client {
     fn drive(&mut self) -> Result<Exit, Box<dyn Error>> {
         match self.drive_until_exit() {
             Err(e) if self.stop.is_some() => {
-                crate::debug!("while stopping: {e}");
+                log::debug!("while stopping: {e}");
                 Ok(Exit::Stopped(self.stop.take().ok_or("no stop")?))
             }
             result => result,
@@ -132,6 +151,9 @@ impl Client {
                 self.phase_deadline(),
                 self.stop.as_ref().map(Stop::wake_at),
                 delivered_by,
+                self.lost_since
+                    .filter(|_| self.handover)
+                    .map(|t| t + HANDOVER_GRACE),
             ]
             .into_iter()
             .flatten()
@@ -154,7 +176,10 @@ impl Client {
                 if let Err(e) = self.pipe.pump(&mut self.endpoint, link) {
                     self.lose(&format!("send failed: {e}"));
                 }
-                self.stop = Stop::check(&self.pipe);
+                self.stop = Stop::check(&self.shared, &self.pipe);
+                if self.stop.is_some() {
+                    self.events.emit(Event::Stopping);
+                }
             }
             if let Some(stop) = &mut self.stop {
                 // From Hello on the server may hold our session, so the news
@@ -214,10 +239,20 @@ impl Client {
         if let Some(since) = self.lost_since
             && now.duration_since(since) >= RESUME_TIMEOUT
         {
-            return Err(if self.was_up {
-                "lost the connection to the server".into()
+            return Err(Disconnected(if self.was_up {
+                "lost the connection to the server"
             } else {
-                "could not reach the server".into()
+                "could not reach the server"
+            })
+            .into());
+        }
+        if self.handover
+            && let Some(since) = self.lost_since
+            && now.duration_since(since) >= HANDOVER_GRACE
+        {
+            self.handover = false;
+            self.events.emit(Event::LinkLost {
+                reason: "connection closed".to_owned(),
             });
         }
         match &self.phase {
@@ -233,7 +268,7 @@ impl Client {
                 // it would be just as dead, so start over with a fresh one.
                 self.lose("no word from the server");
                 if let Err(e) = self.endpoint.disconnect(&self.ticket.peer) {
-                    crate::debug!("disconnect: {e}");
+                    log::debug!("disconnect: {e}");
                 }
             }
             _ => {}
@@ -252,7 +287,10 @@ impl Client {
         };
         match attempt {
             Ok(id) => {
-                crate::debug!("connecting to {}", self.peer());
+                log::debug!("connecting to {}", self.peer());
+                self.events.emit(Event::Connecting {
+                    peer: self.peer().clone(),
+                });
                 self.phase = Phase::Connecting { id };
             }
             Err(e) => self.retry(&format!("connect: {e}")),
@@ -338,15 +376,23 @@ impl Client {
                 ..
             } if self.carries(&peer_id, conn_id, Some(stream_id)) => self.lose("stream closed"),
             EndpointEvent::ConnectionClosed { peer_id, conn_id }
-            | EndpointEvent::ConnectionReplaced {
-                peer_id,
-                old: conn_id,
-                ..
-            } if self.carries(&peer_id, conn_id, None) => self.lose("connection closed"),
+                if self.carries(&peer_id, conn_id, None) =>
+            {
+                self.lose("connection closed");
+            }
+            EndpointEvent::ConnectionReplaced { peer_id, old, new }
+                if self.carries(&peer_id, old, None) =>
+            {
+                if net::is_upgrade(old, new) {
+                    self.hand_over();
+                } else {
+                    self.lose("connection closed");
+                }
+            }
             EndpointEvent::Nat(NatEvent::PathUpgraded { peer, .. }) if peer == *self.peer() => {
                 if self.was_up && !self.told_direct {
                     self.told_direct = true;
-                    eprintln!("# upgraded to a direct connection");
+                    self.events.emit(Event::Upgraded);
                 }
                 // The relayed circuit is closed under the upgrade; move the
                 // session onto the direct connection.
@@ -354,7 +400,7 @@ impl Client {
                 if let Some(conn) = self.phase_conn()
                     && Some(conn) != current
                 {
-                    self.lose("path upgraded");
+                    self.hand_over();
                 }
             }
             _ => {}
@@ -391,12 +437,18 @@ impl Client {
                     else {
                         return Ok(());
                     };
-                    if self.was_up {
-                        crate::debug!("session resumed");
+                    if std::mem::take(&mut self.handover) {
+                        log::debug!("session moved to the direct connection");
+                    } else if self.was_up {
+                        log::debug!("session resumed");
+                        self.events.emit(Event::Resumed);
                     } else {
                         let direct = net::is_direct(&self.endpoint, &self.ticket.peer);
                         self.told_direct = direct;
-                        eprintln!("# connected ({})", net::path_label(direct));
+                        self.events.emit(Event::Connected {
+                            peer: self.ticket.peer.clone(),
+                            path: PathKind::from_direct(direct),
+                        });
                     }
                     self.phase = Phase::Up { link };
                     self.lost_since = None;
@@ -454,19 +506,32 @@ impl Client {
         match std::mem::replace(&mut self.phase, Phase::Idle { at: Instant::now() }) {
             Phase::Opening { conn, stream, .. } => {
                 if let Err(e) = self.endpoint.abandon_stream(&peer, conn, stream) {
-                    crate::debug!("abandon stream: {e}");
+                    log::debug!("abandon stream: {e}");
                 }
             }
-            Phase::Handshaking { link, .. } | Phase::Up { link } => {
-                link.abandon(&mut self.endpoint)
+            Phase::Handshaking { link, .. } => link.abandon(&mut self.endpoint),
+            Phase::Up { link } => {
+                link.abandon(&mut self.endpoint);
+                if !self.handover {
+                    self.events.emit(Event::LinkLost {
+                        reason: reason.to_owned(),
+                    });
+                }
             }
             Phase::Idle { .. } | Phase::Connecting { .. } => {}
         }
         self.retry(reason);
     }
 
+    /// Moves the session off a relayed circuit onto the direct connection
+    /// that replaced it; a planned move, so not reported as a lost link.
+    fn hand_over(&mut self) {
+        self.handover = matches!(self.phase, Phase::Up { .. });
+        self.lose("moving to the direct connection");
+    }
+
     fn retry(&mut self, reason: &str) {
-        crate::debug!("{reason}; retrying in {:?}", self.backoff);
+        log::debug!("{reason}; retrying in {:?}", self.backoff);
         self.lost_since.get_or_insert_with(Instant::now);
         self.phase = Phase::Idle {
             at: Instant::now() + self.backoff,
