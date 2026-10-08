@@ -73,23 +73,37 @@ $ minipaw serve                             # on the machine to reach
 # forwarding to 127.0.0.1:22
 # 🐾 listening; connect with:
 minipaw mpAQ…
-# ssh: ssh -o ProxyCommand='minipaw -q mpAQ…' user@host
+# ssh: minipaw ssh user@mpAQ…
 # [1] 12D3KooW…ab12 connected (direct)
 # [1] ended: 1.2 MiB sent, 40.0 KiB received in 3:02
 ```
 
-On the other machine, in `~/.ssh/config`:
+On the other machine, the ticket stands in for the host:
+
+```sh
+minipaw ssh me@mpAQ…                   # a shell
+minipaw ssh -p 2222 me@mpAQ… uptime    # any ssh options, a command
+minipaw cp -r photos me@mpAQ…:backup/  # scp; remote paths are TICKET:PATH
+```
+
+These run the system's `ssh` and `scp` with every other argument as is,
+adding a ProxyCommand of `minipaw -q <ticket>` (`-q` keeps it silent,
+since ssh shares its stderr). The host key is remembered in known_hosts
+under `minipaw-<peer id>`, so the first connection asks to trust it, as
+ssh does for any new host.
+
+For other tools that run ssh, such as git or rsync, put the ProxyCommand
+in `~/.ssh/config`:
 
 ```
 Host home
-  HostName home
   User me
+  HostKeyAlias minipaw-12D3KooW…
   ProxyCommand minipaw -q mpAQ…
 ```
 
 Then `ssh home`, `scp file home:`, `git clone home:repo` all go through
-minipaw. `-q` keeps the client silent, since ssh shares its stderr; only
-a fatal error prints.
+minipaw.
 
 - serve prints `#` lines on stderr, never a terminal UI, so it runs as
   is under systemd or nohup. Ctrl-C stops it (exit 0).

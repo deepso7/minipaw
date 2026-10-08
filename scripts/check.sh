@@ -949,11 +949,53 @@ check_quiet_hangup() {
   pass "stopped in ${took}s while connecting; stopped when up; finished after stdin's end"
 }
 
+# Stands in for ssh and scp: logs the host key alias and the other
+# arguments to $T/fake.log, then runs the ProxyCommand on its stdin and
+# stdout, as ssh would.
+FAKE_SSH='proxy= alias= rest=
+while [ $# -gt 0 ]; do
+  case $1 in
+    -o) case $2 in
+          ProxyCommand=*) proxy=${2#ProxyCommand=} ;;
+          HostKeyAlias=*) alias=${2#HostKeyAlias=} ;;
+        esac
+        shift 2 ;;
+    *) rest="$rest $1"; shift ;;
+  esac
+done
+echo "$alias$rest" >>"$FAKE_LOG"
+exec sh -c "exec $proxy"'
+
+# `minipaw ssh` and `cp` swap the ticket for a host, file its key under
+# the server's peer id, and reach serve through their ProxyCommand.
+check_ssh_wrapper() {
+  start_target echo || { fail "no target"; return; }
+  start_serve "$T/serve.err" --forward "$TARGET_PORT" || { fail "no ticket"; return; }
+  printf '%s\n' "$FAKE_SSH" >"$T/fake"
+  chmod +x "$T/fake"
+  head -c 1000000 /dev/urandom >"$T/up"
+  local peer
+  peer=$("$BIN" parse "$TICKET" | sed -n 's/^peer: *//p')
+  FAKE_LOG=$T/fake.log MINIPAW_SSH=$T/fake MINIPAW_DIRECT=$DIRECT \
+    "$BIN" ssh -v "me@$TICKET" echo "$TICKET" <"$T/up" >"$T/ssh.out" 2>"$T/ssh.err" &
+  local pid=$!
+  track $pid
+  expect_exit ssh $pid 0 60 || return
+  cmp -s "$T/up" "$T/ssh.out" || { fail "ssh got different data back"; return; }
+  FAKE_LOG=$T/fake.log MINIPAW_SCP=$T/fake MINIPAW_DIRECT=$DIRECT \
+    "$BIN" cp -r a "$TICKET:b c" </dev/null >/dev/null 2>"$T/cp.err" ||
+    { fail "cp failed: $(tail -1 "$T/cp.err")"; return; }
+  local want
+  want=$(printf 'minipaw-%s -v me@minipaw echo %s\nminipaw-%s -r a minipaw:b c' "$peer" "$TICKET" "$peer")
+  [ "$(cat "$T/fake.log")" = "$want" ] || { fail "arguments: $(cat "$T/fake.log")"; return; }
+  pass "ssh moved 1 MB through serve; ssh and cp arguments rewritten"
+}
+
 ALL="transfer forced_relay resume heartbeat interrupt_client interrupt_server interrupt_blocked
 interrupt_both wrong_token busy squatters stdin_error stdout_error closed_reader panel_stdout
 serve_forward serve_halfclose serve_reverse_halfclose serve_restart serve_late_resume serve_limit
 serve_target_down serve_lost_welcome serve_isolation serve_mixed serve_stop_connecting serve_auth_deadline serve_churn
-serve_flood serve_leave quiet_stderr quiet_hangup"
+serve_flood serve_leave quiet_stderr quiet_hangup ssh_wrapper"
 if [ "${1:-}" = list ]; then
   echo $ALL
   exit 0
