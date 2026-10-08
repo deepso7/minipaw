@@ -191,7 +191,7 @@ custom streams.
 
 ```sh
 cargo test --workspace              # unit tests
-scripts/check.sh                    # end-to-end behaviour checks (~10s)
+scripts/check.sh                    # end-to-end behaviour checks (~1.5 min)
 scripts/bench.sh                    # loopback throughput, direct + relayed
 scripts/bench-remote.sh <ssh-host>  # real-network throughput
 ```
