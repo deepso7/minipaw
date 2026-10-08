@@ -130,7 +130,7 @@ fn swap_paths(args: &[OsString]) -> Result<(Ticket, Vec<OsString>), String> {
     let mut found: Option<(Ticket, String)> = None;
     let mut out = args.to_vec();
     let parsed = operands(Tool::Cp, args, scp_permutes());
-    let mut remotes = 0;
+    let mut remotes = Vec::new();
     for &at in &parsed.operands {
         let Some((user, ticket, path)) = remote_path(&args[at])? else {
             continue;
@@ -147,12 +147,13 @@ fn swap_paths(args: &[OsString]) -> Result<(Ticket, Vec<OsString>), String> {
         let mut arg = OsString::from(format!("{user}{name}:"));
         arg.push(path);
         out[at] = arg;
-        remotes += 1;
+        remotes.push(at);
     }
-    // With -R, a copy between remote paths runs on the source machine,
-    // which has no ProxyCommand and no such host; by default it goes
-    // through this one.
-    if remotes > 1 && parsed.flags.contains(&b'R') {
+    // With -R, a copy from a remote path to a remote target runs on the
+    // source machine, which has no ProxyCommand and no such host; by
+    // default it goes through this one.
+    let target_remote = parsed.operands.last().is_some_and(|t| remotes.contains(t));
+    if target_remote && remotes.len() > 1 && parsed.flags.contains(&b'R') {
         return Err(
             "-R copies between remote paths from the source machine, which cannot reach a \
              ticket; leave out -R"
@@ -495,9 +496,13 @@ mod tests {
         let (a, b) = (format!("{TICKET}:a"), format!("{TICKET}:b"));
         let err = args(Tool::Cp, "/m", &["-pR", &a, &b]).expect_err("-R");
         assert!(err.contains("leave out -R"), "{err}");
-        // Without -R scp goes through here; with one remote path -R is moot.
+        assert!(args(Tool::Cp, "/m", &["-R", "x", &a, &b]).is_err());
+        // Without -R scp goes through here; with a local target, or a
+        // local source alone, -R is moot.
         assert!(args(Tool::Cp, "/m", &[&a, &b]).is_ok());
         assert!(args(Tool::Cp, "/m", &["-R", &a, "."]).is_ok());
+        assert!(args(Tool::Cp, "/m", &["-R", &a, &b, "downloads/"]).is_ok());
+        assert!(args(Tool::Cp, "/m", &["-R", "x", &b]).is_ok());
     }
 
     #[test]
