@@ -1,22 +1,20 @@
 //! `minipaw ssh` and `minipaw cp`: the system's ssh and scp, reaching a
 //! `minipaw serve` through a ticket.
 //!
-//! The ticket in the arguments is swapped for a placeholder host, and ssh
-//! is told to reach that host through `minipaw -q <ticket>` as its
-//! ProxyCommand. Everything else goes to ssh or scp untouched, so their
-//! options, prompts and exit codes are their own.
+//! The ticket in the arguments is swapped for a host named after the
+//! server's identity, `minipaw-<peer id>`, and ssh is told to reach that
+//! host through `minipaw -q <ticket>` as its ProxyCommand. Everything else
+//! goes to ssh or scp untouched, so their options, prompts and exit codes
+//! are their own.
 //!
-//! Host keys are filed in known_hosts under `minipaw-<peer id>` (ssh's
-//! HostKeyAlias), so each served machine is remembered by its identity,
-//! whatever name it is reached by.
+//! The host's key is filed in known_hosts under that name too (ssh's
+//! HostKeyAlias), and connection sharing (ControlPath `%h`, `%C`) keeps
+//! each server apart, so one server is never taken for another.
 
 use std::ffi::{OsStr, OsString};
 use std::process::{Command, ExitCode};
 
 use minipaw::Ticket;
-
-/// The host name ssh sees in place of the ticket.
-const HOST: &str = "minipaw";
 
 /// Which client to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,7 +87,7 @@ fn exec(mut command: Command) -> std::io::Result<ExitCode> {
 }
 
 /// The client's arguments: ours, then `args` with the ticket swapped for
-/// [`HOST`]. `exe` is minipaw's own path, for the ProxyCommand.
+/// its [`host`]. `exe` is minipaw's own path, for the ProxyCommand.
 fn client_args(
     tool: Tool,
     exe: &std::path::Path,
@@ -100,7 +98,7 @@ fn client_args(
         Tool::Cp => swap_paths(args)?,
     };
     let proxy = format!("ProxyCommand={} -q {ticket}", proxy_path(exe)?);
-    let alias = format!("HostKeyAlias={HOST}-{}", ticket.peer());
+    let alias = format!("HostKeyAlias={}", host(&ticket));
     let mut argv: Vec<OsString> = vec!["-o".into(), proxy.into(), "-o".into(), alias.into()];
     argv.extend(rest);
     Ok(argv)
@@ -119,20 +117,23 @@ fn swap_destination(args: &[OsString]) -> Result<(Ticket, Vec<OsString>), String
             args[at].to_string_lossy()
         )
     })?;
-    out[at] = format!("{user}{HOST}").into();
+    out[at] = format!("{user}{}", host(&ticket)).into();
     Ok((ticket, out))
 }
 
 /// scp's remote paths: every operand that is `[USER@]TICKET:PATH`. They
-/// must all name the same ticket, as one ProxyCommand serves them all.
+/// must all name the same ticket, as one ProxyCommand serves them all, and
+/// no other remote path may go with them, as it would go through that
+/// ProxyCommand too.
 fn swap_paths(args: &[OsString]) -> Result<(Ticket, Vec<OsString>), String> {
     let mut found: Option<(Ticket, String)> = None;
     let mut out = args.to_vec();
     for at in operands(Tool::Cp, args) {
-        let Some((user, ticket, path)) = remote_path(&args[at]) else {
+        let Some((user, ticket, path)) = remote_path(&args[at])? else {
             continue;
         };
         let text = ticket.to_string();
+        let name = host(&ticket);
         match &found {
             Some((_, first)) if *first != text => {
                 return Err("every remote path must use the same ticket".into());
@@ -140,7 +141,7 @@ fn swap_paths(args: &[OsString]) -> Result<(Ticket, Vec<OsString>), String> {
             Some(_) => {}
             None => found = Some((ticket, text)),
         }
-        let mut arg = OsString::from(format!("{user}{HOST}:"));
+        let mut arg = OsString::from(format!("{user}{name}:"));
         arg.push(path);
         out[at] = arg;
     }
@@ -149,10 +150,16 @@ fn swap_paths(args: &[OsString]) -> Result<(Ticket, Vec<OsString>), String> {
     Ok((ticket, out))
 }
 
+/// The host ssh sees in place of `ticket`: one per server identity.
+fn host(ticket: &Ticket) -> String {
+    format!("minipaw-{}", ticket.peer())
+}
+
 /// The positions of the operands in `args`, read as ssh and scp read
-/// their command lines: options may be grouped (`-vp22`, `-vp 22`), `--`
-/// ends them, and scp takes options among its operands. For ssh, only
-/// the first operand, its destination, is returned: what follows is the
+/// their command lines: options may be grouped (`-vp22`, `-vp 22`), and
+/// `--` ends them. They end at the first operand too, except for scp with
+/// glibc, whose getopt takes options among the operands. For ssh, only the
+/// first operand, its destination, is returned: what follows is the
 /// remote command.
 fn operands(tool: Tool, args: &[OsString]) -> Vec<usize> {
     // The single-letter options that take a value, from ssh(1) and scp(1).
@@ -160,6 +167,7 @@ fn operands(tool: Tool, args: &[OsString]) -> Vec<usize> {
         Tool::Ssh => "BbcDEeFIiJLlmOoPpQRSWw",
         Tool::Cp => "cDFiJloPSX",
     };
+    let permute = tool == Tool::Cp && cfg!(all(target_os = "linux", target_env = "gnu"));
     let mut found = Vec::new();
     let mut options = true;
     let mut i = 0;
@@ -183,23 +191,44 @@ fn operands(tool: Tool, args: &[OsString]) -> Vec<usize> {
             if tool == Tool::Ssh {
                 break;
             }
+            options = permute;
         }
     }
     found
 }
 
-/// Splits `[USER@]TICKET:PATH` into `"USER@"` (or `""`), the ticket, and
-/// the path, kept as it is. As with scp, a `/` before the first `:` makes
-/// it a local path.
-fn remote_path(arg: &OsStr) -> Option<(&str, Ticket, OsString)> {
+/// A remote path: its `"USER@"` (or `""`), ticket and path.
+type Remote<'a> = (&'a str, Ticket, OsString);
+
+/// Splits a remote path, `[USER@]TICKET:PATH`, into its parts, the path
+/// kept as it is; `None` for a local path. As
+/// with scp, a path is local if it starts with `:` or has a `/` before its
+/// first `:` (or none), and on Windows if it starts with a drive (`C:`).
+///
+/// # Errors
+///
+/// A remote path that is not a ticket's, such as `host:path` or an
+/// `scp://` URI.
+fn remote_path(arg: &OsStr) -> Result<Option<Remote<'_>>, String> {
     let bytes = arg.as_encoded_bytes();
-    let colon = bytes.iter().position(|&b| b == b':')?;
-    let head = std::str::from_utf8(&bytes[..colon]).ok()?;
-    if head.contains('/') {
-        return None;
+    let Some(colon) = bytes.iter().position(|&b| b == b':' || b == b'/') else {
+        return Ok(None);
+    };
+    let drive = cfg!(windows) && colon == 1 && bytes[0].is_ascii_alphabetic();
+    if colon == 0 || bytes[colon] == b'/' || drive {
+        return Ok(None);
     }
-    let (user, ticket) = user_ticket(head)?;
-    Some((user, ticket, os_string(&bytes[colon + 1..])?))
+    std::str::from_utf8(&bytes[..colon])
+        .ok()
+        .and_then(user_ticket)
+        .and_then(|(user, ticket)| Some((user, ticket, os_string(&bytes[colon + 1..])?)))
+        .map(Some)
+        .ok_or_else(|| {
+            format!(
+                "not a ticket's remote path: {}; write [USER@]TICKET:PATH",
+                arg.to_string_lossy()
+            )
+        })
 }
 
 /// The bytes after an ASCII prefix of an `OsStr`, back as an `OsString`.
@@ -298,6 +327,11 @@ mod tests {
         })
     }
 
+    /// The host that stands in for TICKET.
+    fn h() -> String {
+        host(&TICKET.parse().expect("ticket"))
+    }
+
     fn ours(exe: &str) -> Vec<String> {
         let ticket: Ticket = TICKET.parse().expect("ticket");
         vec![
@@ -317,11 +351,11 @@ mod tests {
         )
         .expect("args");
         let mut want = ours("/usr/bin/minipaw");
-        want.extend(["-p", "2222", "me@minipaw", "echo", TICKET].map(String::from));
+        want.extend(["-p", "2222", &format!("me@{}", h()), "echo", TICKET].map(String::from));
         assert_eq!(got, want);
 
         let got = args(Tool::Ssh, "/m", &["-t", TICKET]).expect("args");
-        assert_eq!(got[4..], ["-t", "minipaw"]);
+        assert_eq!(got[4..], ["-t".to_owned(), h()]);
     }
 
     #[test]
@@ -337,10 +371,11 @@ mod tests {
             ],
         )
         .expect("args");
-        assert_eq!(got[4..], ["-r", "a", "minipaw:b", "u@minipaw:/tmp/c d"]);
+        let want = ["-r", "a", "H:b", "u@H:/tmp/c d"].map(|a| a.replace('H', &h()));
+        assert_eq!(got[4..], want);
 
         let got = args(Tool::Cp, "/m", &[&format!("{TICKET}:"), "."]).expect("args");
-        assert_eq!(got[4..], ["minipaw:", "."]);
+        assert_eq!(got[4..], [format!("{}:", h()), ".".into()]);
     }
 
     #[test]
@@ -367,28 +402,78 @@ mod tests {
 
     #[test]
     fn option_values_are_not_operands() {
-        let t = |s: &str| s.replace('T', TICKET);
+        let t = |s: &str| s.replace("{T}", TICKET).replace("{H}", &h());
         // ssh: -l, -i and -o take a value, apart or attached; -v does not.
-        let argv = ["-l", "T", "-vi", "T", "-oUser=T", "-v", "u@T", "T"].map(t);
+        let argv = [
+            "-l",
+            "{T}",
+            "-vi",
+            "{T}",
+            "-oUser={T}",
+            "-v",
+            "u@{T}",
+            "{T}",
+        ]
+        .map(t);
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
         let got = args(Tool::Ssh, "/m", &argv).expect("args");
-        let want = ["-l", "T", "-vi", "T", "-oUser=T", "-v", "u@minipaw", "T"].map(t);
+        let want = [
+            "-l",
+            "{T}",
+            "-vi",
+            "{T}",
+            "-oUser={T}",
+            "-v",
+            "u@{H}",
+            "{T}",
+        ]
+        .map(t);
         assert_eq!(got[4..], want);
 
-        // scp: -i and -P take a value; operands may come among options,
-        // and after `--` everything is one.
-        let argv = ["-i", "T:k", "a", "-rP22", "T:b", "--", "-T:c"].map(t);
+        // scp: -i and -P take a value. Options after an operand are
+        // operands too, except with glibc; -rP22 is a local path either
+        // way. After `--` everything is an operand.
+        let argv = ["-i", "{T}:k", "a", "-rP22", "{T}:b", "--", "-x"].map(t);
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
         let got = args(Tool::Cp, "/m", &argv).expect("args");
-        let want = ["-i", "T:k", "a", "-rP22", "minipaw:b", "--", "-T:c"].map(t);
+        let want = ["-i", "{T}:k", "a", "-rP22", "{H}:b", "--", "-x"].map(t);
         assert_eq!(got[4..], want);
+
+        let argv = ["a", "-i", "{T}:f", "."].map(t);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let got = args(Tool::Cp, "/m", &argv);
+        if cfg!(all(target_os = "linux", target_env = "gnu")) {
+            assert!(got.is_err(), "{got:?}");
+        } else {
+            assert_eq!(got.expect("args")[4..], ["a", "-i", "{H}:f", "."].map(t));
+        }
     }
 
     #[test]
     fn a_slash_before_the_colon_is_a_local_path() {
         let local = format!("./u@{TICKET}:f");
         let got = args(Tool::Cp, "/m", &[&local, &format!("{TICKET}:g")]).expect("args");
-        assert_eq!(got[4..], [local.as_str(), "minipaw:g"]);
+        assert_eq!(got[4..], [local, format!("{}:g", h())]);
+    }
+
+    #[test]
+    fn other_remote_paths_are_refused() {
+        for other in ["host:f", "u@host:f", "scp://host/f", "[::1]:f"] {
+            let err = args(Tool::Cp, "/m", &[&format!("{TICKET}:a"), other]).expect_err(other);
+            assert!(err.contains("not a ticket's remote path"), "{err}");
+        }
+        // Local: a leading `:`, a `/` first, no `:` at all.
+        let got = args(Tool::Cp, "/m", &[":a", "b/c:d", "e", &format!("{TICKET}:")]);
+        assert!(got.is_ok(), "{got:?}");
+    }
+
+    #[test]
+    fn each_server_has_its_own_host() {
+        let other = minipaw::Identity::generate()
+            .expect("identity")
+            .ticket(None);
+        assert_ne!(host(&other), h());
+        assert!(h().starts_with("minipaw-12D3KooW"), "{}", h());
     }
 
     #[cfg(unix)]
@@ -399,7 +484,9 @@ mod tests {
         raw.push(0xe9);
         let argv = [OsString::from_vec(raw), OsString::from(".")];
         let got = client_args(Tool::Cp, Path::new("/m"), &argv).expect("args");
-        assert_eq!(got[4].as_bytes(), b"minipaw:caf\xe9");
+        let mut want = format!("{}:caf", h()).into_bytes();
+        want.push(0xe9);
+        assert_eq!(got[4].as_bytes(), want);
     }
 
     #[test]

@@ -86,10 +86,12 @@ minipaw ssh -p 2222 me@mpAQ… uptime    # any ssh options, a command
 minipaw cp -r photos me@mpAQ…:backup/  # scp; remote paths are TICKET:PATH
 ```
 
-These run the system's `ssh` and `scp` with every other argument as is,
-adding a ProxyCommand of `minipaw -q <ticket>` (`-q` keeps it silent,
-since ssh shares its stderr). The host key is remembered in known_hosts
-under `minipaw-<peer id>` (which ssh lowercases), so the first connection asks to trust it, as
+These run the system's `ssh` and `scp` with every other argument as is
+(`cp` takes no other remote paths alongside the ticket's),
+with the ticket swapped for a host named `minipaw-<peer id>` and a
+ProxyCommand of `minipaw -q <ticket>` (`-q` keeps it silent, since ssh
+shares its stderr). The host key is remembered in known_hosts under that
+name (which ssh lowercases), so the first connection asks to trust it, as
 ssh does for any new host.
 
 For other tools that run ssh, such as git or rsync, put the ProxyCommand

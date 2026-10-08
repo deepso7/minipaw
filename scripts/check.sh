@@ -966,8 +966,9 @@ done
 echo "$alias$rest" >>"$FAKE_LOG"
 exec sh -c "exec $proxy"'
 
-# `minipaw ssh` and `cp` swap the ticket for a host, file its key under
-# the server's peer id, and reach serve through their ProxyCommand.
+# `minipaw ssh` and `cp` swap the ticket for a host named after the
+# server's peer id, file its key under that name, and reach serve through
+# their ProxyCommand.
 check_ssh_wrapper() {
   start_target echo || { fail "no target"; return; }
   start_serve "$T/serve.err" --forward "$TARGET_PORT" || { fail "no ticket"; return; }
@@ -986,7 +987,8 @@ check_ssh_wrapper() {
     "$BIN" cp -r a "$TICKET:b c" </dev/null >/dev/null 2>"$T/cp.err" ||
     { fail "cp failed: $(tail -1 "$T/cp.err")"; return; }
   local want
-  want=$(printf 'minipaw-%s -v me@minipaw echo %s\nminipaw-%s -r a minipaw:b c' "$peer" "$TICKET" "$peer")
+  local h=minipaw-$peer
+  want=$(printf '%s -v me@%s echo %s\n%s -r a %s:b c' "$h" "$h" "$TICKET" "$h" "$h")
   [ "$(cat "$T/fake.log")" = "$want" ] || { fail "arguments: $(cat "$T/fake.log")"; return; }
   pass "ssh moved 1 MB through serve; ssh and cp arguments rewritten"
 }
