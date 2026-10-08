@@ -680,6 +680,9 @@ impl<H: Host> ServerCore<H> {
             log::debug!("welcome failed: {e}");
             link.abandon(&mut self.endpoint);
             self.host.unused(id, pipe);
+            // Its admission deadline may have lapsed while it was
+            // connecting; without one, an idle peer would stay forever.
+            self.readmit(&key.0);
             return;
         } else {
             Some(link)
