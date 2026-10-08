@@ -509,7 +509,8 @@ impl Pipe {
         }
         match self.writer_done.try_recv() {
             Err(TryRecvError::Empty) => false,
-            // Sent just before it exits, or it is gone.
+            // Sent just before it exits, its writer already dropped, or
+            // it is gone: joining cannot block for long.
             Ok(()) | Err(TryRecvError::Disconnected) => {
                 if let Some(writer) = self.writer.take()
                     && writer.join().is_err()
@@ -621,6 +622,9 @@ fn spawn_output(
                 .fetch_add(data.len() as u64, Ordering::Release);
             wake.interrupt();
         }
+        // Closed before saying so: a writer whose drop blocks (a final
+        // flush to a stuck socket) must not hold up whoever joins us.
+        drop(output);
         // The receiver is gone once the session has ended.
         if done.send(()).is_ok() {
             wake.interrupt();
@@ -630,6 +634,24 @@ fn spawn_output(
 
 #[cfg(test)]
 mod tests {
+    /// A writer whose drop blocks until told to go on.
+    struct SlowDrop(std::sync::mpsc::Receiver<()>);
+
+    impl Write for SlowDrop {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            let _ = self.0.recv_timeout(Duration::from_secs(10));
+        }
+    }
+
     use std::io;
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc::RecvTimeoutError;
@@ -666,6 +688,25 @@ mod tests {
 
     fn pipe(io: Io) -> Pipe {
         Pipe::new(&WaitHandle::new(|| {}), io, Arc::default())
+    }
+
+    #[test]
+    fn a_writer_slow_to_drop_does_not_block_checking_the_output() {
+        let (go, wait) = mpsc::channel();
+        let mut pipe = pipe(Io::new(io::empty(), SlowDrop(wait)));
+        pipe.close_output();
+        // The writer thread is stuck dropping its writer: not closed yet,
+        // and asking must not block.
+        let asked = Instant::now();
+        thread::sleep(Duration::from_millis(100));
+        assert!(!pipe.output_closed());
+        assert!(asked.elapsed() < Duration::from_secs(1));
+        go.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pipe.output_closed() {
+            assert!(Instant::now() < deadline, "output never closed");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

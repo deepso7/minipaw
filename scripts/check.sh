@@ -555,6 +555,25 @@ check_serve_forward() {
   pass "3 concurrent sessions echoed 2 MB each; serve still up"
 }
 
+# A Welcome that never reaches the client: it retries without `resume`,
+# and the server picks the same session up, without a second target
+# connection.
+check_serve_lost_welcome() {
+  start_target echo || { fail "no target"; return; }
+  MINIPAW_TEST_DROP_WELCOME=1 start_serve "$T/serve.err" --forward "$TARGET_PORT" ||
+    { fail "no ticket"; return; }
+  head -c 2000000 /dev/urandom >"$T/up"
+  client c "$T/up" direct
+  expect_exit c "$CLIENT_PID" 0 60 || return
+  cmp -s "$T/up" "$T/c.out" || { fail "echo differs"; return; }
+  grep -q "test hook: dropping the Welcome" "$T/serve.err" ||
+    { fail "the Welcome was not dropped"; return; }
+  local accepted
+  accepted=$(count "$T/target.log" '^accepted ')
+  [ "$accepted" = 1 ] || { fail "the target saw $accepted connections"; return; }
+  pass "retried after a lost Welcome; one target connection, 2 MB echoed"
+}
+
 check_serve_halfclose() {
   start_target count || { fail "no target"; return; }
   start_serve "$T/serve.err" --forward "$TARGET_PORT" || { fail "no ticket"; return; }
@@ -933,7 +952,7 @@ check_quiet_hangup() {
 ALL="transfer forced_relay resume heartbeat interrupt_client interrupt_server interrupt_blocked
 interrupt_both wrong_token busy squatters stdin_error stdout_error closed_reader panel_stdout
 serve_forward serve_halfclose serve_reverse_halfclose serve_restart serve_late_resume serve_limit
-serve_target_down serve_isolation serve_mixed serve_stop_connecting serve_auth_deadline serve_churn
+serve_target_down serve_lost_welcome serve_isolation serve_mixed serve_stop_connecting serve_auth_deadline serve_churn
 serve_flood serve_leave quiet_stderr quiet_hangup"
 if [ "${1:-}" = list ]; then
   echo $ALL
