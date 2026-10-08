@@ -2,7 +2,7 @@
 
 use minip2p::{Multiaddr, PeerAddr};
 
-use crate::Error;
+use crate::{Error, Identity};
 
 /// The relay used when neither [`Config::relay`] nor the ticket names one.
 pub const DEFAULT_RELAY: &str = "/dns/relay.minip2p.com/udp/19876/quic-v1/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf";
@@ -32,6 +32,11 @@ pub struct Config {
     /// makes [`Session::run`](crate::Session::run) fail with
     /// [`Error::Config`].
     pub direct: Option<Multiaddr>,
+    /// The key to run as, so the peer id stays the same from run to run.
+    /// A listener also puts the identity's token in its ticket, which then
+    /// stays the same too (for the same relay). `None` means a fresh key
+    /// and token every run.
+    pub identity: Option<Identity>,
     /// Test hook: once this many session bytes have arrived, a listener
     /// forgets its stream without closing it, as a relay that drops a
     /// circuit and tells only one side would.

@@ -97,6 +97,12 @@ it holds a relay slot; the ticket carries its peer id, a random token and
 the relay (if not the default). Anyone with the ticket can connect, so treat
 it like a password. `Ticket` parses from and displays as the `mp…` string.
 
+The key and token are fresh every run unless `Config::identity` holds an
+`Identity`: `Identity::load_or_create(path)` keeps one in a private file,
+and `Identity::ticket(relay)` gives the ticket a listener with it prints,
+the same every run. `Identity::replace` rotates it. On Unix the file must be
+a regular file only you can read, in a directory only you can write.
+
 ## Input and output
 
 `Io::stdio()` uses the process's stdin and stdout, and `Io::tcp` a

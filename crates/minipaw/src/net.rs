@@ -9,6 +9,7 @@ use minip2p::{
     ReservationPolicy,
 };
 
+use crate::config::Config;
 use crate::pipe::{BACKPRESSURE_RETRY, Link, LocalFailure, Pipe, SendError};
 use crate::session::{Outcome, Shared};
 use crate::wire::{Frame, PROTOCOL};
@@ -35,23 +36,24 @@ pub const ABORT_GRACE: Duration = Duration::from_secs(3);
 
 /// QUIC on every interface, the pipe protocol, and NAT traversal through
 /// `relay`. Servers hold a reservation there to be reachable; clients only
-/// open circuits through it, then hole-punch with DCUtR. `force_relay`
-/// keeps to the relay: no direct dials or hole punching.
-pub fn bind(
-    relay: &PeerAddr,
-    reserve: bool,
-    force_relay: bool,
-) -> Result<Endpoint, Box<dyn Error>> {
+/// open circuits through it, then hole-punch with DCUtR. The config's
+/// `force_relay` keeps to the relay: no direct dials or hole punching. The
+/// endpoint's key is the config's identity, else a fresh one.
+pub fn bind(relay: &PeerAddr, reserve: bool, config: &Config) -> Result<Endpoint, Box<dyn Error>> {
     let nat = NatConfig {
         reservation_policy: if reserve {
             ReservationPolicy::Always
         } else {
             ReservationPolicy::Never
         },
-        force_relay,
+        force_relay: config.force_relay,
         ..NatConfig::default()
     };
-    let mut endpoint = Endpoint::builder()
+    let mut builder = Endpoint::builder();
+    if let Some(identity) = &config.identity {
+        builder = builder.identity(identity.key().clone());
+    }
+    let mut endpoint = builder
         .agent_version(AGENT)
         .protocol(PROTOCOL)
         .nat_config(nat)

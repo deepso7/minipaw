@@ -1,10 +1,11 @@
 //! The command line, and the settings it and the environment make.
 
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory as _, Parser, Subcommand};
-use minipaw::{Config, Multiaddr, PeerAddr, Ticket};
+use minipaw::{Config, Identity, Multiaddr, PeerAddr, Ticket};
 
 /// minipaw: pipe stdin/stdout between two machines, peer to peer.
 ///
@@ -15,15 +16,18 @@ use minipaw::{Config, Multiaddr, PeerAddr, Ticket};
 #[command(
     name = "minipaw",
     version,
-    override_usage = "minipaw [OPTIONS] [TICKET]\n       minipaw [-v] parse <TICKET>",
+    override_usage = "minipaw [OPTIONS] [TICKET]\n       minipaw [-v] parse <TICKET>\n       minipaw [-v] ticket [--identity PATH] [--relay MULTIADDR]",
     after_help = "\
 Examples:
   minipaw <big.iso                 send a file; prints a ticket
   minipaw <ticket> >big.iso        receive it on another machine
   minipaw / minipaw <ticket>       chat, when run in a terminal on both ends
+  minipaw --identity my.key        listen with the same ticket every run
 
 Environment:
-  MINIPAW_RELAY   relay to use when --relay is not given (empty: the built-in relay)"
+  MINIPAW_RELAY   relay to use when --relay is not given (empty: the built-in relay)
+  MINIPAW_HOME    where `minipaw ticket` keeps serve.key (default:
+                  $XDG_CONFIG_HOME/minipaw, else ~/.config/minipaw)"
 )]
 pub struct Args {
     /// A listener's ticket to connect to. Without one, listen and print a
@@ -37,6 +41,12 @@ pub struct Args {
     /// their relay, so this only applies when listening.
     #[arg(long, value_name = "MULTIADDR", conflicts_with = "ticket")]
     pub relay: Option<String>,
+
+    /// Listen as the identity saved at PATH, created if missing, so the
+    /// ticket stays the same from run to run (for the same relay). Anyone
+    /// holding that ticket can connect whenever this listens.
+    #[arg(long, value_name = "PATH", conflicts_with = "ticket")]
+    pub identity: Option<PathBuf>,
 
     /// Log connection progress to stderr.
     #[arg(short, long, global = true)]
@@ -65,6 +75,7 @@ impl Args {
             let session = [
                 (args.ticket.is_some(), "[TICKET]"),
                 (args.relay.is_some(), "--relay"),
+                (args.identity.is_some(), "--identity"),
                 (args.plain, "--plain"),
             ];
             if let Some((_, name)) = session.iter().find(|(used, _)| *used) {
@@ -87,6 +98,19 @@ pub enum Command {
         #[arg(value_name = "TICKET")]
         ticket: Ticket,
     },
+    /// Print the stable ticket of a saved identity, creating the identity
+    /// if missing. The ticket goes to stdout, a `# identity: PATH
+    /// (new|existing)` line to stderr.
+    Ticket {
+        /// The identity file. Defaults to serve.key in $MINIPAW_HOME, else
+        /// $XDG_CONFIG_HOME/minipaw, else ~/.config/minipaw.
+        #[arg(long, value_name = "PATH")]
+        identity: Option<PathBuf>,
+        /// The relay the listener will use; it is part of the ticket.
+        /// Defaults to $MINIPAW_RELAY, then the built-in relay.
+        #[arg(long, value_name = "MULTIADDR")]
+        relay: Option<String>,
+    },
 }
 
 /// The session settings from `args` and the `MINIPAW_*` environment.
@@ -105,15 +129,7 @@ fn config_with(args: &Args, env: impl Fn(&str) -> Option<OsString>) -> Result<Co
     let mut config = Config::default();
     // Test hook: relay only, no direct dials or hole punching.
     config.force_relay = env("MINIPAW_FORCE_RELAY").is_some();
-    // `--relay`, else `MINIPAW_RELAY`; empty or neither means the default.
-    let relay = |flag: Option<&str>| -> Result<Option<PeerAddr>, String> {
-        let env = var("MINIPAW_RELAY");
-        flag.or(env.as_deref())
-            .filter(|s| !s.is_empty())
-            .map(minipaw::parse_relay)
-            .transpose()
-            .map_err(|e| e.to_string())
-    };
+    let relay = |flag: Option<&str>| relay_with(flag, &env);
     match &args.ticket {
         None => {
             config.relay = relay(args.relay.as_deref())?;
@@ -144,6 +160,93 @@ fn config_with(args: &Args, env: impl Fn(&str) -> Option<OsString>) -> Result<Co
         }
     }
     Ok(config)
+}
+
+/// `--relay`, else `MINIPAW_RELAY`; empty or neither means the default.
+fn relay_with(
+    flag: Option<&str>,
+    env: impl Fn(&str) -> Option<OsString>,
+) -> Result<Option<PeerAddr>, String> {
+    let env = env("MINIPAW_RELAY").and_then(|v| v.into_string().ok());
+    flag.or(env.as_deref())
+        .filter(|s| !s.is_empty())
+        .map(minipaw::parse_relay)
+        .transpose()
+        .map_err(|e| e.to_string())
+}
+
+/// Where `minipaw ticket` keeps its identity without `--identity`:
+/// `serve.key` in `$MINIPAW_HOME`, else `$XDG_CONFIG_HOME/minipaw`, else
+/// `~/.config/minipaw`. Empty variables count as unset, and so does a
+/// relative `XDG_CONFIG_HOME`, as the XDG spec says.
+fn default_identity_with(env: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
+    let var = |name: &str| env(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let dir = var("MINIPAW_HOME")
+        .or_else(|| {
+            var("XDG_CONFIG_HOME")
+                .filter(|p| p.is_absolute())
+                .map(|p| p.join("minipaw"))
+        })
+        .or_else(|| var("HOME").map(|p| p.join(".config").join("minipaw")))
+        .ok_or("cannot find a home directory; set MINIPAW_HOME or pass --identity")?;
+    Ok(dir.join("serve.key"))
+}
+
+/// Loads the identity at `path`, creating it if missing, and says whether
+/// it was created. Without a `path` it is the default one, whose directory
+/// is created (mode 0700) if missing; an existing directory is never
+/// changed.
+///
+/// # Errors
+///
+/// When the identity cannot be loaded or created, with the message to print.
+pub fn load_identity(path: Option<&Path>) -> Result<(Identity, PathBuf, bool), String> {
+    let path = match path {
+        Some(path) => path.to_owned(),
+        None => {
+            let path = default_identity_with(|name| std::env::var_os(name))?;
+            if let Some(dir) = path.parent() {
+                create_private_dir(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+            }
+            path
+        }
+    };
+    let (identity, created) = Identity::load_or_create(&path).map_err(|e| e.to_string())?;
+    Ok((identity, path, created))
+}
+
+/// Creates `dir` and any missing parents with mode 0700. An existing `dir`
+/// is left alone; the SDK checks it.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)
+}
+
+/// The stable ticket for `minipaw ticket`, with the identity's path and
+/// whether it was just created.
+///
+/// # Errors
+///
+/// When the relay or the identity is invalid, with the message to print.
+pub fn stable_ticket(
+    identity: Option<&Path>,
+    relay: Option<&str>,
+) -> Result<(Ticket, PathBuf, bool), String> {
+    let relay = relay_with(relay, |name| std::env::var_os(name))?;
+    let (identity, path, created) = load_identity(identity)?;
+    Ok((identity.ticket(relay.as_ref()), path, created))
+}
+
+/// The `# identity: PATH (new|existing)` status line.
+pub fn identity_line(path: &Path, created: bool) -> String {
+    let state = if created { "new" } else { "existing" };
+    format!("# identity: {} ({state})", path.display())
 }
 
 /// Prints what `ticket` contains, for `minipaw parse`.
@@ -205,6 +308,27 @@ mod tests {
     }
 
     #[test]
+    fn identity_and_ticket() {
+        let args = parse(&["--identity", "my.key"]).expect("listen");
+        assert_eq!(args.identity.as_deref(), Some(Path::new("my.key")));
+
+        let args = parse(&["-v", "ticket"]).expect("ticket");
+        assert!(matches!(
+            args.command,
+            Some(Command::Ticket {
+                identity: None,
+                relay: None
+            })
+        ));
+        let args = parse(&["ticket", "--identity", "my.key", "--relay", RELAY]).expect("ticket");
+        let Some(Command::Ticket { identity, relay }) = args.command else {
+            panic!("not ticket");
+        };
+        assert_eq!(identity.as_deref(), Some(Path::new("my.key")));
+        assert_eq!(relay.as_deref(), Some(RELAY));
+    }
+
+    #[test]
     fn usage_errors() {
         let kind = |argv: &[&str]| parse(argv).map(|_| ()).unwrap_err().kind();
         assert_eq!(
@@ -225,6 +349,20 @@ mod tests {
             ErrorKind::UnknownArgument
         );
         assert_eq!(kind(&["parse"]), ErrorKind::MissingRequiredArgument);
+        // An identity is for listening, and `ticket` takes its own flags.
+        assert_eq!(
+            kind(&["--identity", "my.key", TICKET]),
+            ErrorKind::ArgumentConflict
+        );
+        for argv in [
+            ["--identity", "my.key", "ticket"],
+            ["--relay", RELAY, "ticket"],
+            ["--plain", "ticket", "-v"],
+        ] {
+            assert_eq!(kind(&argv), ErrorKind::ArgumentConflict, "{argv:?}");
+        }
+        assert_eq!(kind(&["ticket", TICKET]), ErrorKind::UnknownArgument);
+        assert_eq!(kind(&["ticket", "--plain"]), ErrorKind::UnknownArgument);
         assert_eq!(parse(&["parse", "x"]).unwrap_err().exit_code(), 2);
     }
 
@@ -258,6 +396,30 @@ mod tests {
         // The dialer uses MINIPAW_RELAY for a ticket without a relay.
         let config = config_with(&dial, env(&[("MINIPAW_RELAY", RELAY)])).expect("config");
         assert!(config.relay.is_some());
+    }
+
+    #[test]
+    fn the_default_identity_path() {
+        let path = |vars: &[(&str, &str)]| default_identity_with(env(vars));
+        let ok = |vars: &[(&str, &str)]| path(vars).expect("path");
+        let home = ("HOME", "/home/me");
+        assert_eq!(ok(&[home]), Path::new("/home/me/.config/minipaw/serve.key"));
+        assert_eq!(
+            ok(&[home, ("XDG_CONFIG_HOME", "/xdg")]),
+            Path::new("/xdg/minipaw/serve.key")
+        );
+        // A relative or empty XDG_CONFIG_HOME is ignored.
+        for xdg in ["rel", ""] {
+            assert_eq!(
+                ok(&[home, ("XDG_CONFIG_HOME", xdg)]),
+                Path::new("/home/me/.config/minipaw/serve.key")
+            );
+        }
+        assert_eq!(
+            ok(&[home, ("XDG_CONFIG_HOME", "/xdg"), ("MINIPAW_HOME", "/mp")]),
+            Path::new("/mp/serve.key")
+        );
+        assert!(path(&[]).unwrap_err().contains("MINIPAW_HOME"));
     }
 
     #[test]

@@ -48,6 +48,15 @@ Status goes to stderr (see [Terminal UI](#terminal-ui)), so redirecting
 stdout captures only the data. Add `-v` to see connection details.
 `minipaw parse <ticket>` shows what a ticket contains.
 
+A ticket is new every run unless the listener keeps its key:
+`minipaw --identity my.key` creates `my.key` (mode 0600) on the first run
+and prints the same ticket on every later one. `minipaw ticket` prints
+that stable ticket without listening, for the identity in
+`~/.config/minipaw/serve.key` by default (`$MINIPAW_HOME`,
+`--identity PATH`); pass the listener's `--relay`, which is part of the
+ticket. The file and its directory must be private to you. Anyone with
+the ticket can connect whenever you listen, so delete the file to rotate it.
+
 Exit status: `0` when both directions finished and were confirmed, `1` on
 any error (including the other side hitting one), `130` on Ctrl-C.
 

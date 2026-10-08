@@ -41,6 +41,17 @@ impl Ticket {
     pub fn relay(&self) -> Option<&PeerAddr> {
         self.relay.as_ref()
     }
+
+    /// A listener's ticket. The relay is left out when it is `None` or the
+    /// default, to keep the ticket short.
+    pub(crate) fn listener(peer: PeerId, token: Token, relay: Option<&PeerAddr>) -> Ticket {
+        let default = crate::config::default_relay();
+        Ticket {
+            peer,
+            token,
+            relay: relay.filter(|r| default.as_ref() != Some(*r)).cloned(),
+        }
+    }
 }
 
 /// Why a string is not a valid [`Ticket`].

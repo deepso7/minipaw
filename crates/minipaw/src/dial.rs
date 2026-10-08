@@ -92,8 +92,7 @@ pub fn run(
         ),
         None => None,
     };
-    let endpoint =
-        net::bind(&relay, false, config.force_relay).map_err(crate::Error::from_internal)?;
+    let endpoint = net::bind(&relay, false, config).map_err(crate::Error::from_internal)?;
     let session = net::random16().map_err(crate::Error::from_internal)?;
     shared.set_wake(endpoint.wait_handle());
     let pipe = Pipe::new(&endpoint.wait_handle(), io, shared.stats.clone());

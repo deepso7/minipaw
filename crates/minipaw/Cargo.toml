@@ -16,5 +16,8 @@ getrandom.workspace = true
 log.workspace = true
 minip2p-rs.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [lints]
 workspace = true

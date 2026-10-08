@@ -13,19 +13,51 @@ use ui::{Launch, term};
 fn main() -> ExitCode {
     // Usage errors exit 2, --help and --version 0.
     let args = Args::try_from_argv(std::env::args_os()).unwrap_or_else(|e| e.exit());
-    if let Some(Command::Parse { ticket }) = &args.command {
-        args::print_ticket(ticket);
-        return ExitCode::SUCCESS;
+    match &args.command {
+        Some(Command::Parse { ticket }) => {
+            args::print_ticket(ticket);
+            return ExitCode::SUCCESS;
+        }
+        // The ticket alone on stdout, so `$(minipaw ticket)` works.
+        Some(Command::Ticket { identity, relay }) => {
+            return match args::stable_ticket(identity.as_deref(), relay.as_deref()) {
+                Ok((ticket, path, created)) => {
+                    eprintln!("{}", args::identity_line(&path, created));
+                    println!("{ticket}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("minipaw: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        None => {}
     }
     term::install_panic_hook();
     ui::log::install(args.verbose);
-    let config = match args::config(&args) {
+    let mut config = match args::config(&args) {
         Ok(config) => config,
         Err(e) => {
             eprintln!("minipaw: {e}");
             return ExitCode::FAILURE;
         }
     };
+    if let Some(path) = &args.identity {
+        match args::load_identity(Some(path)) {
+            // An existing identity is the usual case; only a new one is news.
+            Ok((identity, path, created)) => {
+                if created {
+                    eprintln!("{}", args::identity_line(&path, created));
+                }
+                config.identity = Some(identity);
+            }
+            Err(e) => {
+                eprintln!("minipaw: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let mode = ui::choose_mode(args.plain);
     let result = ui::run(mode, Launch::new(args.ticket, config, args.verbose));
     // Errors print on a restored terminal.

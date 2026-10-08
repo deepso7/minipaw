@@ -1376,6 +1376,7 @@ dependencies = [
  "getrandom",
  "log",
  "minip2p-rs",
+ "rustix",
 ]
 
 [[package]]

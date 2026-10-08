@@ -67,15 +67,13 @@ pub fn run(
     shared: Arc<Shared>,
     events: Events,
 ) -> Result<Outcome, crate::Error> {
-    let endpoint =
-        net::bind(&relay, true, config.force_relay).map_err(crate::Error::from_internal)?;
-    let token = net::random16().map_err(crate::Error::from_internal)?;
-    let embed = crate::config::default_relay().is_none_or(|default| default != relay);
-    let ticket = Ticket {
-        peer: endpoint.peer_id().clone(),
-        token,
-        relay: embed.then(|| relay.clone()),
+    let endpoint = net::bind(&relay, true, config).map_err(crate::Error::from_internal)?;
+    // A saved identity keeps the ticket the same from run to run.
+    let token = match &config.identity {
+        Some(identity) => identity.token(),
+        None => net::random16().map_err(crate::Error::from_internal)?,
     };
+    let ticket = Ticket::listener(endpoint.peer_id().clone(), token, Some(&relay));
     shared.set_wake(endpoint.wait_handle());
     let pipe = Pipe::new(&endpoint.wait_handle(), io, shared.stats.clone());
     let drop_link_after = config.test_drop_link_after;
