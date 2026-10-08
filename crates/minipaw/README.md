@@ -99,15 +99,20 @@ it like a password. `Ticket` parses from and displays as the `mp…` string.
 
 ## Input and output
 
-`Io::stdio()` uses the process's stdin and stdout. For anything else, pass
-any `Read + Send` and `Write + Send` to `Io::new`, such as the two halves of
-a `TcpStream` (`stream.try_clone()`) or a pair of channels. Each runs on its
-own helper thread, so both may block.
+`Io::stdio()` uses the process's stdin and stdout, and `Io::tcp` a
+`TcpStream`. For anything else, pass any `Read + Send` and `Write + Send` to
+`Io::new`, such as a pair of channels. Each runs on its own helper thread,
+so both may block.
 
 The session ends once both sides have finished sending and each confirmed
 the other's data. An interactive input never ends on its own, so
 `Io::close_on_peer_fin(true)` ends our side when the peer finishes;
 `Io::stdio()` turns this on when stdin is a terminal.
+
+Once the peer has finished sending and all of it is written, the output is
+dropped. For `Io::tcp` that half-closes the socket, so the target reads EOF
+right then while its replies keep flowing back. Dropping stdout does not
+close it, so with `Io::stdio()` it closes only when the process exits.
 
 Bytes are acknowledged only once written to the output, so a slow writer
 slows the sender down instead of filling memory.
@@ -122,6 +127,11 @@ The output thread can outlive `run` as well: when a session stops or fails,
 `run` waits up to a second for a blocked write, then returns. The thread
 finishes writing the data it already received and only then drops the
 writer; unblock a writer you own (`shutdown` a socket) to end it early.
+
+`Io::tcp` does this cleanup itself, so none of its threads outlive the
+session: after a clean end it shuts down the socket's read side; otherwise,
+once a blocked write has had its second of grace, it shuts down both
+sides, which also ends a write to a target that stopped reading.
 
 `Io::stdio()` treats stdout's reader going away (`| head`) as netcat does:
 the rest of the peer's data is discarded and the session still succeeds.
