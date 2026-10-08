@@ -458,8 +458,10 @@ impl<H: Host> ServerCore<H> {
             return;
         };
         match &mut slot.state {
-            // Kept for after the Welcome.
-            State::Connecting(Some((link, _))) => link.reader.push(data),
+            State::Connecting(Some((link, _))) => {
+                link.reader.push(data);
+                self.check_early(key);
+            }
             State::Running(live) => {
                 if let Some(link) = &mut live.link {
                     link.push(data);
@@ -550,6 +552,7 @@ impl<H: Host> ServerCore<H> {
                     if let Some((old, _)) = held.replace((link, recv)) {
                         old.abandon(&mut self.endpoint);
                     }
+                    self.check_early(&key);
                 }
                 State::Running(_) => self.resume(&key, link, recv),
                 State::Ending(..) => self.rejoin_ending(&key, link),
@@ -573,7 +576,8 @@ impl<H: Host> ServerCore<H> {
             Err(reason) => self.refuse(link, &reason),
             Ok(None) => {
                 let state = State::Connecting(Some((link, recv)));
-                self.sessions.insert(key, Slot { id, state });
+                self.sessions.insert(key.clone(), Slot { id, state });
+                self.check_early(&key);
             }
             Ok(Some(pipe)) => self.start(key, id, pipe, link, recv),
         }
@@ -603,10 +607,57 @@ impl<H: Host> ServerCore<H> {
             (Ok(pipe), Some((link, recv))) => self.start(key, id, pipe, link, recv),
             // The client lost its stream meanwhile. Never welcomed, it
             // comes back as a new session.
-            (Ok(pipe), None) => self.host.unused(id, pipe),
+            (Ok(pipe), None) => {
+                self.host.unused(id, pipe);
+                self.readmit(&key.0);
+            }
             (Err(reason), Some((link, _))) => self.refuse(link, &reason),
-            (Err(reason), None) => log::debug!("session {id}: {reason}"),
+            (Err(reason), None) => {
+                log::debug!("session {id}: {reason}");
+                self.readmit(&key.0);
+            }
         }
+    }
+
+    /// Reads what a connecting session's client sent after its `Hello`. An
+    /// honest dialer sends nothing more until welcomed but its own stop, so
+    /// nothing is kept for later: the session ends on the first frame, and
+    /// what is buffered stays under one frame.
+    fn check_early(&mut self, key: &SlotKey) {
+        let Some(Slot {
+            id,
+            state: State::Connecting(Some((link, _))),
+        }) = self.sessions.get_mut(key)
+        else {
+            return;
+        };
+        let refusal = match link.reader.next() {
+            Ok(None) => return,
+            Ok(Some(Frame::Error(_))) => None,
+            Ok(Some(_)) => Some("unexpected frame before Welcome".to_owned()),
+            Err(e) => Some(e),
+        };
+        let id = *id;
+        let Some(Slot {
+            state: State::Connecting(Some((link, _))),
+            ..
+        }) = self.sessions.remove(key)
+        else {
+            return;
+        };
+        // Its local end is handed back when it comes.
+        if let Some(reason) = refusal {
+            return self.refuse(link, &reason);
+        }
+        // Closing our side confirms the stop, as for a running session.
+        log::debug!("session {id}: the client stopped before its Welcome");
+        if let Err(e) = self
+            .endpoint
+            .close_stream_write(&link.peer, link.conn, link.stream)
+        {
+            log::debug!("close stream: {e}");
+        }
+        self.disconnect_soon(link.peer);
     }
 
     /// Starts a new session on `link` with its local end: once the
@@ -760,12 +811,28 @@ impl<H: Host> ServerCore<H> {
         {
             log::debug!("close refused stream: {e}");
         }
-        if link.peer != self.relay && !self.has_session(&link.peer) {
+        self.disconnect_soon(link.peer);
+    }
+
+    /// A peer with no session is disconnected once what we last sent it
+    /// had time to go out.
+    fn disconnect_soon(&mut self, peer: PeerId) {
+        if peer != self.relay && !self.has_session(&peer) {
             let now = Instant::now();
             self.admission
-                .entry(link.peer)
+                .entry(peer)
                 .or_insert_with(|| Admission::new(now))
                 .refused(now);
+        }
+    }
+
+    /// A peer left with no session must get a new one in time, as a
+    /// newcomer must: its admission deadline is gone once it had one.
+    fn readmit(&mut self, peer: &PeerId) {
+        if *peer != self.relay && !self.has_session(peer) {
+            self.admission
+                .entry(peer.clone())
+                .or_insert_with(|| Admission::new(Instant::now()));
         }
     }
 
@@ -1030,10 +1097,7 @@ impl<H: Host> ServerCore<H> {
                 }
             }
         }
-        if ending
-            .linger
-            .is_some_and(|by| live.link.is_none() || now >= by)
-        {
+        if !ending.lingering(live.link.is_some(), now) {
             ending.linger = None;
         }
         if !ending.drained {
@@ -1069,9 +1133,11 @@ impl<H: Host> ServerCore<H> {
             return true;
         }
         // The endpoint stays up for others; the peer goes unless it has
-        // more in flight.
-        let busy = self.has_session(peer) || self.pending.keys().any(|(p, _, _)| p == peer);
-        if !busy
+        // more in flight. Streams it opened meanwhile must lead to a
+        // session in time.
+        if self.pending.keys().any(|(p, _, _)| p == peer) {
+            self.readmit(peer);
+        } else if !self.has_session(peer)
             && *peer != self.relay
             && let Err(e) = self.endpoint.disconnect(peer)
         {
@@ -1161,6 +1227,15 @@ impl Live {
 }
 
 impl Ending {
+    /// Whether the teardown still waits for the peer to finish, given
+    /// whether it has a stream. A completed session waits out its deadline
+    /// even without one: a client that lost the stream before our last ack
+    /// comes back for it on a fresh one.
+    fn lingering(&self, has_link: bool, now: Instant) -> bool {
+        self.linger
+            .is_some_and(|by| now < by && (has_link || self.clean))
+    }
+
     /// Starts tearing a session down as a dialer's [`net::finish`] does,
     /// but as deadlines: a completed session lingers for the peer to
     /// finish too, so our last ack is not lost; a stopped or broken one
@@ -1240,6 +1315,32 @@ mod tests {
         }
         assert_eq!(admission.by, t0 + ADMISSION_TIMEOUT + REFUSAL_GRACE);
         assert_eq!(admission.deadline, t0 + ADMISSION_TIMEOUT);
+    }
+
+    #[test]
+    fn a_completed_session_waits_out_its_linger_without_a_stream() {
+        let t0 = Instant::now();
+        let ending = |clean| Ending {
+            result: Ok(Outcome::Done),
+            clean,
+            tell: None,
+            linger: Some(t0 + LINGER),
+            by: t0 + LINGER,
+            drain_by: t0 + STDOUT_GRACE,
+            drained: true,
+        };
+        // Its client may come back for our last ack, until the deadline.
+        assert!(ending(true).lingering(false, t0));
+        assert!(ending(true).lingering(true, t0));
+        assert!(!ending(true).lingering(false, t0 + LINGER));
+        // Otherwise only a stream the peer can still finish is waited on.
+        assert!(ending(false).lingering(true, t0));
+        assert!(!ending(false).lingering(false, t0));
+        assert!(!ending(false).lingering(true, t0 + LINGER));
+        // The peer finishing ends the wait.
+        let mut finished = ending(true);
+        finished.linger = None;
+        assert!(!finished.lingering(true, t0));
     }
 
     #[test]

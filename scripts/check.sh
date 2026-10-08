@@ -375,6 +375,8 @@ check_panel_stdout() {
 #           reads to EOF and notes `received <bytes>`
 #   stall   never reads its first connection (notes `stalled`); echoes
 #           the others
+#   late    reads to EOF, then replies `late reply` two seconds later and
+#           closes
 #   python3 -c "$TARGET_PY" <mode> <log>   (prints its port on stdout)
 TARGET_PY='
 import socket, sys, threading
@@ -408,6 +410,10 @@ def serve(c, i):
         elif mode == "stall":
             note("stalled")
             threading.Event().wait()
+        elif mode == "late":
+            drain(c)
+            threading.Event().wait(2)
+            c.sendall(b"late reply\n")
     except OSError as e:
         note("error %d: %s" % (i, e))
     c.close()
@@ -765,6 +771,51 @@ check_serve_auth_deadline() {
   pass "squatter out after ${after}s and $opened streams; client served"
 }
 
+# serve's own peer address, for squat to dial directly.
+serve_addr() { # serve_addr <serve.err>
+  echo "$DIRECT/p2p/$(sed -n 's#^\# bound /ip4/0\.0\.0\.0/udp/[0-9]*/quic-v1/p2p/\(.*\)#\1#p' "$1" | head -1)"
+}
+
+# A client that floods its stream before its Welcome (while its session
+# waits for the target, held there by a test hook) is refused at once,
+# with nothing kept, while another session transfers normally.
+check_serve_flood() {
+  start_target echo || { fail "no target"; return; }
+  MINIPAW_TEST_CONNECT_DELAY=3 start_serve "$T/serve.err" --forward "$TARGET_PORT" ||
+    { fail "no ticket"; return; }
+  head -c 1000000 /dev/urandom >"$T/up.a"
+  head -c 1000000 /dev/urandom >"$T/up.b"
+  feed "$T/c.in" "$T/up.a" "$T/up.b"
+  client c "$T/c.in" direct
+  local c=$CLIENT_PID
+  wait_until 30 has_bytes "$T/c.out" 1000000 || { fail "the transfer did not start"; return; }
+  local code=0
+  "$SQUAT" --flood "$(serve_addr "$T/serve.err")" "$TICKET" 20 2>"$T/squat.err" || code=$?
+  [ "$code" = 0 ] || { fail "flood: $(tail -1 "$T/squat.err")"; return; }
+  grep -q '^# refused .*: unexpected frame before Welcome$' "$T/serve.err" ||
+    { fail "the flood was not refused"; return; }
+  touch "$T/c.in.go"
+  expect_exit c "$c" 0 60 || return
+  cat "$T/up.a" "$T/up.b" | cmp -s - "$T/c.out" || { fail "the other session's data differs"; return; }
+  pass "$(sed -n 's/^squat: //p' "$T/squat.err"); 2 MB echoed meanwhile"
+}
+
+# A peer whose session outlived its admission deadline, and that opens a
+# stream without a Hello before the session ends, is still disconnected
+# once it is left with no session: it is admitted afresh.
+check_serve_leave() {
+  start_target echo || { fail "no target"; return; }
+  start_serve "$T/serve.err" --forward "$TARGET_PORT" || { fail "no ticket"; return; }
+  local code=0
+  "$SQUAT" --leave "$(serve_addr "$T/serve.err")" "$TICKET" 17 40 2>"$T/squat.err" || code=$?
+  [ "$code" = 0 ] || { fail "squat: $(tail -1 "$T/squat.err")"; return; }
+  grep -q '^# \[1\] ended' "$T/serve.err" || { fail "the session was not reported ended"; return; }
+  local after
+  after=$(sed -n 's/^squat: disconnected \([0-9.]*\)s after its session/\1/p' "$T/squat.err")
+  holds "$after >= 10 && $after <= 20" || { fail "disconnected ${after}s after its session"; return; }
+  pass "disconnected ${after}s after its session ended"
+}
+
 # Inflight `accept` calls (from the -v log): the most at once, and now.
 inflight() { # inflight <serve.err> -> "<max> <now>"
   awk '/test hook: waiting/ { n++; if (n > max) max = n }
@@ -831,11 +882,59 @@ check_quiet_stderr() {
   pass "-q and -q -v: nothing on the terminal, data intact"
 }
 
+# SIGHUP to `-q`, as ssh sends its ProxyCommand when it exits: a client
+# still connecting stops, telling the server, and one whose session is up
+# with stdin open stops too; one whose stdin ended finishes its session.
+check_quiet_hangup() {
+  start_target late || { fail "no target"; return; }
+  MINIPAW_TEST_CONNECT_DELAY=4 start_serve "$T/serve1.err" --forward "$TARGET_PORT" ||
+    { fail "no ticket"; return; }
+  "$BIN" -q "$TICKET" </dev/null >"$T/early.out" 2>"$T/early.err" &
+  local pid=$! start
+  track $pid
+  wait_until 30 grep -q 'test hook: waiting' "$T/serve1.err" || { fail "never connecting"; return; }
+  start=$(now)
+  kill -HUP $pid
+  expect_exit early $pid 130 10 || return
+  local took
+  took=$(since "$start")
+  holds "$took <= 3" || { fail "stopping while connecting took ${took}s"; return; }
+  wait_until 10 grep -q 'the client stopped before its Welcome' "$T/serve1.err" ||
+    { fail "the server was not told"; return; }
+  wait_until 10 grep -q '# target: connected to ' "$T/serve1.err"
+  grep -q "$CONNECTED" "$T/serve1.err" && { fail "the session was reported connected"; return; }
+  kill "$SERVER_PID"
+  wait_upto "$SERVER_PID" 10
+
+  start_serve "$T/serve.err" --forward "$TARGET_PORT" || { fail "no ticket"; return; }
+  held "$T/open.in" hi
+  "$BIN" -q "$TICKET" <"$T/open.in" >"$T/open.out" 2>"$T/open.err" &
+  pid=$!
+  track $pid
+  wait_until 30 has_lines "$T/serve.err" "$CONNECTED" 1 || { fail "the session never opened"; return; }
+  sleep 0.5
+  kill -HUP $pid
+  expect_exit open $pid 130 10 || return
+  wait_until 5 has_lines "$T/serve.err" '^# \[[0-9]*\] ended' 1 || { fail "serve still holds the session"; return; }
+
+  echo bye >"$T/bye"
+  "$BIN" -q "$TICKET" <"$T/bye" >"$T/done.out" 2>"$T/done.err" &
+  pid=$!
+  track $pid
+  wait_until 30 has_lines "$T/serve.err" "$CONNECTED" 2 || { fail "the last session never opened"; return; }
+  sleep 0.5
+  kill -HUP $pid
+  expect_exit done $pid 0 30 || return
+  [ "$(cat "$T/done.out")" = "late reply" ] || { fail "got '$(head -c 100 "$T/done.out")'"; return; }
+  wait_until 5 has_lines "$T/serve.err" "$ENDED_OK" 1 || { fail "the last session did not end cleanly"; return; }
+  pass "stopped in ${took}s while connecting; stopped when up; finished after stdin's end"
+}
+
 ALL="transfer forced_relay resume heartbeat interrupt_client interrupt_server interrupt_blocked
 interrupt_both wrong_token busy squatters stdin_error stdout_error closed_reader panel_stdout
 serve_forward serve_halfclose serve_reverse_halfclose serve_restart serve_late_resume serve_limit
 serve_target_down serve_isolation serve_mixed serve_stop_connecting serve_auth_deadline serve_churn
-quiet_stderr"
+serve_flood serve_leave quiet_stderr quiet_hangup"
 if [ "${1:-}" = list ]; then
   echo $ALL
   exit 0
