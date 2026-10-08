@@ -21,14 +21,16 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use minipaw::{Error, Event, Handle, Io, Outcome, PathKind};
-use ratatui::backend::{Backend as _, ClearType};
+use ratatui::backend::{Backend as _, ClearType, IntoCrossterm as _};
 use ratatui::crossterm::event::{
     self as term_event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
+use ratatui::crossterm::queue;
+use ratatui::crossterm::style::{Print, PrintStyledContent, StyledContent};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Widget as _};
+use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 use super::chat_io::{
@@ -67,8 +69,6 @@ const INLINE_HEIGHT: u16 = 3;
 const INLINE_HINTS: &str = " Enter send · Ctrl-D end · Ctrl-C quit ";
 /// Narrower than this, the inline box leaves out its hints and the peer.
 const INLINE_WIDE: u16 = 80;
-/// Rows printed above the inline box per call, bounding its buffer.
-const PRINT_CHUNK: usize = 256;
 
 /// Runs the session as a chat.
 pub fn run(launch: Launch) -> Result<Outcome, Error> {
@@ -119,7 +119,10 @@ pub fn run(launch: Launch) -> Result<Outcome, Error> {
     };
 
     let mut chat = Chat::new(state, input_tx, color_enabled(), inline);
-    chat.on_event(&first);
+    if !inline {
+        // Inline, its status line is already on the screen.
+        chat.on_event(&first);
+    }
     let result = chat.run(&mut terminal, &ui_rx, &output_rx, &handle, session);
     if inline {
         let ok = matches!(result, Ok(Ok(_)));
@@ -201,26 +204,28 @@ fn enter_inline() -> io::Result<Terminal<term::StderrBackend>> {
     inline_terminal()
 }
 
-/// A ratatui terminal with the inline box at the cursor.
+/// A ratatui terminal with the inline box at the cursor, and the cursor
+/// parked on the box's top-left cell.
+///
+/// The box draws its own input cursor, so the terminal's (hidden) one can
+/// stay parked there: that cell starts a line, which stays where it is
+/// however the terminal rewraps lines on a resize. So clearing from the
+/// cursor down always clears the whole box.
 fn inline_terminal() -> io::Result<Terminal<term::StderrBackend>> {
-    Terminal::with_options(
+    let mut terminal = Terminal::with_options(
         term::StderrBackend::querying_cursor(),
         TerminalOptions {
             viewport: Viewport::Inline(INLINE_HEIGHT),
         },
-    )
+    )?;
+    park(&mut terminal)?;
+    Ok(terminal)
 }
 
-/// Clears the inline box and everything below it, leaving the cursor at
-/// the start of its top row.
-fn clear_inline(terminal: &mut Terminal<term::StderrBackend>) -> io::Result<()> {
-    let area = terminal.get_frame().area();
-    // After a shrink, the box's old top may be off the screen.
-    let rows = term::size().map_or(area.bottom(), |(_, rows)| rows);
-    let top = area.y.min(rows.saturating_sub(area.height.max(1)));
-    let backend = terminal.backend_mut();
-    backend.set_cursor_position(Position::new(0, top))?;
-    backend.clear_region(ClearType::AfterCursor)
+/// Moves the cursor to the inline box's top-left cell.
+fn park(terminal: &mut Terminal<term::StderrBackend>) -> io::Result<()> {
+    let top = terminal.get_frame().area().as_position();
+    terminal.set_cursor_position(top)
 }
 
 /// Whether to use colour: `NO_COLOR` set to anything non-empty turns it
@@ -794,13 +799,21 @@ impl Chat {
             frame.render_widget(Paragraph::new(Span::styled(shown, t.text)), inner);
         }
         let x = u16::try_from(before).unwrap_or(u16::MAX);
-        frame.set_cursor_position(Position {
+        let cursor = Position {
             x: inner
                 .x
                 .saturating_add(x)
                 .min(inner.right().saturating_sub(1)),
             y: inner.y,
-        });
+        };
+        if self.inline {
+            // The terminal's cursor stays parked; see `inline_terminal`.
+            if let Some(cell) = frame.buffer_mut().cell_mut(cursor) {
+                cell.set_style(Style::new().add_modifier(Modifier::REVERSED));
+            }
+        } else {
+            frame.set_cursor_position(cursor);
+        }
     }
 
     fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -823,34 +836,35 @@ impl Chat {
         now: Instant,
     ) -> io::Result<()> {
         let size = term::size();
-        if size != self.size {
-            clear_inline(terminal)?;
+        if size != self.size || !self.outbox.is_empty() {
+            // Clear the box (the cursor is parked on it), print the new
+            // lines where it was, and set up a fresh box below them.
+            self.print_outbox(terminal.backend_mut())?;
             *terminal = inline_terminal()?;
             self.size = size;
         }
-        self.print_outbox(terminal)?;
         terminal.draw(|frame| self.draw_inline(frame, now))?;
-        Ok(())
+        park(terminal)
     }
 
-    /// Inline: prints the lines not yet shown above the box, into the
-    /// terminal's own scrollback.
-    fn print_outbox(&mut self, terminal: &mut Terminal<term::StderrBackend>) -> io::Result<()> {
-        if self.outbox.is_empty() {
-            return Ok(());
+    /// Inline: clears the box and prints the lines not yet shown in its
+    /// place, as plain styled text: the terminal wraps long lines itself,
+    /// rewraps them on a resize, and copies them back as typed.
+    fn print_outbox(&mut self, backend: &mut term::StderrBackend) -> io::Result<()> {
+        backend.clear_region(ClearType::AfterCursor)?;
+        let theme = &self.theme;
+        for entry in self.outbox.drain(..) {
+            let label =
+                StyledContent::new(theme.label(entry.who).into_crossterm(), entry.who.label());
+            let text = StyledContent::new(theme.body(entry.who).into_crossterm(), entry.text);
+            queue!(
+                backend,
+                PrintStyledContent(label),
+                PrintStyledContent(text),
+                Print("\r\n")
+            )?;
         }
-        let width = usize::from(terminal.size()?.width.saturating_sub(1)).max(LABEL_WIDTH + 4);
-        let rows: Vec<Line<'static>> = std::mem::take(&mut self.outbox)
-            .iter()
-            .flat_map(|entry| wrap(entry, width, &self.theme))
-            .collect();
-        for chunk in rows.chunks(PRINT_CHUNK) {
-            let height = u16::try_from(chunk.len()).unwrap_or(u16::MAX);
-            terminal.insert_before(height, |buf| {
-                Paragraph::new(chunk.to_vec()).render(buf.area, buf);
-            })?;
-        }
-        Ok(())
+        io::Write::flush(backend)
     }
 
     /// Inline: the box, with the input line inside and the status in its
@@ -928,8 +942,7 @@ impl Chat {
             }
             self.push(Who::Note, line);
         }
-        self.print_outbox(terminal)?;
-        clear_inline(terminal)
+        self.print_outbox(terminal.backend_mut())
     }
 
     /// Full screen: prints the end of the conversation to stderr, on the
@@ -1101,8 +1114,14 @@ mod tests {
         let mut chat = Chat::new(state, input_tx, false, true);
 
         let rows = inline_rows(&chat, 90, t0);
-        assert!(rows[0].starts_with("╭ 🐾") && rows[0].contains("minipaw"), "{rows:?}");
-        assert!(rows[0].contains("● connected · via relay · 12D3KooW…tLdf ╮"), "{rows:?}");
+        assert!(
+            rows[0].starts_with("╭ 🐾") && rows[0].contains("minipaw"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[0].contains("● connected · via relay · 12D3KooW…tLdf ╮"),
+            "{rows:?}"
+        );
         assert!(rows[1].contains("type a message"), "{rows:?}");
         assert!(rows[2].contains("Enter send"), "{rows:?}");
         assert!(rows[2].contains("↑ 0 B  ↓ 0 B · 0:00"), "{rows:?}");
