@@ -487,6 +487,40 @@ impl Pipe {
         self.peer_finished() && self.out.fin_acked
     }
 
+    /// Our ack of everything the peer sent, `Fin` included, for a peer that
+    /// lost it with its stream once the session was complete.
+    pub fn final_ack(&self) -> Frame {
+        let (offset, fin) = self.inb.ack(self.written());
+        Frame::Ack { offset, fin }
+    }
+
+    /// Lets the writer finish: it writes what it has, then drops the
+    /// output. See [`output_closed`](Self::output_closed).
+    pub fn close_output(&mut self) {
+        self.stdout = None;
+    }
+
+    /// Whether the writer has exited, after
+    /// [`close_output`](Self::close_output); never blocks. The endpoint's
+    /// wait wakes when it does.
+    pub fn output_closed(&mut self) -> bool {
+        if self.writer.is_none() {
+            return true;
+        }
+        match self.writer_done.try_recv() {
+            Err(TryRecvError::Empty) => false,
+            // Sent just before it exits, or it is gone.
+            Ok(()) | Err(TryRecvError::Disconnected) => {
+                if let Some(writer) = self.writer.take()
+                    && writer.join().is_err()
+                {
+                    log::error!("stdout writer panicked");
+                }
+                true
+            }
+        }
+    }
+
     /// Flushes stdout and stops the writer, waiting at most `limit` (or for
     /// ever) for a blocked stdout, then cancels the helper threads: without
     /// a limit the session ended cleanly, with one it did not. Idempotent.
@@ -588,7 +622,9 @@ fn spawn_output(
             wake.interrupt();
         }
         // The receiver is gone once the session has ended.
-        if done.send(()).is_err() {}
+        if done.send(()).is_ok() {
+            wake.interrupt();
+        }
     })
 }
 
@@ -725,6 +761,46 @@ mod tests {
                     Err(RecvTimeoutError::Timeout) => panic!("input still blocked"),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_closed_output_drains_without_blocking_the_caller() {
+        let (tx, rx) = mpsc::channel();
+        let mut pipe = pipe(Io::new(io::empty(), ChannelWriter(tx)));
+        pipe.on_frame(Frame::Data(b"last words".to_vec())).unwrap();
+        pipe.on_frame(Frame::Fin { offset: 10 }).unwrap();
+        pipe.close_output();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pipe.output_closed() {
+            assert!(Instant::now() < deadline, "writer never exited");
+            thread::yield_now();
+        }
+        assert!(pipe.writer.is_none());
+        assert_eq!(rx.try_iter().flatten().collect::<Vec<u8>>(), b"last words");
+        // Everything is written, so the ack covers the Fin.
+        assert_eq!(
+            pipe.final_ack(),
+            Frame::Ack {
+                offset: 10,
+                fin: true
+            }
+        );
+        assert!(pipe.output_closed());
+    }
+
+    /// Passes what is written on to a channel.
+    struct ChannelWriter(Sender<Vec<u8>>);
+
+    impl Write for ChannelWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .send(buf.to_vec())
+                .map_err(|_| ErrorKind::BrokenPipe)?;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 

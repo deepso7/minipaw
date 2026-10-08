@@ -42,6 +42,12 @@ pub struct Config {
     /// circuit and tells only one side would.
     #[doc(hidden)]
     pub test_drop_link_after: Option<u64>,
+    /// Test hook: a listener admits its first session without sending the
+    /// `Welcome`, and drops the stream, as if the stream had died with the
+    /// `Welcome` still in flight. The dialer must retry and get the same
+    /// session.
+    #[doc(hidden)]
+    pub test_drop_welcome: bool,
 }
 
 /// Parses a relay address, checking that it is a QUIC address that fits in

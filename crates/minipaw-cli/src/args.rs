@@ -141,6 +141,8 @@ fn config_with(args: &Args, env: impl Fn(&str) -> Option<OsString>) -> Result<Co
                         format!("invalid MINIPAW_TEST_DROP_LINK_AFTER '{raw}': {e}")
                     })?);
             }
+            // Test hook: the listener never sends its first Welcome.
+            config.test_drop_welcome = env("MINIPAW_TEST_DROP_WELCOME").is_some();
         }
         Some(ticket) => {
             // Tickets carry their relay; only one without needs ours.
@@ -376,11 +378,13 @@ mod tests {
             ("MINIPAW_FORCE_RELAY", ""),
             ("MINIPAW_RELAY", RELAY),
             ("MINIPAW_TEST_DROP_LINK_AFTER", "1000"),
+            ("MINIPAW_TEST_DROP_WELCOME", "1"),
         ];
         let config = config_with(&listen, env(&vars)).expect("config");
         assert!(config.force_relay);
         assert!(config.relay.is_some());
         assert_eq!(config.test_drop_link_after, Some(1000));
+        assert!(config.test_drop_welcome);
 
         // An empty MINIPAW_RELAY is unset.
         let config = config_with(&listen, env(&[("MINIPAW_RELAY", "")])).expect("config");

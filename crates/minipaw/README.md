@@ -153,7 +153,11 @@ Byte counts are not events; poll `Handle::progress` instead.
 
 Sessions survive their stream: when a relay cuts a circuit or the
 connection moves to a direct path, the dialer resumes on a fresh stream
-from the last byte the other side confirmed, for up to 60 seconds.
+from the last byte the other side confirmed, for up to 60 seconds. A
+listener that no longer holds the session (it ended, or the listener
+restarted with the same identity) refuses the resume, so the dialer fails
+with `Error::PeerEnded` rather than quietly starting over. Both ends must
+speak the same `PROTOCOL_VERSION`; a mismatch is refused.
 
 Diagnostics go through the [`log`](https://docs.rs/log) facade under
 `minipaw` targets. The library never installs a logger; install one (such

@@ -56,7 +56,8 @@ struct Client {
     backoff: Duration,
     /// Since when we have had no working stream (`None` while up).
     lost_since: Option<Instant>,
-    /// Whether a stream was ever up, for messages.
+    /// Whether a stream was ever up: for messages, and every later `Hello`
+    /// asks to resume.
     was_up: bool,
     /// Whether a Hello ever went out: from then on the server may hold our
     /// session, and must be told if we stop.
@@ -341,10 +342,14 @@ impl Client {
                 && peer_id == *self.peer() =>
             {
                 let link = Link::new(peer_id, conn_id, stream_id);
+                // Once welcomed, the server holds our session: one that
+                // does not (it restarted, or ended the session) must refuse
+                // rather than start a fresh one.
                 let hello = Frame::Hello {
                     token: self.ticket.token,
                     session: self.session,
                     recv: self.pipe.recv_offset(),
+                    resume: self.was_up,
                 };
                 self.phase = Phase::Handshaking {
                     link,
