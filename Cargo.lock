@@ -1376,6 +1376,7 @@ dependencies = [
  "getrandom",
  "log",
  "minip2p-rs",
+ "rustix",
 ]
 
 [[package]]
@@ -1387,6 +1388,7 @@ dependencies = [
  "log",
  "minipaw",
  "ratatui",
+ "signal-hook",
 ]
 
 [[package]]

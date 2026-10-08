@@ -97,17 +97,77 @@ it holds a relay slot; the ticket carries its peer id, a random token and
 the relay (if not the default). Anyone with the ticket can connect, so treat
 it like a password. `Ticket` parses from and displays as the `mp…` string.
 
+The key and token are fresh every run unless `Config::identity` holds an
+`Identity`: `Identity::load_or_create(path)` keeps one in a private file,
+and `Identity::ticket(relay)` gives the ticket a listener with it prints,
+the same every run. `Identity::replace` rotates it. On Unix the file must be
+a regular file only you can read, in a directory only you can write.
+
+## Serve
+
+`minipaw::serve` keeps listening and serves every dialer with the ticket,
+up to `Config::max_sessions` (16) at once, each in a session of its own.
+Its `accept` callback makes each session's local end, such as a fresh
+connection to a port being forwarded:
+
+```rust,no_run
+use std::net::{SocketAddr, TcpStream};
+use std::time::Duration;
+
+use minipaw::{Config, Event, Io, ServeEvent};
+
+fn main() -> Result<(), minipaw::Error> {
+    let target: SocketAddr = "127.0.0.1:22".parse().expect("address");
+    let server = minipaw::serve(Config::default(), move |_peer| {
+        let stream = TcpStream::connect_timeout(&target, Duration::from_secs(5))?;
+        stream.set_nodelay(true)?;
+        Io::tcp(stream)
+    })
+    .on_event(|event| match event {
+        ServeEvent::Server(Event::Listening { ticket }) => eprintln!("connect with: {ticket}"),
+        ServeEvent::Opened { session, peer, path } => eprintln!("[{session}] {peer} ({path})"),
+        ServeEvent::Ended { session, result, progress, .. } => {
+            eprintln!("[{session}] {result:?}: {} bytes in", progress.written);
+        }
+        ServeEvent::Refused { peer, reason } => eprintln!("refused {peer}: {reason}"),
+        _ => {}
+    });
+    // `server.handle().stop()`, say from a Ctrl-C handler, ends it.
+    server.run()
+}
+```
+
+`accept` runs on a worker thread, so a slow one holds up no other
+session, but it must return promptly: it cannot be cancelled, and each
+call counts toward `max_sessions` until it returns. A failing one refuses
+the dialer with its error. A session failing never ends the server; it is
+reported in `ServeEvent::Ended`. `Handle::stop` stops every session (each
+dialer is told), gives them a few seconds between them, and `run` returns
+`Ok(())`. `Handle::progress` adds up every session served, ended ones
+included.
+
+With an `Identity` the ticket stays the same across restarts, but sessions
+do not survive one: a dialer connected at the time gets
+`Error::PeerEnded`. Sessions that cannot hole-punch a direct path share
+the relay's circuits to the server, which a relay may limit in number,
+duration and size.
+
 ## Input and output
 
-`Io::stdio()` uses the process's stdin and stdout. For anything else, pass
-any `Read + Send` and `Write + Send` to `Io::new`, such as the two halves of
-a `TcpStream` (`stream.try_clone()`) or a pair of channels. Each runs on its
-own helper thread, so both may block.
+`Io::stdio()` uses the process's stdin and stdout, and `Io::tcp` a
+`TcpStream`. For anything else, pass any `Read + Send` and `Write + Send` to
+`Io::new`, such as a pair of channels. Each runs on its own helper thread,
+so both may block.
 
 The session ends once both sides have finished sending and each confirmed
 the other's data. An interactive input never ends on its own, so
 `Io::close_on_peer_fin(true)` ends our side when the peer finishes;
 `Io::stdio()` turns this on when stdin is a terminal.
+
+Once the peer has finished sending and all of it is written, the output is
+dropped. For `Io::tcp` that half-closes the socket, so the target reads EOF
+right then while its replies keep flowing back. Dropping stdout does not
+close it, so with `Io::stdio()` it closes only when the process exits.
 
 Bytes are acknowledged only once written to the output, so a slow writer
 slows the sender down instead of filling memory.
@@ -123,6 +183,11 @@ The output thread can outlive `run` as well: when a session stops or fails,
 finishes writing the data it already received and only then drops the
 writer; unblock a writer you own (`shutdown` a socket) to end it early.
 
+`Io::tcp` does this cleanup itself, so none of its threads outlive the
+session: after a clean end it shuts down the socket's read side; otherwise,
+once a blocked write has had its second of grace, it shuts down both
+sides, which also ends a write to a target that stopped reading.
+
 `Io::stdio()` treats stdout's reader going away (`| head`) as netcat does:
 the rest of the peer's data is discarded and the session still succeeds.
 For writers passed to `Io::new`, any write error, `BrokenPipe` included,
@@ -137,7 +202,11 @@ Byte counts are not events; poll `Handle::progress` instead.
 
 Sessions survive their stream: when a relay cuts a circuit or the
 connection moves to a direct path, the dialer resumes on a fresh stream
-from the last byte the other side confirmed, for up to 60 seconds.
+from the last byte the other side confirmed, for up to 60 seconds. A
+listener that no longer holds the session (it ended, or the listener
+restarted with the same identity) refuses the resume, so the dialer fails
+with `Error::PeerEnded` rather than quietly starting over. Both ends must
+speak the same `PROTOCOL_VERSION`; a mismatch is refused.
 
 Diagnostics go through the [`log`](https://docs.rs/log) facade under
 `minipaw` targets. The library never installs a logger; install one (such
@@ -154,7 +223,7 @@ or `Config::force_relay` to skip hole punching.
 - QUIC only: direct paths are QUIC (TLS 1.3), and relays must be QUIC
   addresses. Relayed paths run an end-to-end Noise session, so the relay
   sees only ciphertext.
-- One session per `Session`, one dialer per listener.
+- One session per `Session`, one dialer per listener; `serve` for more.
 
 ## License
 

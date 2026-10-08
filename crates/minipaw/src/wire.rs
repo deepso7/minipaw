@@ -9,7 +9,7 @@
 /// The libp2p protocol id of a minipaw session stream.
 pub const PROTOCOL: &str = "/minipaw/pipe/1";
 /// The session protocol version a `Hello` carries; peers must match.
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 
 /// Largest `Data` payload we send.
 pub const MAX_DATA: usize = 32 * 1024;
@@ -36,6 +36,10 @@ pub enum Frame {
         token: Token,
         session: SessionId,
         recv: u64,
+        /// The dialer has had a `Welcome` for this session, so the server
+        /// must hold it: a server that does not refuses rather than start
+        /// a fresh session under the same id.
+        resume: bool,
     },
     /// Server → dialer: how many session bytes the server has received.
     Welcome {
@@ -66,12 +70,14 @@ impl Frame {
                 token,
                 session,
                 recv,
+                resume,
             } => {
-                let mut payload = Vec::with_capacity(1 + 16 + 16 + 8);
+                let mut payload = Vec::with_capacity(1 + 16 + 16 + 8 + 1);
                 payload.push(VERSION);
                 payload.extend_from_slice(token);
                 payload.extend_from_slice(session);
                 payload.extend_from_slice(&recv.to_be_bytes());
+                payload.push(u8::from(*resume));
                 frame(HELLO, &payload)
             }
             Frame::Welcome { recv } => frame(WELCOME, &recv.to_be_bytes()),
@@ -99,6 +105,7 @@ impl Frame {
                     token: r.array()?,
                     session: r.array()?,
                     recv: r.u64()?,
+                    resume: r.u8()? != 0,
                 }
             }
             WELCOME => Frame::Welcome { recv: r.u64()? },
@@ -197,6 +204,13 @@ mod tests {
                 token: [7; 16],
                 session: [9; 16],
                 recv: 42,
+                resume: false,
+            },
+            Frame::Hello {
+                token: [1; 16],
+                session: [2; 16],
+                recv: 0,
+                resume: true,
             },
             Frame::Welcome { recv: 1 << 40 },
             Frame::Data(b"hello".to_vec()),
@@ -241,5 +255,23 @@ mod tests {
         let mut reader = FrameReader::default();
         reader.push(&frame(99, &[]));
         assert!(reader.next().is_err());
+    }
+
+    #[test]
+    fn hellos_from_other_versions_are_refused() {
+        // A version 2 Hello: token, session and recv, but no resume flag.
+        let mut v2 = vec![2];
+        v2.extend_from_slice(&[7; 16]);
+        v2.extend_from_slice(&[9; 16]);
+        v2.extend_from_slice(&42u64.to_be_bytes());
+        let mut reader = FrameReader::default();
+        reader.push(&frame(HELLO, &v2));
+        assert_eq!(reader.next().unwrap_err(), "unsupported protocol version 2");
+
+        // The same at the current version is cut short of its flag.
+        v2[0] = VERSION;
+        let mut reader = FrameReader::default();
+        reader.push(&frame(HELLO, &v2));
+        assert_eq!(reader.next().unwrap_err(), "truncated frame payload");
     }
 }

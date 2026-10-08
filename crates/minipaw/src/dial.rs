@@ -56,7 +56,8 @@ struct Client {
     backoff: Duration,
     /// Since when we have had no working stream (`None` while up).
     lost_since: Option<Instant>,
-    /// Whether a stream was ever up, for messages.
+    /// Whether a stream was ever up: for messages, and every later `Hello`
+    /// asks to resume.
     was_up: bool,
     /// Whether a Hello ever went out: from then on the server may hold our
     /// session, and must be told if we stop.
@@ -92,8 +93,7 @@ pub fn run(
         ),
         None => None,
     };
-    let endpoint =
-        net::bind(&relay, false, config.force_relay).map_err(crate::Error::from_internal)?;
+    let endpoint = net::bind(&relay, false, config).map_err(crate::Error::from_internal)?;
     let session = net::random16().map_err(crate::Error::from_internal)?;
     shared.set_wake(endpoint.wait_handle());
     let pipe = Pipe::new(&endpoint.wait_handle(), io, shared.stats.clone());
@@ -342,10 +342,14 @@ impl Client {
                 && peer_id == *self.peer() =>
             {
                 let link = Link::new(peer_id, conn_id, stream_id);
+                // Once welcomed, the server holds our session: one that
+                // does not (it restarted, or ended the session) must refuse
+                // rather than start a fresh one.
                 let hello = Frame::Hello {
                     token: self.ticket.token,
                     session: self.session,
                     recv: self.pipe.recv_offset(),
+                    resume: self.was_up,
                 };
                 self.phase = Phase::Handshaking {
                     link,

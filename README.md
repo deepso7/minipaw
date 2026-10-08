@@ -48,8 +48,77 @@ Status goes to stderr (see [Terminal UI](#terminal-ui)), so redirecting
 stdout captures only the data. Add `-v` to see connection details.
 `minipaw parse <ticket>` shows what a ticket contains.
 
+A ticket is new every run unless the listener keeps its key:
+`minipaw --identity my.key` creates `my.key` (mode 0600) on the first run
+and prints the same ticket on every later one. `minipaw ticket` prints
+that stable ticket without listening, for the identity in
+`~/.config/minipaw/serve.key` by default (`$MINIPAW_HOME`,
+`--identity PATH`); pass the listener's `--relay`, which is part of the
+ticket. The file and its directory must be private to you. Anyone with
+the ticket can connect whenever you listen, so delete the file to rotate it.
+
 Exit status: `0` when both directions finished and were confirmed, `1` on
 any error (including the other side hitting one), `130` on Ctrl-C.
+
+## Serve a port (SSH over minipaw)
+
+`minipaw serve` keeps listening with a stable ticket and forwards every
+session to a local TCP port, several at once (16 by default,
+`--max-sessions N`). It defaults to sshd on `127.0.0.1:22`; `--forward
+HOST:PORT` or `--forward PORT` picks another.
+
+```console
+$ minipaw serve                             # on the machine to reach
+# identity: /home/me/.config/minipaw/serve.key (new)
+# forwarding to 127.0.0.1:22
+# 🐾 listening; connect with:
+minipaw mpAQ…
+# ssh: minipaw ssh user@mpAQ…
+# [1] 12D3KooW…ab12 connected (direct)
+# [1] ended: 1.2 MiB sent, 40.0 KiB received in 3:02
+```
+
+On the other machine, the ticket stands in for the host:
+
+```sh
+minipaw ssh me@mpAQ…                   # a shell
+minipaw ssh -p 2222 me@mpAQ… uptime    # any ssh options, a command
+minipaw cp -r photos me@mpAQ…:backup/  # scp; remote paths are TICKET:PATH
+```
+
+These run the system's `ssh` and `scp` with every other argument as is
+(`cp` takes no other remote paths alongside the ticket's),
+with the ticket swapped for a host named `minipaw-<peer id>` and a
+ProxyCommand of `minipaw -q <ticket>` (`-q` keeps it silent, since ssh
+shares its stderr). The host key is remembered in known_hosts under that
+name (which ssh lowercases), so the first connection asks to trust it, as
+ssh does for any new host.
+
+For other tools that run ssh, such as git or rsync, put the ProxyCommand
+in `~/.ssh/config`:
+
+```
+Host home
+  User me
+  HostKeyAlias minipaw-12D3KooW…
+  ProxyCommand minipaw -q mpAQ…
+```
+
+Then `ssh home`, `scp file home:`, `git clone home:repo` all go through
+minipaw.
+
+- serve prints `#` lines on stderr, never a terminal UI, so it runs as
+  is under systemd or nohup. Ctrl-C stops it (exit 0).
+- The identity lives in `~/.config/minipaw/serve.key` (`--identity PATH`),
+  so the ticket survives restarts. `minipaw serve --new` rotates it, and
+  the old ticket stops working.
+- Sessions don't survive a serve restart: a connected ssh is cut off and
+  just reconnects.
+- Without hole punching, sessions go through the relay: slower, and a
+  relay with limits cuts its circuits every so often; sessions resume
+  across each cut, but the relay also rate limits new circuits, so a long,
+  large relayed transfer can fail.
+- The ticket is a secret: anyone holding it can reach the forwarded port.
 
 ## Terminal UI
 
@@ -66,6 +135,7 @@ minipaw picks how to show status from where its streams point:
   your side, Ctrl-C stops.
 - **Plain `#` lines** when stderr isn't a terminal, or with `--plain`. This
   is what scripts and logs see.
+- **Nothing** with `-q`, not even `-v`'s log: only a fatal error prints.
 
 The panel and chat need stderr to be a terminal, `TERM` set to something
 other than `dumb`, and a terminal of at least 40×8; the chat also needs raw
@@ -76,7 +146,7 @@ mode to work. Otherwise minipaw falls back to plain lines.
 - **Ticket.** The `mp…` ticket holds the server's peer ID (its public key),
   a random 16-byte token, and the relay if it isn't the default. Anyone with
   the ticket can connect, so share it like a password. The server serves one
-  client per run.
+  client per run; `minipaw serve` serves many.
 - **Relay first, then direct.** The server reserves a slot on a
   [Circuit Relay v2](https://github.com/libp2p/specs/blob/master/relay/circuit-v2.md)
   server (by default `relay.minip2p.com`). The client connects through it,
@@ -137,7 +207,7 @@ custom streams.
 
 ```sh
 cargo test --workspace              # unit tests
-scripts/check.sh                    # end-to-end behaviour checks (~10s)
+scripts/check.sh                    # end-to-end behaviour checks (~1.5 min)
 scripts/bench.sh                    # loopback throughput, direct + relayed
 scripts/bench-remote.sh <ssh-host>  # real-network throughput
 ```
@@ -157,8 +227,11 @@ accumulate in `bench/results.tsv`, one row per run with the commit.
 A few environment variables exist for testing only:
 `MINIPAW_FORCE_RELAY=1` disables direct connections,
 `MINIPAW_DIRECT=<multiaddr>` makes the client also dial the server directly,
-and `MINIPAW_TEST_DROP_LINK_AFTER=<bytes>` makes the server go silent on its
-stream once, after that many bytes.
+`MINIPAW_TEST_DROP_LINK_AFTER=<bytes>` makes the server go silent on its
+stream once, after that many bytes, `MINIPAW_TEST_DROP_WELCOME=1` makes it
+drop its first `Welcome`, `MINIPAW_TEST_RESUME_TIMEOUT=<secs>` shortens how
+long it waits for a client to resume, and `MINIPAW_TEST_CONNECT_DELAY=<secs>`
+makes `serve` wait that long before each connection to its target.
 
 ## License
 

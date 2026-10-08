@@ -2,7 +2,9 @@
 
 use std::fmt;
 
-/// Why [`Session::run`](crate::Session::run) failed.
+/// Why [`Session::run`](crate::Session::run) or
+/// [`Server::run`](crate::Server::run) failed, or a served session ended
+/// without completing.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {

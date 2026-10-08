@@ -90,6 +90,13 @@ start_server() {
   ${SERVER_WRAP:-} "$BIN" -v --relay "$RELAY" "$@" <"$in" >"$out" 2>"$err" &
   SERVER_PID=$!
   track "$SERVER_PID"
+  wait_ticket "$err"
+}
+
+# Waits for the server SERVER_PID to print its ticket on <stderr>, and sets
+# TICKET.
+wait_ticket() { # wait_ticket <stderr>
+  local err=$1
   TICKET=
   for _ in $(seq 1 150); do
     TICKET=$(awk '/^minipaw mp/{print $2}' "$err")

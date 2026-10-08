@@ -18,6 +18,12 @@ getrandom = "0.4"
 log = "0.4"
 minip2p-rs = { version = "0.7.4", features = ["nat"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
+# Safe syscall wrappers (euid, open flags) for identity file checks; already
+# in the tree through minip2p.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
+# Handling SIGHUP for `-q` (ssh hangs up its ProxyCommand as it exits);
+# already in the tree through crossterm.
+signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

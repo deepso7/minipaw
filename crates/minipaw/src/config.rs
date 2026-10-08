@@ -1,8 +1,10 @@
 //! Session settings.
 
+use std::time::Duration;
+
 use minip2p::{Multiaddr, PeerAddr};
 
-use crate::Error;
+use crate::{Error, Identity};
 
 /// The relay used when neither [`Config::relay`] nor the ticket names one.
 pub const DEFAULT_RELAY: &str = "/dns/relay.minip2p.com/udp/19876/quic-v1/p2p/12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf";
@@ -14,7 +16,7 @@ pub const DEFAULT_RELAY: &str = "/dns/relay.minip2p.com/udp/19876/quic-v1/p2p/12
 /// let mut config = minipaw::Config::default();
 /// config.force_relay = true;
 /// ```
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Config {
     /// The relay to go through; `None` means [`DEFAULT_RELAY`].
@@ -32,11 +34,52 @@ pub struct Config {
     /// makes [`Session::run`](crate::Session::run) fail with
     /// [`Error::Config`].
     pub direct: Option<Multiaddr>,
+    /// The key to run as, so the peer id stays the same from run to run.
+    /// A listener also puts the identity's token in its ticket, which then
+    /// stays the same too (for the same relay). `None` means a fresh key
+    /// and token every run.
+    pub identity: Option<Identity>,
+    /// For [`serve`](crate::serve), how many sessions may be open at once,
+    /// counting those still waiting for their `accept` call, and how many
+    /// `accept` calls may be in flight; beyond that, dialers are refused as
+    /// busy. [`DEFAULT_MAX_SESSIONS`] by default; 0 makes
+    /// [`Server::run`](crate::Server::run) fail with [`Error::Config`]. A
+    /// [`listen`](crate::listen)er always serves one.
+    pub max_sessions: usize,
     /// Test hook: once this many session bytes have arrived, a listener
     /// forgets its stream without closing it, as a relay that drops a
     /// circuit and tells only one side would.
     #[doc(hidden)]
     pub test_drop_link_after: Option<u64>,
+    /// Test hook: a listener admits its first session without sending the
+    /// `Welcome`, and drops the stream, as if the stream had died with the
+    /// `Welcome` still in flight. The dialer must retry and get the same
+    /// session.
+    #[doc(hidden)]
+    pub test_drop_welcome: bool,
+    /// Test hook: how long a listener waits for a client that lost its
+    /// stream to resume, instead of the usual minute, so a test can see a
+    /// client come back after the session ended.
+    #[doc(hidden)]
+    pub test_resume_timeout: Option<Duration>,
+}
+
+/// The default [`Config::max_sessions`].
+pub const DEFAULT_MAX_SESSIONS: usize = 16;
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            relay: None,
+            force_relay: false,
+            direct: None,
+            identity: None,
+            max_sessions: DEFAULT_MAX_SESSIONS,
+            test_drop_link_after: None,
+            test_drop_welcome: false,
+            test_resume_timeout: None,
+        }
+    }
 }
 
 /// Parses a relay address, checking that it is a QUIC address that fits in
@@ -75,6 +118,15 @@ fn check(relay: &PeerAddr, raw: &str) -> Result<(), Error> {
 
 pub(crate) fn default_relay() -> Option<PeerAddr> {
     DEFAULT_RELAY.parse().ok()
+}
+
+/// The relay chosen, checked, or else the default.
+pub(crate) fn relay_or_default(chosen: Option<&PeerAddr>) -> Result<PeerAddr, Error> {
+    match chosen {
+        Some(relay) => check_relay(relay).map(|()| relay.clone()),
+        None => default_relay()
+            .ok_or_else(|| Error::Config("the built-in relay address is invalid".into())),
+    }
 }
 
 #[cfg(test)]

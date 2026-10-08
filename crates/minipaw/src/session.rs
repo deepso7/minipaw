@@ -1,10 +1,11 @@
 //! Starting, driving and stopping a session.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use minip2p::{PeerAddr, WaitHandle};
+use minip2p::WaitHandle;
 
 use crate::config::{self, Config};
 use crate::event::{Event, Events};
@@ -31,7 +32,9 @@ pub enum Outcome {
     Delivered,
 }
 
-/// Bytes moved so far, from [`Handle::progress`].
+/// Bytes moved so far, from [`Handle::progress`]. For a
+/// [`Server`](crate::Server), the sum over all its sessions, ended ones
+/// included.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Progress {
     /// Bytes taken from the session's input.
@@ -44,13 +47,44 @@ pub struct Progress {
     pub written: u64,
 }
 
-/// What a session shares with other threads: stop requests and progress.
+impl Progress {
+    pub(crate) fn of(stats: &Stats) -> Progress {
+        Progress {
+            read: stats.read.load(Ordering::Relaxed),
+            acked: stats.acked.load(Ordering::Relaxed),
+            received: stats.received.load(Ordering::Relaxed),
+            written: stats.written.0.load(Ordering::Relaxed),
+        }
+    }
+
+    fn add(&mut self, other: Progress) {
+        self.read += other.read;
+        self.acked += other.acked;
+        self.received += other.received;
+        self.written += other.written;
+    }
+}
+
+/// What a session or server shares with other threads: stop requests and
+/// progress.
 #[derive(Default)]
 pub(crate) struct Shared {
     stop: AtomicBool,
     /// Wakes the session's `Endpoint::wait`, once it has an endpoint.
     wake: Mutex<Option<WaitHandle>>,
+    /// A session's counters. A server's stay at zero: its sessions each
+    /// have their own, in `tally`.
     pub(crate) stats: Arc<Stats>,
+    tally: Mutex<Tally>,
+}
+
+/// A server's sessions' counters.
+#[derive(Default)]
+struct Tally {
+    /// The sum over sessions that have ended.
+    ended: Progress,
+    /// Sessions still open, by id.
+    open: HashMap<u64, Arc<Stats>>,
 }
 
 impl Shared {
@@ -79,39 +113,87 @@ impl Shared {
         }
     }
 
-    fn clear_wake(&self) {
+    /// Counts session `id`'s bytes in the server's progress.
+    pub(crate) fn track(&self, id: u64, stats: Arc<Stats>) {
+        if let Ok(mut tally) = self.tally.lock() {
+            tally.open.insert(id, stats);
+        }
+    }
+
+    /// Session `id` is over: its final counts, kept in the server's
+    /// progress, which so never goes down.
+    pub(crate) fn retire(&self, id: u64) -> Progress {
+        let Ok(mut tally) = self.tally.lock() else {
+            return Progress::default();
+        };
+        let progress = tally
+            .open
+            .remove(&id)
+            .map(|stats| Progress::of(&stats))
+            .unwrap_or_default();
+        tally.ended.add(progress);
+        progress
+    }
+
+    /// Session `id` never started: it moved nothing worth counting.
+    pub(crate) fn forget(&self, id: u64) {
+        if let Ok(mut tally) = self.tally.lock() {
+            tally.open.remove(&id);
+        }
+    }
+
+    fn progress(&self) -> Progress {
+        let mut progress = Progress::of(&self.stats);
+        // Read under the lock, so a session ending meanwhile is counted
+        // exactly once.
+        if let Ok(tally) = self.tally.lock() {
+            progress.add(tally.ended);
+            for stats in tally.open.values() {
+                progress.add(Progress::of(stats));
+            }
+        }
+        progress
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tally_is_empty(&self) -> bool {
+        self.tally.lock().is_ok_and(|tally| tally.open.is_empty())
+    }
+
+    pub(crate) fn clear_wake(&self) {
         if let Ok(mut slot) = self.wake.lock() {
             *slot = None;
         }
     }
 }
 
-/// Controls a session from other threads: stop it, or read its progress.
-/// Cheap to clone.
+/// Controls a session or a [`Server`](crate::Server) from other threads:
+/// stop it, or read its progress. Cheap to clone.
 #[derive(Clone)]
-pub struct Handle(Arc<Shared>);
+pub struct Handle(pub(crate) Arc<Shared>);
 
 impl Handle {
     /// Ends the session as Ctrl-C does in the `minipaw` CLI: the peer is
     /// told (for a few seconds at most), output is flushed (for a second at
     /// most), and [`Session::run`] returns [`Error::Stopped`].
     ///
+    /// A server stops admitting, stops each of its sessions that way at
+    /// once, gives them a few seconds between them, and
+    /// [`Server::run`](crate::Server::run) returns `Ok(())`.
+    ///
     /// Idempotent, never blocks for long, and safe to call from a signal
-    /// handler thread, before [`Session::run`] or after it returned.
+    /// handler thread, before `run` or after it returned.
     pub fn stop(&self) {
         self.0.stop();
     }
 
     /// A snapshot of the session's byte counters. Cheap enough to poll
     /// several times a second.
+    ///
+    /// A server's counts are cumulative: they add up every session it has
+    /// served, ended ones included, so they never go down.
     pub fn progress(&self) -> Progress {
-        let stats = &self.0.stats;
-        Progress {
-            read: stats.read.load(Ordering::Relaxed),
-            acked: stats.acked.load(Ordering::Relaxed),
-            received: stats.received.load(Ordering::Relaxed),
-            written: stats.written.0.load(Ordering::Relaxed),
-        }
+        self.0.progress()
     }
 }
 
@@ -211,11 +293,7 @@ impl Session {
         }
         // Only the relay this session uses is checked: a dialer's ticket
         // may name its own, leaving `config.relay` unused.
-        let relay = |chosen: Option<&PeerAddr>| match chosen {
-            Some(relay) => config::check_relay(relay).map(|()| relay.clone()),
-            None => config::default_relay()
-                .ok_or_else(|| Error::Config("the built-in relay address is invalid".into())),
-        };
+        let relay = config::relay_or_default;
         let result = match kind {
             Kind::Listen => {
                 let relay = relay(config.relay.as_ref())?;

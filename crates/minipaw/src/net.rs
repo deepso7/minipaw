@@ -9,6 +9,7 @@ use minip2p::{
     ReservationPolicy,
 };
 
+use crate::config::Config;
 use crate::pipe::{BACKPRESSURE_RETRY, Link, LocalFailure, Pipe, SendError};
 use crate::session::{Outcome, Shared};
 use crate::wire::{Frame, PROTOCOL};
@@ -27,7 +28,7 @@ pub const DELIVERED_GRACE: Duration = Duration::from_secs(10);
 /// connection may take before it is reported as a lost link.
 pub const HANDOVER_GRACE: Duration = Duration::from_secs(3);
 /// On a stop or an error, how long we wait for a blocked output to drain.
-const STDOUT_GRACE: Duration = Duration::from_secs(1);
+pub const STDOUT_GRACE: Duration = Duration::from_secs(1);
 /// After a stop request or a local failure, how long we try to tell the peer: first
 /// waiting for a stream if the session is between streams, then for the
 /// peer to confirm it got the news.
@@ -35,23 +36,24 @@ pub const ABORT_GRACE: Duration = Duration::from_secs(3);
 
 /// QUIC on every interface, the pipe protocol, and NAT traversal through
 /// `relay`. Servers hold a reservation there to be reachable; clients only
-/// open circuits through it, then hole-punch with DCUtR. `force_relay`
-/// keeps to the relay: no direct dials or hole punching.
-pub fn bind(
-    relay: &PeerAddr,
-    reserve: bool,
-    force_relay: bool,
-) -> Result<Endpoint, Box<dyn Error>> {
+/// open circuits through it, then hole-punch with DCUtR. The config's
+/// `force_relay` keeps to the relay: no direct dials or hole punching. The
+/// endpoint's key is the config's identity, else a fresh one.
+pub fn bind(relay: &PeerAddr, reserve: bool, config: &Config) -> Result<Endpoint, Box<dyn Error>> {
     let nat = NatConfig {
         reservation_policy: if reserve {
             ReservationPolicy::Always
         } else {
             ReservationPolicy::Never
         },
-        force_relay,
+        force_relay: config.force_relay,
         ..NatConfig::default()
     };
-    let mut endpoint = Endpoint::builder()
+    let mut builder = Endpoint::builder();
+    if let Some(identity) = &config.identity {
+        builder = builder.identity(identity.key().clone());
+    }
+    let mut endpoint = builder
         .agent_version(AGENT)
         .protocol(PROTOCOL)
         .nat_config(nat)
@@ -145,7 +147,7 @@ fn flush(endpoint: &mut Endpoint) {
 }
 
 /// Flushes, then closes the endpoint.
-fn close(mut endpoint: Endpoint) {
+pub fn close(mut endpoint: Endpoint) {
     flush(&mut endpoint);
     if let Err(e) = endpoint.close() {
         log::debug!("close endpoint: {e}");
@@ -206,7 +208,11 @@ pub enum Exit {
 /// up, again on a fresh one if that stream dies first, until the peer
 /// confirms by half-closing a stream we sent it on, or `by` passes.
 pub struct Stop {
-    reason: StopReason,
+    /// What the session ends with, until taken; `None` for a session
+    /// that broke, which reports its own error.
+    reason: Option<StopReason>,
+    /// What the peer is told.
+    message: &'static str,
     pub by: Instant,
     /// Streams the `Error` went out on.
     told: Vec<(PeerId, ConnectionId, StreamId)>,
@@ -225,25 +231,53 @@ impl Stop {
     /// A stop request or the pipe's first local I/O error, if either
     /// happened.
     pub fn check(shared: &Shared, pipe: &Pipe) -> Option<Stop> {
-        let reason = if shared.stopped() {
-            StopReason::Interrupted
+        if shared.stopped() {
+            Some(Stop::interrupted())
         } else {
-            StopReason::Failed(pipe.take_failure()?)
-        };
+            Some(Stop::failed(pipe.take_failure()?))
+        }
+    }
+
+    /// A stop request.
+    pub fn interrupted() -> Stop {
+        Stop::new(Some(StopReason::Interrupted), "interrupted")
+    }
+
+    /// A local I/O error.
+    pub fn failed(failure: LocalFailure) -> Stop {
+        Stop::new(
+            Some(StopReason::Failed(failure)),
+            "the other side hit a local I/O error",
+        )
+    }
+
+    /// A session that broke on our side, such as a protocol error or a
+    /// peer that did not come back in time: the peer is told, so it exits
+    /// now instead of waiting out [`RESUME_TIMEOUT`].
+    pub fn broken() -> Stop {
+        Stop::new(None, "the other side failed")
+    }
+
+    fn new(reason: Option<StopReason>, message: &'static str) -> Stop {
         log::debug!("stopping; telling the peer");
-        Some(Stop {
+        Stop {
             reason,
+            message,
             by: Instant::now() + ABORT_GRACE,
             told: Vec::new(),
             confirmed: false,
             retry_at: None,
-        })
+        }
     }
 
-    fn message(&self) -> &'static str {
-        match self.reason {
-            StopReason::Interrupted => "interrupted",
-            StopReason::Failed(_) => "the other side hit a local I/O error",
+    /// The error a stop request or local failure ends the session with.
+    /// Taken once.
+    pub fn take_error(&mut self) -> crate::Error {
+        match self.reason.take() {
+            Some(StopReason::Failed(LocalFailure::Read(e))) => crate::Error::Input(e),
+            Some(StopReason::Failed(LocalFailure::Write(e))) => crate::Error::Output(e),
+            // A broken session reports its own error; this is never asked.
+            Some(StopReason::Interrupted) | None => crate::Error::Stopped,
         }
     }
 
@@ -288,7 +322,7 @@ impl Stop {
             return Ok(false);
         }
         self.retry_at = None;
-        match link.try_send(endpoint, &Frame::Error(self.message().into())) {
+        match link.try_send(endpoint, &Frame::Error(self.message.into())) {
             Ok(()) => {
                 if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
                     log::debug!("close stream: {e}");
@@ -332,16 +366,12 @@ pub fn finish(
             pipe.finish(None);
             Ok(Outcome::Delivered)
         }
-        Ok(Exit::Stopped(stop)) => {
+        Ok(Exit::Stopped(mut stop)) => {
             // The loop already told the peer, or gave up trying.
             drop(link);
             close(endpoint);
             pipe.finish(Some(STDOUT_GRACE));
-            Err(match stop.reason {
-                StopReason::Interrupted => crate::Error::Stopped,
-                StopReason::Failed(LocalFailure::Read(e)) => crate::Error::Input(e),
-                StopReason::Failed(LocalFailure::Write(e)) => crate::Error::Output(e),
-            })
+            Err(stop.take_error())
         }
         Err(e) if e.is::<PeerEnded>() => {
             pipe.finish(Some(STDOUT_GRACE));
