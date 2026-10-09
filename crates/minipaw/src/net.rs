@@ -10,7 +10,7 @@ use minip2p::{
 };
 
 use crate::config::Config;
-use crate::pipe::{BACKPRESSURE_RETRY, Link, LocalFailure, Pipe, SendError};
+use crate::pipe::{Link, LocalFailure, Pipe, SendError};
 use crate::session::{Outcome, Shared};
 use crate::wire::{Frame, PROTOCOL};
 use minip2p::{ConnectionId, PeerId, StreamId};
@@ -159,7 +159,8 @@ pub fn linger_and_close(mut endpoint: Endpoint, link: Option<Link>) {
         link.close_write(&mut endpoint);
         let deadline = Instant::now() + LINGER;
         loop {
-            // A past deadline makes `wait` return without polling anything.
+            // A past deadline still returns events already queued, so
+            // check the clock rather than wait for `Deadline`.
             if Instant::now() >= deadline {
                 break;
             }
@@ -219,7 +220,8 @@ pub struct Stop {
     partial: Option<(ConnectionId, StreamId)>,
     /// The peer half-closed one of them: it read the `Error`.
     confirmed: bool,
-    /// The last send hit backpressure; try again then.
+    /// The last send hit backpressure; try again then, or once the link's
+    /// `StreamWritable` comes.
     retry_at: Option<Instant>,
 }
 
@@ -320,7 +322,7 @@ impl Stop {
             return Ok(false);
         };
         let key = (link.peer.clone(), link.conn, link.stream);
-        if self.told.contains(&key) || self.retry_at.is_some_and(|at| now < at) {
+        if self.told.contains(&key) || link.blocked(now) {
             return Ok(false);
         }
         self.retry_at = None;
@@ -341,7 +343,7 @@ impl Stop {
                 Ok(false)
             }
             Err(SendError::Full) => {
-                self.retry_at = Some(now + BACKPRESSURE_RETRY);
+                self.retry_at = link.retry_at();
                 Ok(false)
             }
             Err(SendError::Dead(e)) => Err(e),
@@ -457,7 +459,8 @@ fn abort(
     }
     if let Some(peer) = peer {
         loop {
-            // A past deadline makes `wait` return without polling anything.
+            // A past deadline still returns events already queued, so
+            // check the clock rather than wait for `Deadline`.
             if Instant::now() >= by {
                 break;
             }
