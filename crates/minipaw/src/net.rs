@@ -322,7 +322,12 @@ impl Stop {
             return Ok(false);
         };
         let key = (link.peer.clone(), link.conn, link.stream);
-        if self.told.contains(&key) || link.blocked(now) {
+        if self.told.contains(&key) {
+            return Ok(false);
+        }
+        // The link may be blocked by a send from before the stop, too.
+        if link.blocked(now) {
+            self.retry_at = link.retry_at();
             return Ok(false);
         }
         self.retry_at = None;
