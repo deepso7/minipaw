@@ -30,8 +30,12 @@ const INPUT_QUEUE: usize = 8;
 /// A non-urgent ack waits this long after the first unacked write, so it
 /// covers more of them.
 const ACK_DELAY: Duration = Duration::from_millis(10);
-/// A full send buffer is retried after this pause.
-pub const BACKPRESSURE_RETRY: Duration = Duration::from_millis(5);
+/// A stream that refused a write at a resource limit, which arms no
+/// `StreamWritable`, is retried after this pause.
+const BACKPRESSURE_RETRY: Duration = Duration::from_millis(5);
+/// A stream that answered `Full` waits for its `StreamWritable`; this bounds
+/// the wait, should the event never come.
+const WRITABLE_FALLBACK: Duration = Duration::from_millis(250);
 /// A link that has sent nothing for this long sends a `Ping`.
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 /// A link that has heard nothing for this long is dead. minip2p does not
@@ -49,17 +53,6 @@ pub enum SendError {
     Dead(String),
 }
 
-/// A refused write is backpressure if the stream hit a resource limit
-/// (a partly taken write is `Error::Full`, handled by the caller); anything
-/// else means the stream is dead.
-fn send_error(error: &Error) -> SendError {
-    if let Error::Transport(TransportError::ResourceExhausted { .. }) = error {
-        SendError::Full
-    } else {
-        SendError::Dead(error.to_string())
-    }
-}
-
 /// The stream currently carrying the session.
 pub struct Link {
     pub peer: PeerId,
@@ -73,6 +66,9 @@ pub struct Link {
     /// The end of a frame the stream took only part of. It goes out before
     /// anything else, or the peer would read a torn frame.
     unsent: RefCell<Bytes>,
+    /// The stream refused a write: sends wait until then, or until its
+    /// `StreamWritable`.
+    blocked_until: Cell<Option<Instant>>,
 }
 
 impl Link {
@@ -86,6 +82,7 @@ impl Link {
             heard: now,
             sent: Cell::new(now),
             unsent: RefCell::new(Bytes::new()),
+            blocked_until: Cell::new(None),
         }
     }
 
@@ -108,6 +105,42 @@ impl Link {
         self.peer == *peer && self.conn == conn && self.stream == stream
     }
 
+    /// Whether sends wait for the stream to take writes again.
+    pub fn blocked(&self, now: Instant) -> bool {
+        if self.blocked_until.get().is_some_and(|until| now < until) {
+            return true;
+        }
+        self.blocked_until.set(None);
+        false
+    }
+
+    /// When a blocked stream is tried again without its `StreamWritable`.
+    pub fn retry_at(&self) -> Option<Instant> {
+        self.blocked_until.get()
+    }
+
+    /// The stream's `StreamWritable`: it takes writes again.
+    pub fn writable(&self) {
+        self.blocked_until.set(None);
+    }
+
+    /// Holds sends on the stream for `wait`, or until its `StreamWritable`.
+    fn block(&self, wait: Duration) -> SendError {
+        self.blocked_until.set(Some(Instant::now() + wait));
+        SendError::Full
+    }
+
+    /// A refused write is backpressure if the stream hit a resource limit
+    /// (a partly taken write is `Error::Full`, handled by the caller);
+    /// anything else means the stream is dead.
+    fn refused(&self, error: &Error) -> SendError {
+        if let Error::Transport(TransportError::ResourceExhausted { .. }) = error {
+            self.block(BACKPRESSURE_RETRY)
+        } else {
+            SendError::Dead(error.to_string())
+        }
+    }
+
     /// Queues `frame` after any held tail. `Full` means none of it was
     /// queued; a frame the stream took part of counts as queued, and its
     /// end is held for [`flush`](Self::flush).
@@ -117,9 +150,14 @@ impl Link {
         let len = data.len();
         match endpoint.send_stream(&self.peer, self.conn, self.stream, data) {
             Ok(()) => {}
-            Err(Error::Full { unsent, .. }) if unsent.len() == len => return Err(SendError::Full),
-            Err(Error::Full { unsent, .. }) => *self.unsent.borrow_mut() = unsent,
-            Err(e) => return Err(send_error(&e)),
+            Err(Error::Full { unsent, .. }) => {
+                let full = self.block(WRITABLE_FALLBACK);
+                if unsent.len() == len {
+                    return Err(full);
+                }
+                *self.unsent.borrow_mut() = unsent;
+            }
+            Err(e) => return Err(self.refused(&e)),
         }
         self.sent.set(Instant::now());
         Ok(())
@@ -135,9 +173,9 @@ impl Link {
             Ok(()) => Ok(()),
             Err(Error::Full { unsent, .. }) => {
                 *self.unsent.borrow_mut() = unsent;
-                Err(SendError::Full)
+                Err(self.block(WRITABLE_FALLBACK))
             }
-            Err(e) => Err(send_error(&e)),
+            Err(e) => Err(self.refused(&e)),
         }
     }
 
@@ -271,8 +309,6 @@ pub struct Pipe {
     stats: Arc<Stats>,
     failure: Failure,
     ack_due: Option<Instant>,
-    /// Sends paused by backpressure until then.
-    blocked_until: Option<Instant>,
 }
 
 impl Pipe {
@@ -312,7 +348,6 @@ impl Pipe {
             stats,
             failure,
             ack_due: None,
-            blocked_until: None,
         }
     }
 
@@ -341,7 +376,6 @@ impl Pipe {
         self.out.rewind(peer_recv)?;
         self.inb.resume();
         self.ack_due = None;
-        self.blocked_until = None;
         Ok(())
     }
 
@@ -403,24 +437,18 @@ impl Pipe {
     pub fn pump(&mut self, endpoint: &mut Endpoint, link: Option<&Link>) -> Result<(), String> {
         self.pull_stdin();
         let Some(link) = link else {
-            // Send timers only matter with a link; a stale one would hand
-            // `Endpoint::wait` a past deadline, which returns at once
-            // without driving the endpoint.
+            // Send timers only matter with a link; a stale one would keep
+            // the loop from sleeping.
             self.ack_due = None;
-            self.blocked_until = None;
             return Ok(());
         };
         let now = Instant::now();
-        if self.blocked_until.is_some_and(|until| now < until) {
+        if link.blocked(now) {
             return Ok(());
         }
-        self.blocked_until = None;
         match self.send_pending(endpoint, link, now) {
-            Ok(()) => Ok(()),
-            Err(SendError::Full) => {
-                self.blocked_until = Some(now + BACKPRESSURE_RETRY);
-                Ok(())
-            }
+            // The link holds when to try again.
+            Ok(()) | Err(SendError::Full) => Ok(()),
             Err(SendError::Dead(e)) => Err(e),
         }
     }
@@ -494,10 +522,10 @@ impl Pipe {
 
     /// When `pump` next has timed work on `link`: a backpressure retry, or
     /// else a delayed ack or a ping (which cannot go out while sends are
-    /// blocked anyway).
+    /// blocked anyway). A `StreamWritable` wakes it sooner.
     pub fn deadline(&self, link: Option<&Link>) -> Option<Instant> {
         let link = link?;
-        self.blocked_until.or_else(|| {
+        link.retry_at().or_else(|| {
             let ping = link.ping_at();
             Some(self.ack_due.map_or(ping, |due| due.min(ping)))
         })

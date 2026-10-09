@@ -159,7 +159,8 @@ impl Client {
             .flatten()
             .min()
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(1))
-            // A past deadline makes `wait` return without polling anything.
+            // A past deadline polls once but never sleeps: a timer due
+            // but not yet acted on would spin the loop.
             .max(Instant::now() + Duration::from_millis(1));
             if let EndpointWaitOutcome::Event(event) = self.endpoint.wait(deadline)? {
                 if let Some(stop) = &mut self.stop {
@@ -368,6 +369,17 @@ impl Client {
                 stream_id,
                 data,
             } => self.on_data(&peer_id, conn_id, stream_id, &data)?,
+            EndpointEvent::StreamWritable {
+                peer_id,
+                conn_id,
+                stream_id,
+            } => {
+                if let Phase::Handshaking { link, .. } | Phase::Up { link } = &self.phase
+                    && link.is(&peer_id, conn_id, stream_id)
+                {
+                    link.writable();
+                }
+            }
             EndpointEvent::StreamClosed {
                 peer_id,
                 conn_id,

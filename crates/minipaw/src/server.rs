@@ -323,7 +323,8 @@ impl<H: Host> ServerCore<H> {
             .flatten()
             .min()
             .unwrap_or_else(|| now + Duration::from_secs(1))
-            // A past deadline makes `wait` return without polling anything.
+            // A past deadline polls once but never sleeps: a timer due
+            // but not yet acted on would spin the loop.
             .max(now + Duration::from_millis(1))
     }
 
@@ -400,6 +401,20 @@ impl<H: Host> ServerCore<H> {
                 Some(key) => self.on_slot_data(&key, &data),
                 None => self.on_pending_data((peer_id, conn_id, stream_id), &data),
             },
+            EndpointEvent::StreamWritable {
+                peer_id,
+                conn_id,
+                stream_id,
+            } => {
+                if let Some(link) = self
+                    .sessions
+                    .values()
+                    .filter_map(Slot::link)
+                    .find(|l| l.is(&peer_id, conn_id, stream_id))
+                {
+                    link.writable();
+                }
+            }
             EndpointEvent::StreamRemoteWriteClosed {
                 peer_id,
                 conn_id,
