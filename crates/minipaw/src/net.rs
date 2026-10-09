@@ -156,9 +156,7 @@ pub fn close(mut endpoint: Endpoint) {
 
 pub fn linger_and_close(mut endpoint: Endpoint, link: Option<Link>) {
     if let Some(link) = link {
-        if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
-            log::debug!("close stream: {e}");
-        }
+        link.close_write(&mut endpoint);
         let deadline = Instant::now() + LINGER;
         loop {
             // A past deadline makes `wait` return without polling anything.
@@ -216,6 +214,9 @@ pub struct Stop {
     pub by: Instant,
     /// Streams the `Error` went out on.
     told: Vec<(PeerId, ConnectionId, StreamId)>,
+    /// The stream that took part of the `Error`; the rest goes out before
+    /// it is closed.
+    partial: Option<(ConnectionId, StreamId)>,
     /// The peer half-closed one of them: it read the `Error`.
     confirmed: bool,
     /// The last send hit backpressure; try again then.
@@ -265,6 +266,7 @@ impl Stop {
             message,
             by: Instant::now() + ABORT_GRACE,
             told: Vec::new(),
+            partial: None,
             confirmed: false,
             retry_at: None,
         }
@@ -322,11 +324,19 @@ impl Stop {
             return Ok(false);
         }
         self.retry_at = None;
-        match link.try_send(endpoint, &Frame::Error(self.message.into())) {
+        let sent = if self.partial == Some((link.conn, link.stream)) {
+            link.flush(endpoint)
+        } else {
+            link.try_send(endpoint, &Frame::Error(self.message.into()))
+                .and_then(|()| {
+                    self.partial = Some((link.conn, link.stream));
+                    link.flush(endpoint)
+                })
+        };
+        match sent {
             Ok(()) => {
-                if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
-                    log::debug!("close stream: {e}");
-                }
+                link.close_write(endpoint);
+                self.partial = None;
                 self.told.push(key);
                 Ok(false)
             }
@@ -439,9 +449,7 @@ fn abort(
         if let Err(e) = link.send(endpoint, &error) {
             log::debug!("abort not sent: {e}");
         }
-        if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
-            log::debug!("close stream: {e}");
-        }
+        link.close_write(endpoint);
         told.push(link);
     };
     if let Some(link) = link {

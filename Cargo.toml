@@ -16,7 +16,7 @@ clap = { version = "4.6", features = ["derive"] }
 ctrlc = "3"
 getrandom = "0.4"
 log = "0.4"
-minip2p-rs = { version = "0.7.4", features = ["nat"] }
+minip2p-rs = { version = "0.7.5", features = ["nat"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
 # Safe syscall wrappers (euid, open flags) for identity file checks; already
 # in the tree through minip2p.

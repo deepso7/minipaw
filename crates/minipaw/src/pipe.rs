@@ -8,7 +8,7 @@
 //! [`Pipe::failure`] reports it so the session ends nonzero rather than
 //! claiming a complete transfer.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use minip2p::{ConnectionId, Endpoint, Error, PeerId, StreamId, TransportError, WaitHandle};
+use minip2p::{Bytes, ConnectionId, Endpoint, Error, PeerId, StreamId, TransportError, WaitHandle};
 
 use crate::window::{Inbound, Outbound};
 use crate::wire::{Frame, FrameReader, MAX_DATA};
@@ -30,8 +30,7 @@ const INPUT_QUEUE: usize = 8;
 /// A non-urgent ack waits this long after the first unacked write, so it
 /// covers more of them.
 const ACK_DELAY: Duration = Duration::from_millis(10);
-/// minip2p has no writable event, so a full send buffer is retried after
-/// this pause.
+/// A full send buffer is retried after this pause.
 pub const BACKPRESSURE_RETRY: Duration = Duration::from_millis(5);
 /// A link that has sent nothing for this long sends a `Ping`.
 const PING_INTERVAL: Duration = Duration::from_secs(5);
@@ -44,20 +43,20 @@ const PING_INTERVAL: Duration = Duration::from_secs(5);
 const DEAD_AFTER: Duration = Duration::from_secs(20);
 
 pub enum SendError {
-    /// The stream's send buffer is full; the frame was not queued.
+    /// The stream's send buffer is full; the frame was not queued, or a
+    /// held tail is still unsent.
     Full,
     Dead(String),
 }
 
-/// A refused write that is backpressure rather than a dead stream: QUIC's
-/// full write queue, or a full Yamux buffer on a relayed circuit.
-fn is_backpressure(error: &Error) -> bool {
-    match error {
-        Error::Transport(TransportError::ResourceExhausted { .. }) => true,
-        Error::Transport(TransportError::StreamSendFailed { reason, .. }) => {
-            reason.contains("send buffer is full")
-        }
-        _ => false,
+/// A refused write is backpressure if the stream hit a resource limit
+/// (a partly taken write is `Error::Full`, handled by the caller); anything
+/// else means the stream is dead.
+fn send_error(error: &Error) -> SendError {
+    if let Error::Transport(TransportError::ResourceExhausted { .. }) = error {
+        SendError::Full
+    } else {
+        SendError::Dead(error.to_string())
     }
 }
 
@@ -71,6 +70,9 @@ pub struct Link {
     heard: Instant,
     /// When we last queued a frame on it.
     sent: Cell<Instant>,
+    /// The end of a frame the stream took only part of. It goes out before
+    /// anything else, or the peer would read a torn frame.
+    unsent: RefCell<Bytes>,
 }
 
 impl Link {
@@ -83,6 +85,7 @@ impl Link {
             reader: FrameReader::default(),
             heard: now,
             sent: Cell::new(now),
+            unsent: RefCell::new(Bytes::new()),
         }
     }
 
@@ -105,18 +108,53 @@ impl Link {
         self.peer == *peer && self.conn == conn && self.stream == stream
     }
 
+    /// Queues `frame` after any held tail. `Full` means none of it was
+    /// queued; a frame the stream took part of counts as queued, and its
+    /// end is held for [`flush`](Self::flush).
     pub fn try_send(&self, endpoint: &mut Endpoint, frame: &Frame) -> Result<(), SendError> {
-        endpoint
-            .send_stream(&self.peer, self.conn, self.stream, frame.encode())
-            .map_err(|e| {
-                if is_backpressure(&e) {
-                    SendError::Full
-                } else {
-                    SendError::Dead(e.to_string())
-                }
-            })?;
+        self.flush(endpoint)?;
+        let data = Bytes::from(frame.encode());
+        let len = data.len();
+        match endpoint.send_stream(&self.peer, self.conn, self.stream, data) {
+            Ok(()) => {}
+            Err(Error::Full { unsent, .. }) if unsent.len() == len => return Err(SendError::Full),
+            Err(Error::Full { unsent, .. }) => *self.unsent.borrow_mut() = unsent,
+            Err(e) => return Err(send_error(&e)),
+        }
         self.sent.set(Instant::now());
         Ok(())
+    }
+
+    /// Sends the held end of a partly queued frame, if any.
+    pub fn flush(&self, endpoint: &mut Endpoint) -> Result<(), SendError> {
+        let data = self.unsent.take();
+        if data.is_empty() {
+            return Ok(());
+        }
+        match endpoint.send_stream(&self.peer, self.conn, self.stream, data) {
+            Ok(()) => Ok(()),
+            Err(Error::Full { unsent, .. }) => {
+                *self.unsent.borrow_mut() = unsent;
+                Err(SendError::Full)
+            }
+            Err(e) => Err(send_error(&e)),
+        }
+    }
+
+    /// Half-closes our side. A tail the stream still cannot take is lost,
+    /// leaving the peer a torn last frame; only a teardown closes, so the
+    /// peer treats it as the stream ending.
+    pub fn close_write(&self, endpoint: &mut Endpoint) {
+        if let Err(SendError::Full) = self.flush(endpoint) {
+            log::debug!(
+                "closing stream {} with {} bytes unsent",
+                self.stream,
+                self.unsent.borrow().len()
+            );
+        }
+        if let Err(e) = endpoint.close_stream_write(&self.peer, self.conn, self.stream) {
+            log::debug!("close stream: {e}");
+        }
     }
 
     /// Sends a frame that must go out now, such as a handshake.
@@ -393,6 +431,7 @@ impl Pipe {
         link: &Link,
         now: Instant,
     ) -> Result<(), SendError> {
+        link.flush(endpoint)?;
         let written = self.written();
         if self.inb.ack_pending(written) {
             if self.inb.ack_urgent(written) || self.ack_due.is_some_and(|due| now >= due) {

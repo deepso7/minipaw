@@ -213,7 +213,7 @@ struct Ending {
     /// stream gets it again.
     clean: bool,
     /// The peer is being told the session is over, until it confirms.
-    tell: Option<Stop>,
+    tell: Option<Box<Stop>>,
     /// Waiting for the peer to close its side of the link, until then.
     linger: Option<Instant>,
     /// The deadline for resending our last ack; fixed when ending begins.
@@ -651,12 +651,7 @@ impl<H: Host> ServerCore<H> {
         }
         // Closing our side confirms the stop, as for a running session.
         log::debug!("session {id}: the client stopped before its Welcome");
-        if let Err(e) = self
-            .endpoint
-            .close_stream_write(&link.peer, link.conn, link.stream)
-        {
-            log::debug!("close stream: {e}");
-        }
+        link.close_write(&mut self.endpoint);
         self.disconnect_soon(link.peer);
     }
 
@@ -779,14 +774,10 @@ impl<H: Host> ServerCore<H> {
             };
             let sent = link
                 .send(&mut self.endpoint, &welcome)
-                .and_then(|()| link.send(&mut self.endpoint, &live.pipe.final_ack()))
-                .and_then(|()| {
-                    self.endpoint
-                        .close_stream_write(&link.peer, link.conn, link.stream)
-                        .map_err(|e| e.to_string())
-                });
+                .and_then(|()| link.send(&mut self.endpoint, &live.pipe.final_ack()));
             match sent {
                 Ok(()) => {
+                    link.close_write(&mut self.endpoint);
                     live.link = Some(link);
                     ending.linger = Some(ending.by);
                 }
@@ -808,12 +799,7 @@ impl<H: Host> ServerCore<H> {
         if let Err(e) = link.send(&mut self.endpoint, &Frame::Error(reason.into())) {
             log::debug!("refusal not sent: {e}");
         }
-        if let Err(e) = self
-            .endpoint
-            .close_stream_write(&link.peer, link.conn, link.stream)
-        {
-            log::debug!("close refused stream: {e}");
-        }
+        link.close_write(&mut self.endpoint);
         self.disconnect_soon(link.peer);
     }
 
@@ -1199,7 +1185,7 @@ impl Slot {
                 .min()
             }
             State::Ending(_, ending) => [
-                ending.tell.as_ref().map(Stop::wake_at),
+                ending.tell.as_deref().map(Stop::wake_at),
                 ending.linger,
                 (!ending.drained).then_some(ending.drain_by),
             ]
@@ -1257,10 +1243,7 @@ impl Ending {
             drained: false,
         };
         let mut linger = |live: &mut Live| {
-            let link = live.link.as_ref()?;
-            if let Err(e) = endpoint.close_stream_write(&link.peer, link.conn, link.stream) {
-                log::debug!("close stream: {e}");
-            }
+            live.link.as_ref()?.close_write(endpoint);
             Some(now + LINGER)
         };
         match end {
@@ -1276,7 +1259,7 @@ impl Ending {
             }
             End::Stopped(mut stop) => {
                 ending.result = Err(stop.take_error());
-                ending.tell = Some(stop);
+                ending.tell = Some(Box::new(stop));
             }
             End::Failed(e) if e.is::<PeerEnded>() => {
                 // Half-closing back confirms to the peer that its Error
@@ -1286,7 +1269,7 @@ impl Ending {
             }
             End::Failed(e) => {
                 log::debug!("session failed: {e}");
-                ending.tell = Some(Stop::broken());
+                ending.tell = Some(Box::new(Stop::broken()));
                 ending.result = Err(crate::Error::from_internal(e));
             }
         }
