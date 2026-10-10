@@ -5,6 +5,9 @@
 mod args;
 mod serve;
 mod ssh;
+#[cfg(all(unix, feature = "ssh-server"))]
+#[allow(dead_code)] // not wired into `serve` yet
+mod sshd;
 mod ui;
 
 use std::process::ExitCode;
