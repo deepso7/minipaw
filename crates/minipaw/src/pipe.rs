@@ -870,21 +870,24 @@ mod tests {
         use std::os::unix::net::UnixStream;
 
         let (ours, mut theirs) = <UnixStream as Socket>::pair();
+        let probe = ours.try_clone().unwrap();
+        // Whether the socket's buffer is full, so a write to it blocks. A
+        // byte that fits is harmless: the target never reads.
+        let full = || match rustix::net::send(&probe, &[0], rustix::net::SendFlags::DONTWAIT) {
+            Ok(_) => false,
+            Err(e) if e == rustix::io::Errno::AGAIN => true,
+            Err(e) => panic!("probe: {e}"),
+        };
         let mut pipe = pipe(ours.io());
         // A full window is far more than a Unix socket buffers.
-        let total = WINDOW / MAX_DATA * MAX_DATA;
         for _ in 0..WINDOW / MAX_DATA {
             pipe.on_frame(Frame::Data(vec![1; MAX_DATA])).unwrap();
         }
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut last = u64::MAX;
-        // Wait for the writer to stall.
-        while pipe.written() != last {
-            assert!(Instant::now() < deadline, "writer never stalled");
-            last = pipe.written();
-            thread::sleep(Duration::from_millis(50));
+        while !full() {
+            assert!(Instant::now() < deadline, "the socket never filled");
+            thread::sleep(Duration::from_millis(10));
         }
-        assert!(last < total as u64, "the socket took the whole window");
 
         theirs.write_all(b"reply").unwrap();
         let mut got = Vec::new();
@@ -897,7 +900,9 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(got, b"reply");
-        assert_eq!(pipe.written(), last, "the writer was still blocked");
+        // Nothing drained the socket, so the writer is still blocked.
+        assert!(full());
+        assert!(pipe.written() < WINDOW as u64);
         pipe.finish(Some(Duration::from_millis(50)));
     }
 
