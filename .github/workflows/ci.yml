@@ -43,6 +43,18 @@ jobs:
           fi
       - name: SDK packages for crates.io
         run: cargo package -p minipaw --no-verify --allow-dirty
+      - name: CLI builds without the SSH server
+        run: cargo build -p minipaw-cli --no-default-features
+
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
 
   test:
     strategy:

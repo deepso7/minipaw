@@ -498,6 +498,47 @@ CI changes:
 4. PR 3: SFTP.
 5. PR 4 onward: phase 3.
 
+## Implementation notes (PR 2)
+
+Where PR 2 differs from the plan above, and why:
+
+- **PTY drain on a normal exit.** The master is read until EIO, *or* until
+  the shell has exited and the terminal has been quiet for 250 ms. A
+  background job that still holds the pts would otherwise keep the session
+  open for good; sshd does not wait for those either. Waiting on the
+  client's window is not quiet, so no output is lost to back-pressure.
+- **No-PTY teardown order.** The pumps are cancelled when teardown starts,
+  before SIGHUP and SIGTERM, rather than after SIGKILL: output written
+  during the grace has no reader anyway, as the channel is going away.
+- **A spawn while stopping** is refused like a failed spawn (failure, then
+  close).
+- **authorized_keys parsing.** A line whose first token starts with
+  `ssh-`, `ecdsa-` or `sk-` is a key line; anything else counts as options
+  and is an error. A key that does not parse (bad base64, a blob of another
+  type) is an error too, naming the file and line. Unsupported types,
+  certificates (`*-cert-v01@openssh.com`) included, are skipped with a
+  warning. The default file is under the home directory of the passwd
+  entry, not `$HOME`.
+- **Without the feature**, `--ssh` and its flags still parse, and clap
+  rejects `--ssh` with a message naming the `ssh-server` feature.
+- **tokio's `fs` feature** comes in with pty-process (its dependency), not
+  in phase 2.
+- **Tests.**
+  - The silent-client deadline test uses paused time. The unsigned-offer
+    test cannot: tokio advances a paused clock while socket I/O is still in
+    flight, so the handshake itself hit the deadline. It uses a real 3 s
+    deadline instead (the deadline is a field of the server's shared state).
+  - On Linux a PTY hangup signals only the session leader; the foreground
+    job gets SIGHUP when the leader exits. The test checks that chain end to
+    end (BSD signals the foreground group at once).
+  - Spike cases 1, 2, 3, 4 and 7 are ported at CI sizes (20 MB, not
+    100 MB; 25 connections, not 1,000). Cases 5 and 6 need the cleartext
+    abuse proxy and exercise russh internals; the spike covers them.
+  - The end-to-end check is `serve_ssh` in `scripts/check.sh`, which CI
+    already runs on ubuntu and macos. Its key file lives under `$HOME`,
+    since the path policy refuses a world-writable `/tmp`.
+- **No `deny.toml`**: `cargo deny check advisories` passes on its defaults.
+
 ## Risks
 
 Top risks:

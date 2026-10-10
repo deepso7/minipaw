@@ -25,6 +25,7 @@ cleanup() {
     wait "$LIMITED_PID" 2>/dev/null
     rm -f "$LIMITED_LOG"
   fi
+  [ -n "${KEYS:-}" ] && rm -rf "$KEYS"
   rm -rf "$T"
 }
 trap cleanup EXIT
@@ -993,11 +994,72 @@ check_ssh_wrapper() {
   pass "ssh moved 1 MB through serve; ssh and cp arguments rewritten"
 }
 
+# The system's ssh through `minipaw ssh`, logging in with the key <key>,
+# with no ssh config and a known_hosts of its own.
+ssh_as() { # ssh_as <key> [ssh args...]
+  local key=$1
+  shift
+  MINIPAW_DIRECT=$DIRECT "$BIN" ssh -F /dev/null -i "$key" -o IdentitiesOnly=yes \
+    -o BatchMode=yes -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new \
+    -o UserKnownHostsFile="$KEYS/known_hosts" "$@"
+}
+
+# `serve --ssh` answers sessions itself. The system's ssh logs in with a key
+# through `minipaw ssh` (so `minipaw -q`), runs a command with and without a
+# PTY, gets its exit status, and moves 20 MB each way through cat.
+#
+# The keys live under $HOME: serve refuses an authorized_keys file in a
+# shared directory such as /tmp, as sshd's StrictModes does.
+check_serve_ssh() {
+  command -v ssh-keygen >/dev/null || { skip "no ssh-keygen"; return; }
+  KEYS=$(mktemp -d "$HOME/.minipaw-check.XXXXXX")
+  chmod 700 "$KEYS"
+  ssh-keygen -q -t ed25519 -N '' -C check -f "$KEYS/key" || { fail "ssh-keygen"; return; }
+  cp "$KEYS/key.pub" "$KEYS/authorized_keys"
+  chmod 600 "$KEYS/authorized_keys"
+  start_serve "$T/serve.err" --ssh --authorized-keys "$KEYS/authorized_keys" ||
+    { fail "no ticket"; return; }
+  grep -q '^# ssh: built-in server as .*, 1 key$' "$T/serve.err" ||
+    { fail "no status line: $(grep '^# ssh' "$T/serve.err" | head -2)"; return; }
+  local key=$KEYS/key pid code=0
+  ssh_as "$key" "me@$TICKET" true </dev/null >"$T/true.out" 2>"$T/true.err" &
+  pid=$!
+  track $pid
+  expect_exit true $pid 0 60 || return
+  ssh_as "$key" "me@$TICKET" 'exit 3' </dev/null >/dev/null 2>"$T/exit.err" &
+  pid=$!
+  track $pid
+  wait_upto $pid 60 || code=$?
+  [ "$code" = 3 ] || { fail "exit 3 came back as $code: $(tail -1 "$T/exit.err")"; return; }
+  ssh_as "$key" -tt "me@$TICKET" 'stty size' </dev/null >"$T/tty.out" 2>"$T/tty.err" &
+  pid=$!
+  track $pid
+  expect_exit tty $pid 0 60 || return
+  tr -d '\r' <"$T/tty.out" | grep -Eq '^[0-9]+ [0-9]+$' ||
+    { fail "stty size printed '$(head -c 100 "$T/tty.out")'"; return; }
+  head -c 20000000 /dev/urandom >"$T/up"
+  ssh_as "$key" "me@$TICKET" cat <"$T/up" >"$T/cat.out" 2>"$T/cat.err" &
+  pid=$!
+  track $pid
+  expect_exit cat $pid 0 120 || return
+  cmp -s "$T/up" "$T/cat.out" || { fail "cat sent back different data"; return; }
+  # A key that is not listed is refused.
+  ssh-keygen -q -t ed25519 -N '' -C other -f "$KEYS/other" || { fail "ssh-keygen"; return; }
+  ssh_as "$KEYS/other" "me@$TICKET" true </dev/null >/dev/null 2>"$T/other.err" &
+  pid=$!
+  track $pid
+  code=0
+  wait_upto $pid 60 || code=$?
+  [ "$code" = 255 ] || { fail "an unlisted key got in (exit $code)"; return; }
+  kill -0 "$SERVER_PID" 2>/dev/null || { fail "serve exited"; return; }
+  pass "ssh true, exit 3, a PTY, and 20 MB each way through cat; a stranger's key refused"
+}
+
 ALL="transfer forced_relay resume heartbeat interrupt_client interrupt_server interrupt_blocked
 interrupt_both wrong_token busy squatters stdin_error stdout_error closed_reader panel_stdout
 serve_forward serve_halfclose serve_reverse_halfclose serve_restart serve_late_resume serve_limit
 serve_target_down serve_lost_welcome serve_isolation serve_mixed serve_stop_connecting serve_auth_deadline serve_churn
-serve_flood serve_leave quiet_stderr quiet_hangup ssh_wrapper"
+serve_flood serve_leave quiet_stderr quiet_hangup ssh_wrapper serve_ssh"
 if [ "${1:-}" = list ]; then
   echo $ALL
   exit 0
