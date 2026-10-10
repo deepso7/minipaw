@@ -13,8 +13,10 @@ categories = ["network-programming", "command-line-utilities"]
 [dependencies]
 base64.workspace = true
 getrandom.workspace = true
+hkdf.workspace = true
 log.workspace = true
 minip2p-rs.workspace = true
+sha2.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true

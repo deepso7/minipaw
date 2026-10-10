@@ -1,7 +1,9 @@
 //! Where a session's bytes come from and go to.
 
 use std::io::{IsTerminal as _, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{self, TcpStream};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 
 /// The local ends of a session: bytes read from `input` go to the peer, and
 /// bytes from the peer are written to `output`.
@@ -22,8 +24,8 @@ use std::net::{Shutdown, TcpStream};
 /// `run` waits up to a second for a blocked `write`, then leaves the thread
 /// behind. It still owns `output`, finishes writing the data it had already
 /// received, and drops `output` after that. With a writer you own, unblock
-/// it to end it early (for a socket, `shutdown`). [`Io::tcp`] does both of
-/// these itself.
+/// it to end it early (for a socket, `shutdown`). [`Io::tcp`] and
+/// `Io::unix` do both of these themselves.
 pub struct Io {
     pub(crate) input: Box<dyn Read + Send>,
     pub(crate) output: Box<dyn Write + Send>,
@@ -80,11 +82,32 @@ impl Io {
     ///
     /// Cloning the socket's handle failed.
     pub fn tcp(stream: TcpStream) -> std::io::Result<Self> {
-        let input = stream.try_clone()?;
-        let cancel = Cancel(Some(stream.try_clone()?));
-        let mut io = Io::new(input, TcpOutput(stream));
-        io.cancel = Some(cancel);
-        Ok(io)
+        Ok(Io::socket(stream.try_clone()?, stream.try_clone()?, stream))
+    }
+
+    /// Both directions of a Unix stream socket, such as one end of a
+    /// [`UnixStream::pair`] whose other end an in-process server holds.
+    ///
+    /// Half-closes are passed on and no helper thread outlives the session,
+    /// just as with [`Io::tcp`].
+    ///
+    /// # Errors
+    ///
+    /// Cloning the socket's handle failed.
+    #[cfg(unix)]
+    pub fn unix(stream: UnixStream) -> std::io::Result<Self> {
+        Ok(Io::socket(stream.try_clone()?, stream.try_clone()?, stream))
+    }
+
+    /// Three handles to one socket: one to read, one to cancel with, and one
+    /// to write.
+    fn socket<S>(input: S, cancel: S, output: S) -> Self
+    where
+        S: Read + Write + Shutdown + Send + 'static,
+    {
+        let mut io = Io::new(input, SocketOutput(output));
+        io.cancel = Some(Cancel(Some(Box::new(cancel))));
+        io
     }
 
     /// Whether the peer finishing its side also ends ours, as if `input`
@@ -96,10 +119,28 @@ impl Io {
     }
 }
 
-/// The output of [`Io::tcp`]: dropping it half-closes the socket.
-struct TcpOutput(TcpStream);
+/// A socket whose two directions can be shut down apart.
+trait Shutdown {
+    fn shutdown(&self, how: net::Shutdown) -> std::io::Result<()>;
+}
 
-impl Write for TcpOutput {
+impl Shutdown for TcpStream {
+    fn shutdown(&self, how: net::Shutdown) -> std::io::Result<()> {
+        TcpStream::shutdown(self, how)
+    }
+}
+
+#[cfg(unix)]
+impl Shutdown for UnixStream {
+    fn shutdown(&self, how: net::Shutdown) -> std::io::Result<()> {
+        UnixStream::shutdown(self, how)
+    }
+}
+
+/// The output of a socket `Io`: dropping it half-closes the socket.
+struct SocketOutput<S: Shutdown>(S);
+
+impl<S: Shutdown + Write> Write for SocketOutput<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.write(buf)
     }
@@ -109,33 +150,33 @@ impl Write for TcpOutput {
     }
 }
 
-impl Drop for TcpOutput {
+impl<S: Shutdown> Drop for SocketOutput<S> {
     fn drop(&mut self) {
         // The target may have closed already.
-        if let Err(e) = self.0.shutdown(Shutdown::Write) {
+        if let Err(e) = self.0.shutdown(net::Shutdown::Write) {
             log::debug!("half-close output: {e}");
         }
     }
 }
 
-/// Ends the blocking calls of an [`Io::tcp`]'s helper threads at teardown.
+/// Ends the blocking calls of a socket `Io`'s helper threads at teardown.
 /// Dropped unused, it aborts, so every way out of a session cleans up.
-pub(crate) struct Cancel(Option<TcpStream>);
+pub(crate) struct Cancel(Option<Box<dyn Shutdown + Send>>);
 
 impl Cancel {
     /// After a clean end: the input thread reads EOF and exits. The output
     /// half-closed the socket when it finished.
     pub(crate) fn clean(mut self) {
-        self.shutdown(Shutdown::Read);
+        self.shutdown(net::Shutdown::Read);
     }
 
     /// After a stop or a failure, once the output had its grace: every
     /// blocked call returns, even a write to a target that stopped reading.
     pub(crate) fn abort(mut self) {
-        self.shutdown(Shutdown::Both);
+        self.shutdown(net::Shutdown::Both);
     }
 
-    fn shutdown(&mut self, how: Shutdown) {
+    fn shutdown(&mut self, how: net::Shutdown) {
         // The target may have closed already.
         if let Some(stream) = self.0.take()
             && let Err(e) = stream.shutdown(how)
@@ -147,7 +188,7 @@ impl Cancel {
 
 impl Drop for Cancel {
     fn drop(&mut self) {
-        self.shutdown(Shutdown::Both);
+        self.shutdown(net::Shutdown::Both);
     }
 }
 
@@ -169,6 +210,59 @@ pub(crate) mod tests {
         (ours, theirs)
     }
 
+    /// A kind of socket an `Io` can be made from, so each test runs on
+    /// every kind.
+    pub trait Socket: Read + Write + Send + Sized + 'static {
+        /// A connected pair: ours, and the target's. The target's reads
+        /// time out after ten seconds, so a test fails rather than hangs.
+        fn pair() -> (Self, Self);
+        fn io(self) -> Io;
+        fn shut(&self, how: net::Shutdown);
+    }
+
+    impl Socket for TcpStream {
+        fn pair() -> (Self, Self) {
+            let (ours, theirs) = tcp_pair();
+            theirs
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            (ours, theirs)
+        }
+        fn io(self) -> Io {
+            Io::tcp(self).unwrap()
+        }
+        fn shut(&self, how: net::Shutdown) {
+            self.shutdown(how).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    impl Socket for UnixStream {
+        fn pair() -> (Self, Self) {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            theirs
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            (ours, theirs)
+        }
+        fn io(self) -> Io {
+            Io::unix(self).unwrap()
+        }
+        fn shut(&self, how: net::Shutdown) {
+            self.shutdown(how).unwrap();
+        }
+    }
+
+    /// Runs a test generic over [`Socket`] on every kind there is.
+    macro_rules! on_every_socket {
+        ($test:ident) => {
+            $test::<::std::net::TcpStream>();
+            #[cfg(unix)]
+            $test::<::std::os::unix::net::UnixStream>();
+        };
+    }
+    pub(crate) use on_every_socket;
+
     /// Runs `f` on a thread; the returned closure waits at most ten seconds
     /// for its result and for the thread to exit.
     fn spawn<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> impl FnOnce() -> T {
@@ -188,84 +282,133 @@ pub(crate) mod tests {
 
     #[test]
     fn dropping_the_output_half_closes_while_replies_still_flow() {
-        let (ours, mut theirs) = tcp_pair();
-        let Io {
-            mut input,
-            mut output,
-            // Dropping it would shut the socket down.
-            cancel: _cancel,
-            ..
-        } = Io::tcp(ours).unwrap();
-        output.write_all(b"request").unwrap();
-        drop(output);
-        let mut got = Vec::new();
-        theirs.read_to_end(&mut got).unwrap();
-        assert_eq!(got, b"request");
+        fn test<S: Socket>() {
+            let (ours, mut theirs) = S::pair();
+            let Io {
+                mut input,
+                mut output,
+                // Dropping it would shut the socket down.
+                cancel: _cancel,
+                ..
+            } = ours.io();
+            output.write_all(b"request").unwrap();
+            drop(output);
+            let mut got = Vec::new();
+            theirs.read_to_end(&mut got).unwrap();
+            assert_eq!(got, b"request");
 
-        theirs.write_all(b"reply").unwrap();
-        theirs.shutdown(Shutdown::Write).unwrap();
-        let mut got = Vec::new();
-        input.read_to_end(&mut got).unwrap();
-        assert_eq!(got, b"reply");
+            theirs.write_all(b"reply").unwrap();
+            theirs.shut(net::Shutdown::Write);
+            let mut got = Vec::new();
+            input.read_to_end(&mut got).unwrap();
+            assert_eq!(got, b"reply");
+        }
+        on_every_socket!(test);
     }
 
     #[test]
     fn clean_cancel_ends_a_blocked_read() {
-        for _ in 0..20 {
-            let (ours, _theirs) = tcp_pair();
-            let Io {
-                mut input, cancel, ..
-            } = Io::tcp(ours).unwrap();
-            let read = spawn(move || input.read(&mut [0; 64]).map_err(|e| e.kind()));
-            thread::sleep(Duration::from_millis(10));
-            cancel.unwrap().clean();
-            assert_eq!(read(), Ok(0));
+        fn test<S: Socket>() {
+            for _ in 0..20 {
+                let (ours, _theirs) = S::pair();
+                let Io {
+                    mut input, cancel, ..
+                } = ours.io();
+                let read = spawn(move || input.read(&mut [0; 64]).map_err(|e| e.kind()));
+                thread::sleep(Duration::from_millis(10));
+                cancel.unwrap().clean();
+                assert_eq!(read(), Ok(0));
+            }
         }
+        on_every_socket!(test);
     }
 
     #[test]
-    fn abort_ends_a_write_to_a_target_that_stopped_reading() {
-        for _ in 0..20 {
-            let (ours, _theirs) = tcp_pair();
+    fn a_clean_end_leaves_no_thread_behind() {
+        fn test<S: Socket>() {
+            // The target sends, reads to the end, and never closes.
+            let (ours, mut theirs) = S::pair();
             let Io {
                 mut input,
                 mut output,
                 cancel,
                 ..
-            } = Io::tcp(ours).unwrap();
-            let (progress, wrote) = mpsc::channel();
-            let write = spawn(move || {
-                let chunk = vec![0; 64 * 1024];
-                loop {
-                    if output.write_all(&chunk).is_err() {
-                        return;
-                    }
-                    if progress.send(()).is_err() {}
-                }
+            } = ours.io();
+            let read = spawn(move || {
+                let mut got = Vec::new();
+                input
+                    .read_to_end(&mut got)
+                    .map(|_| got)
+                    .map_err(|e| e.kind())
             });
-            let read = spawn(move || input.read(&mut [0; 64]).map_err(|e| e.kind()));
-            // Until the socket buffers fill and the writes block.
-            while wrote.recv_timeout(Duration::from_millis(100)).is_ok() {}
-            cancel.unwrap().abort();
+            let write = spawn(move || {
+                output.write_all(b"done").unwrap();
+                // As the output thread does once all of it is written.
+                drop(output);
+            });
+            theirs.write_all(b"reply").unwrap();
             write();
-            assert!(matches!(read(), Ok(0) | Err(_)));
+            let mut got = Vec::new();
+            theirs.read_to_end(&mut got).unwrap();
+            assert_eq!(got, b"done");
+            // The session ended cleanly: the input thread exits with what
+            // it had read.
+            thread::sleep(Duration::from_millis(10));
+            cancel.unwrap().clean();
+            assert_eq!(read(), Ok(b"reply".to_vec()));
         }
+        on_every_socket!(test);
+    }
+
+    #[test]
+    fn abort_ends_a_write_to_a_target_that_stopped_reading() {
+        fn test<S: Socket>() {
+            for _ in 0..20 {
+                let (ours, _theirs) = S::pair();
+                let Io {
+                    mut input,
+                    mut output,
+                    cancel,
+                    ..
+                } = ours.io();
+                let (progress, wrote) = mpsc::channel();
+                let write = spawn(move || {
+                    let chunk = vec![0; 64 * 1024];
+                    loop {
+                        if output.write_all(&chunk).is_err() {
+                            return;
+                        }
+                        if progress.send(()).is_err() {}
+                    }
+                });
+                let read = spawn(move || input.read(&mut [0; 64]).map_err(|e| e.kind()));
+                // Until the socket buffers fill and the writes block.
+                while wrote.recv_timeout(Duration::from_millis(100)).is_ok() {}
+                cancel.unwrap().abort();
+                write();
+                assert!(matches!(read(), Ok(0) | Err(_)));
+            }
+        }
+        on_every_socket!(test);
     }
 
     #[test]
     fn dropping_an_unused_cancel_aborts() {
-        let (ours, _theirs) = tcp_pair();
-        let Io {
-            mut input, cancel, ..
-        } = Io::tcp(ours).unwrap();
-        let read = spawn(move || input.read(&mut [0; 64]).map_err(|e| e.kind()));
-        thread::sleep(Duration::from_millis(10));
-        drop(cancel);
-        assert!(matches!(read(), Ok(0) | Err(_)));
+        fn test<S: Socket>() {
+            let (ours, _theirs) = S::pair();
+            let Io {
+                mut input, cancel, ..
+            } = ours.io();
+            let read = spawn(move || input.read(&mut [0; 64]).map_err(|e| e.kind()));
+            thread::sleep(Duration::from_millis(10));
+            drop(cancel);
+            assert!(matches!(read(), Ok(0) | Err(_)));
+        }
+        on_every_socket!(test);
     }
 
     #[test]
-    fn only_tcp_has_something_to_cancel() {
+    fn only_sockets_have_something_to_cancel() {
         assert!(Io::stdio().cancel.is_none());
         assert!(Io::new(io::empty(), io::sink()).cancel.is_none());
     }

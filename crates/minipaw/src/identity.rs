@@ -21,7 +21,9 @@ use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use hkdf::Hkdf;
 use minip2p::{Ed25519Keypair, PeerAddr, PeerId};
+use sha2::Sha256;
 
 use crate::Error;
 use crate::ticket::Ticket;
@@ -30,6 +32,8 @@ use crate::wire::Token;
 const HEADER: &str = "minipaw identity v1";
 /// Longer files are not identities; reading stops there.
 const MAX_LEN: u64 = 256;
+/// Separates the SSH host key from anything else derived from the key.
+const SSH_HOST_KEY_INFO: &[u8] = b"minipaw/ssh-host-key/v1";
 
 /// A listener's persistent key pair and ticket token. Run with the same
 /// identity ([`Config::identity`](crate::Config::identity)) and relay, and
@@ -151,6 +155,23 @@ impl Identity {
     /// fits in a ticket.
     pub fn ticket(&self, relay: Option<&PeerAddr>) -> Ticket {
         Ticket::listener(self.peer_id(), self.token, relay)
+    }
+
+    /// The Ed25519 seed of the SSH host key a listener with this identity
+    /// presents.
+    ///
+    /// **Secret**: whoever has it can pose as this host, so never log,
+    /// print or show it. It is derived from the identity's secret key
+    /// (HKDF-SHA256, info `minipaw/ssh-host-key/v1`) and is not that key,
+    /// so the host key never signs with the key the transport uses. Like the
+    /// ticket, it stays the same as long as the identity does, and changes
+    /// when the identity is rotated (`serve --new`).
+    pub fn ssh_host_seed(&self) -> [u8; 32] {
+        let mut seed = [0u8; 32];
+        Hkdf::<Sha256>::new(None, &self.key.secret_key_bytes())
+            .expand(SSH_HOST_KEY_INFO, &mut seed)
+            .expect("32 bytes is a valid HKDF-SHA256 length");
+        seed
     }
 
     pub(crate) fn key(&self) -> &Ed25519Keypair {
@@ -516,6 +537,34 @@ mod tests {
             !debug.contains(&secret) && debug.contains("peer_id"),
             "{debug}"
         );
+    }
+
+    #[test]
+    fn the_ssh_host_seed_is_derived_from_the_key() {
+        let mut secret = [0u8; 32];
+        for (i, byte) in secret.iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        let identity = Identity {
+            key: Ed25519Keypair::from_secret_key_bytes(secret),
+            token: [0xaa; 16],
+        };
+        // HKDF-SHA256(ikm = 00 01 .. 1f, no salt, info
+        // "minipaw/ssh-host-key/v1"), computed with Python's hmac and
+        // hashlib.
+        assert_eq!(
+            hex(&identity.ssh_host_seed()),
+            "fe5b559896ce61bbbb6e81d62804ecca2cb675e67468cbfa6b3d0ee8b896b37a"
+        );
+        // The token plays no part; the key does.
+        let other_token = Identity {
+            token: [0x55; 16],
+            ..identity.clone()
+        };
+        assert_eq!(other_token.ssh_host_seed(), identity.ssh_host_seed());
+        let other = Identity::generate().expect("generate");
+        assert_ne!(other.ssh_host_seed(), identity.ssh_host_seed());
+        assert_ne!(other.ssh_host_seed(), other.key.secret_key_bytes());
     }
 
     #[test]
