@@ -610,8 +610,8 @@ impl Pipe {
     }
 
     /// After a clean end, once the output has finished: ends a read still
-    /// blocked on an [`Io::tcp`] socket. Idempotent; a no-op for other
-    /// `Io`s.
+    /// blocked on an [`Io::tcp`] or `Io::unix` socket. Idempotent; a no-op
+    /// for other `Io`s.
     pub fn cancel_clean(&mut self) {
         if let Some(cancel) = self.cancel.take() {
             cancel.clean();
@@ -619,7 +619,7 @@ impl Pipe {
     }
 
     /// After a stop or a failure, once the output had its grace: shuts an
-    /// [`Io::tcp`] socket down both ways, ending a blocked read and a
+    /// [`Io::tcp`] or `Io::unix` socket down both ways, ending a blocked read and a
     /// write to a target that stopped reading. Idempotent; a no-op for
     /// other `Io`s, and what dropping the pipe does if neither ran.
     pub fn cancel_abort(&mut self) {
@@ -724,7 +724,7 @@ mod tests {
     use std::sync::mpsc::RecvTimeoutError;
 
     use super::*;
-    use crate::io::tests::tcp_pair;
+    use crate::io::tests::{Socket, on_every_socket};
     use crate::window::WINDOW;
 
     /// Yields the chunks sent to it, then blocks until the sender is gone,
@@ -819,38 +819,101 @@ mod tests {
     }
 
     #[test]
-    fn peer_fin_half_closes_a_tcp_output_while_replies_keep_flowing() {
-        let (ours, mut theirs) = tcp_pair();
-        let mut pipe = pipe(Io::tcp(ours).unwrap());
-        pipe.on_frame(Frame::Data(b"request".to_vec())).unwrap();
-        pipe.on_frame(Frame::Fin { offset: 7 }).unwrap();
-        // EOF arrives without the pipe finishing.
-        theirs
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut got = Vec::new();
-        theirs.read_to_end(&mut got).unwrap();
-        assert_eq!(got, b"request");
+    fn peer_fin_half_closes_a_socket_output_while_replies_keep_flowing() {
+        fn test<S: Socket>() {
+            let (ours, mut theirs) = S::pair();
+            let mut pipe = pipe(ours.io());
+            pipe.on_frame(Frame::Data(b"request".to_vec())).unwrap();
+            pipe.on_frame(Frame::Fin { offset: 7 }).unwrap();
+            // EOF arrives without the pipe finishing.
+            let mut got = Vec::new();
+            theirs.read_to_end(&mut got).unwrap();
+            assert_eq!(got, b"request");
 
-        theirs.write_all(b"reply").unwrap();
-        theirs.shutdown(std::net::Shutdown::Write).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while pipe.stdin_open {
-            assert!(Instant::now() < deadline, "reply never ended");
-            pipe.pull_stdin();
-            thread::yield_now();
+            theirs.write_all(b"reply").unwrap();
+            theirs.shut(std::net::Shutdown::Write);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while pipe.stdin_open {
+                assert!(Instant::now() < deadline, "reply never ended");
+                pipe.pull_stdin();
+                thread::yield_now();
+            }
+            assert_eq!(pipe.out.next_chunk().as_deref(), Some(&b"reply"[..]));
+            pipe.finish(None);
+            assert!(pipe.take_failure().is_none());
         }
-        assert_eq!(pipe.out.next_chunk().as_deref(), Some(&b"reply"[..]));
-        pipe.finish(None);
-        assert!(pipe.take_failure().is_none());
+        on_every_socket!(test);
     }
 
     #[test]
-    fn unclean_finish_ends_threads_blocked_on_a_tcp_target() {
+    fn a_clean_finish_ends_the_input_thread_of_a_target_still_open() {
+        fn test<S: Socket>() {
+            // The target neither sends nor closes.
+            let (ours, _theirs) = S::pair();
+            let mut pipe = pipe(ours.io());
+            pipe.on_frame(Frame::Fin { offset: 0 }).unwrap();
+            pipe.finish(None);
+            match pipe.stdin.recv_timeout(Duration::from_secs(10)) {
+                Ok(Input::Eof) | Err(RecvTimeoutError::Disconnected) => {}
+                Ok(Input::Data(_)) => panic!("the target sent nothing"),
+                Err(RecvTimeoutError::Timeout) => panic!("input still blocked"),
+            }
+        }
+        on_every_socket!(test);
+    }
+
+    /// A target that won't read until it has written, like a russh server,
+    /// still gets its writes through while ours to it are blocked.
+    #[cfg(unix)]
+    #[test]
+    fn input_keeps_flowing_while_output_to_a_unix_target_is_blocked() {
+        use std::os::unix::net::UnixStream;
+
+        let (ours, theirs) = <UnixStream as Socket>::pair();
+        let mut pipe = pipe(ours.io());
+        // A full window is far more than a Unix socket buffers.
+        for _ in 0..WINDOW / MAX_DATA {
+            pipe.on_frame(Frame::Data(vec![1; MAX_DATA])).unwrap();
+        }
+        // Bytes waiting for the target show the writer has started; once
+        // their count holds still for a while, its write is blocked.
+        let queued = || rustix::io::ioctl_fionread(&theirs).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut last, mut still) = (0, 0);
+        while still < 4 {
+            assert!(Instant::now() < deadline, "the writer never blocked");
+            thread::sleep(Duration::from_millis(50));
+            let now = queued();
+            still = if now > 0 && now == last { still + 1 } else { 0 };
+            last = now;
+        }
+
+        (&theirs).write_all(b"reply").unwrap();
+        let mut got = Vec::new();
+        while got.len() < 5 {
+            assert!(Instant::now() < deadline, "reply never read");
+            pipe.pull_stdin();
+            while let Some(chunk) = pipe.out.next_chunk() {
+                got.extend_from_slice(&chunk);
+            }
+            thread::yield_now();
+        }
+        assert_eq!(got, b"reply");
+        // The target reads nothing, so the writer can never finish.
+        assert!(pipe.written() < WINDOW as u64);
+        pipe.finish(Some(Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn unclean_finish_ends_threads_blocked_on_a_socket_target() {
+        on_every_socket!(unclean_finish_ends_threads_blocked_on);
+    }
+
+    fn unclean_finish_ends_threads_blocked_on<S: Socket>() {
         for _ in 0..10 {
             // The target neither reads nor sends.
-            let (ours, _theirs) = tcp_pair();
-            let mut pipe = pipe(Io::tcp(ours).unwrap());
+            let (ours, _theirs) = S::pair();
+            let mut pipe = pipe(ours.io());
             for _ in 0..WINDOW / MAX_DATA {
                 pipe.on_frame(Frame::Data(vec![1; MAX_DATA])).unwrap();
             }
