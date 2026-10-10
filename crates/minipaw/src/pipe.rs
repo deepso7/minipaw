@@ -862,6 +862,45 @@ mod tests {
         on_every_socket!(test);
     }
 
+    /// A target that won't read until it has written, like a russh server,
+    /// still gets its writes through while ours to it are blocked.
+    #[cfg(unix)]
+    #[test]
+    fn input_keeps_flowing_while_output_to_a_unix_target_is_blocked() {
+        use std::os::unix::net::UnixStream;
+
+        let (ours, mut theirs) = <UnixStream as Socket>::pair();
+        let mut pipe = pipe(ours.io());
+        // A full window is far more than a Unix socket buffers.
+        let total = WINDOW / MAX_DATA * MAX_DATA;
+        for _ in 0..WINDOW / MAX_DATA {
+            pipe.on_frame(Frame::Data(vec![1; MAX_DATA])).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last = u64::MAX;
+        // Wait for the writer to stall.
+        while pipe.written() != last {
+            assert!(Instant::now() < deadline, "writer never stalled");
+            last = pipe.written();
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(last < total as u64, "the socket took the whole window");
+
+        theirs.write_all(b"reply").unwrap();
+        let mut got = Vec::new();
+        while got.len() < 5 {
+            assert!(Instant::now() < deadline, "reply never read");
+            pipe.pull_stdin();
+            while let Some(chunk) = pipe.out.next_chunk() {
+                got.extend_from_slice(&chunk);
+            }
+            thread::yield_now();
+        }
+        assert_eq!(got, b"reply");
+        assert_eq!(pipe.written(), last, "the writer was still blocked");
+        pipe.finish(Some(Duration::from_millis(50)));
+    }
+
     #[test]
     fn unclean_finish_ends_threads_blocked_on_a_socket_target() {
         on_every_socket!(unclean_finish_ends_threads_blocked_on);
