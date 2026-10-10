@@ -869,27 +869,28 @@ mod tests {
     fn input_keeps_flowing_while_output_to_a_unix_target_is_blocked() {
         use std::os::unix::net::UnixStream;
 
-        let (ours, mut theirs) = <UnixStream as Socket>::pair();
-        let probe = ours.try_clone().unwrap();
-        // Whether the socket's buffer is full, so a write to it blocks. A
-        // byte that fits is harmless: the target never reads.
-        let full = || match rustix::net::send(&probe, &[0], rustix::net::SendFlags::DONTWAIT) {
-            Ok(_) => false,
-            Err(e) if e == rustix::io::Errno::AGAIN => true,
-            Err(e) => panic!("probe: {e}"),
-        };
+        let (ours, theirs) = <UnixStream as Socket>::pair();
         let mut pipe = pipe(ours.io());
         // A full window is far more than a Unix socket buffers.
         for _ in 0..WINDOW / MAX_DATA {
             pipe.on_frame(Frame::Data(vec![1; MAX_DATA])).unwrap();
         }
+        // Bytes waiting for the target show the writer has started; once
+        // their count stops growing, its write is blocked.
+        let queued = || rustix::io::ioctl_fionread(&theirs).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !full() {
-            assert!(Instant::now() < deadline, "the socket never filled");
-            thread::sleep(Duration::from_millis(10));
+        let mut last = 0;
+        loop {
+            assert!(Instant::now() < deadline, "the writer never blocked");
+            thread::sleep(Duration::from_millis(50));
+            let now = queued();
+            if now > 0 && now == last {
+                break;
+            }
+            last = now;
         }
 
-        theirs.write_all(b"reply").unwrap();
+        (&theirs).write_all(b"reply").unwrap();
         let mut got = Vec::new();
         while got.len() < 5 {
             assert!(Instant::now() < deadline, "reply never read");
@@ -900,8 +901,8 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(got, b"reply");
-        // Nothing drained the socket, so the writer is still blocked.
-        assert!(full());
+        // The target read nothing, so the writer is still blocked.
+        assert_eq!(queued(), last);
         assert!(pipe.written() < WINDOW as u64);
         pipe.finish(Some(Duration::from_millis(50)));
     }

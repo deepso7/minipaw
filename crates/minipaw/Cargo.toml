@@ -21,9 +21,5 @@ sha2.workspace = true
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 
-[target.'cfg(unix)'.dev-dependencies]
-# Probing whether a test socket's send buffer is full.
-rustix = { workspace = true, features = ["net"] }
-
 [lints]
 workspace = true
