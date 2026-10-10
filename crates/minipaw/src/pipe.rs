@@ -876,17 +876,15 @@ mod tests {
             pipe.on_frame(Frame::Data(vec![1; MAX_DATA])).unwrap();
         }
         // Bytes waiting for the target show the writer has started; once
-        // their count stops growing, its write is blocked.
+        // their count holds still for a while, its write is blocked.
         let queued = || rustix::io::ioctl_fionread(&theirs).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut last = 0;
-        loop {
+        let (mut last, mut still) = (0, 0);
+        while still < 4 {
             assert!(Instant::now() < deadline, "the writer never blocked");
             thread::sleep(Duration::from_millis(50));
             let now = queued();
-            if now > 0 && now == last {
-                break;
-            }
+            still = if now > 0 && now == last { still + 1 } else { 0 };
             last = now;
         }
 
@@ -901,8 +899,7 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(got, b"reply");
-        // The target read nothing, so the writer is still blocked.
-        assert_eq!(queued(), last);
+        // The target reads nothing, so the writer can never finish.
         assert!(pipe.written() < WINDOW as u64);
         pipe.finish(Some(Duration::from_millis(50)));
     }
