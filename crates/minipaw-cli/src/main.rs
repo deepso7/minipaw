@@ -6,7 +6,6 @@ mod args;
 mod serve;
 mod ssh;
 #[cfg(all(unix, feature = "ssh-server"))]
-#[allow(dead_code)] // not wired into `serve` yet
 mod sshd;
 mod ui;
 
@@ -47,6 +46,9 @@ fn main() -> ExitCode {
             new,
             max_sessions,
             relay,
+            ssh,
+            authorized_keys,
+            no_auth,
         }) => {
             ui::log::install(args.verbose, false);
             return serve::run(&serve::Options {
@@ -55,6 +57,9 @@ fn main() -> ExitCode {
                 new: *new,
                 max_sessions: *max_sessions,
                 relay: relay.as_deref(),
+                ssh: *ssh,
+                authorized_keys,
+                no_auth: *no_auth,
             });
         }
         Some(Command::Ssh { args }) => return ssh::run(ssh::Tool::Ssh, args),

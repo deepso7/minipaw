@@ -1,5 +1,6 @@
 //! `minipaw serve`: a server with a stable ticket that forwards every
-//! session to a local TCP port, such as sshd's.
+//! session to a local TCP port, such as sshd's, or with `--ssh` answers it
+//! with a built-in SSH server (`sshd`).
 //!
 //! It is a daemon, so it never draws a UI: it prints plain `#` lines on
 //! stderr, the same whether that is a terminal, a pipe or a journal. Its
@@ -8,7 +9,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,10 @@ pub struct Options<'a> {
     pub new: bool,
     pub max_sessions: usize,
     pub relay: Option<&'a str>,
+    /// `--ssh`, which replaces `forward`, and its flags.
+    pub ssh: bool,
+    pub authorized_keys: &'a [PathBuf],
+    pub no_auth: bool,
 }
 
 /// Serves until Ctrl-C (exit 0); a second Ctrl-C exits 130 at once.
@@ -47,6 +52,10 @@ pub fn run(options: &Options<'_>) -> ExitCode {
 fn serve(options: &Options<'_>) -> Result<(), String> {
     let settings = args::serve_config(options.relay, options.max_sessions)?;
     let mut config = settings.config;
+    // The SSH server replaces the target; there is nothing to resolve.
+    if options.ssh {
+        return serve_ssh(options, config);
+    }
     let targets = options.forward.resolve()?;
     let (identity, path, created) = args::load_identity(options.identity, options.new)?;
     config.identity = Some(identity);
@@ -55,12 +64,51 @@ fn serve(options: &Options<'_>) -> Result<(), String> {
 
     let delay = settings.connect_delay;
     let server = minipaw::serve(config, move |peer| connect(peer, &targets, delay));
+    run_server(server)?;
+    eprintln!("# stopped");
+    Ok(())
+}
+
+/// Serves with the built-in SSH server. Its logins are stopped on every
+/// way out, a failed start of the server included.
+#[cfg(all(unix, feature = "ssh-server"))]
+fn serve_ssh(options: &Options<'_>, mut config: minipaw::Config) -> Result<(), String> {
+    use crate::sshd;
+
+    let setup = sshd::Setup::load(&sshd::Options {
+        authorized_keys: options.authorized_keys,
+        no_auth: options.no_auth,
+    })?;
+    let (identity, path, created) = args::load_identity(options.identity, options.new)?;
+    let host_seed = identity.ssh_host_seed();
+    config.identity = Some(identity);
+    eprintln!("{}", args::identity_line(&path, created));
+    for line in &setup.lines {
+        eprintln!("{line}");
+    }
+    let sshd = sshd::Sshd::start(setup, &host_seed)?;
+    let acceptor = sshd.acceptor();
+    let server = minipaw::serve(config, move |peer| acceptor.accept(peer));
+    let result = run_server(server);
+    drop(sshd);
+    result?;
+    eprintln!("# stopped");
+    Ok(())
+}
+
+/// Without the SSH server, `--ssh` is already a usage error.
+#[cfg(not(all(unix, feature = "ssh-server")))]
+fn serve_ssh(options: &Options<'_>, _: minipaw::Config) -> Result<(), String> {
+    let _ = (options.authorized_keys, options.no_auth);
+    Err("--ssh needs a minipaw built with the ssh-server feature, on Unix".into())
+}
+
+/// Runs `server` until Ctrl-C, printing its events.
+fn run_server(server: minipaw::Server) -> Result<(), String> {
     let mut printer = Printer::default();
     let server = server.on_event(move |event| printer.print(event));
     term::install_interrupts(server.handle())?;
-    server.run().map_err(|e| e.to_string())?;
-    eprintln!("# stopped");
-    Ok(())
+    server.run().map_err(|e| e.to_string())
 }
 
 /// `127.0.0.1:22`, or `localhost:22 (127.0.0.1:22)` for a name.
