@@ -1,0 +1,27 @@
+---
+title: Your own relay
+description: Run your own minip2p relay instead of the hosted relay.minip2p.com, and point minipaw at it with --relay or MINIPAW_RELAY.
+---
+
+By default minipaw meets through the hosted relay at `relay.minip2p.com`. To
+use your own, run
+[`minip2p-relay`](https://github.com/deepso7/minip2p/tree/main/examples/relay-server)
+somewhere public, then point the listener at it:
+
+```sh
+minipaw --relay /dns/relay.example.com/udp/19876/quic-v1/p2p/12D3KooW…
+# or: export MINIPAW_RELAY=…
+```
+
+The ticket embeds a non-default relay, so clients need no flag. Relays must be
+QUIC addresses.
+
+## Circuit limits
+
+With the relay's default limits a circuit carries only 128 KiB each way, which
+is fine when hole punching succeeds. For peers that can't punch through, run
+the relay with:
+
+```sh
+--max-circuit-bytes 0 --max-circuit-duration 0 --circuit-peer-rate off
+```

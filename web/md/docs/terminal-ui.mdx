@@ -1,0 +1,21 @@
+---
+title: Terminal UI
+description: minipaw picks how to show status from where its streams point, a status panel, a chat view, plain lines or nothing, and never mixes status into stdout.
+---
+
+minipaw picks how to show status from where its streams point. Nothing but
+data ever goes to stdout.
+
+| Mode | When | What you see |
+| --- | --- | --- |
+| **Status panel** | stdout is redirected or piped, and stderr is a terminal, as when sending or receiving a file | A small panel on stderr: the ticket, the connection state, relay or direct, bytes sent and received, rates, and an ETA when sending a regular file. |
+| **Chat** | stdin and stdout are both terminals | The conversation prints into your terminal's normal scrollback, above a small input box with the connection state and traffic. Enter sends, Ctrl-D ends your side, Ctrl-C stops. |
+| **Plain lines** | stderr isn't a terminal, or `--plain` | `#` status lines. This is what scripts and logs see. |
+| **Nothing** | `-q` | Only a fatal error prints, not even `-v`'s log. |
+
+The panel and chat need stderr to be a terminal, `TERM` set to something
+other than `dumb`, and a terminal of at least 40×8. The chat also needs raw
+mode to work. Otherwise minipaw falls back to plain lines.
+
+[`minipaw serve`](/docs/ssh) always prints plain `#` lines, so it runs as is
+under systemd or nohup.

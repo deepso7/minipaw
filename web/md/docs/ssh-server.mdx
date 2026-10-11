@@ -1,0 +1,106 @@
+---
+title: Built-in SSH server
+description: minipaw serve --ssh answers each session with an SSH server inside minipaw, with scp and sftp, for machines with no sshd or where you can't run one.
+---
+
+On a machine with no sshd, or where you can't run one, `minipaw serve --ssh`
+answers each session with an SSH server inside minipaw, as the user running
+it, with no setup. [`minipaw ssh`](/docs/ssh#connect) connects to it the same
+way.
+
+```console
+$ minipaw serve --ssh
+# identity: /home/me/.config/minipaw/serve.key (existing)
+# ssh: built-in server as me, 2 keys
+# 🐾 listening; connect with:
+minipaw mpAQ…
+# ssh: minipaw ssh user@mpAQ…
+```
+
+The built-in server is Unix only.
+
+## Who gets in
+
+A key in `~/.ssh/authorized_keys` of the serving user gets in, as does one in
+the files given with `--authorized-keys PATH` (repeatable).
+
+- Keys are read once at startup, so restart serve to apply edits and
+  revocations.
+- ed25519 and ecdsa keys work. RSA, DSA and security-key (`sk-*`) lines are
+  skipped with a warning.
+- A line with options (`command=`, `from=`, `restrict`, …) or
+  `cert-authority` is an error, so nothing is quietly loosened.
+- The file and every directory above it must be owned by you or root and not
+  be writable by anyone else, as sshd's StrictModes requires. So must the
+  directory holding any symlink on the way, and the directories above it.
+
+:::danger[--no-auth]
+`--no-auth` accepts anyone who reaches the server: **the ticket is the only
+credential**, and whoever has it gets a shell as you. serve says so on every
+start. `SSH_PEER_ID` in the shell is the dialer's peer ID, which under
+`--no-auth` it may have made up, so use it for logs only.
+:::
+
+## Sessions
+
+Every login runs as the serving user, whatever user name the client asks for
+(it is logged, nothing more). You get your shell from the passwd entry, in
+your home directory, with a clean environment: `HOME`, `USER`, `LOGNAME`,
+`SHELL`, `PATH`, `TERM` with a PTY, `SSH_CONNECTION` and `SSH_PEER_ID`.
+
+`-v` logs each login: the key, the user name asked for, and what ran.
+
+## scp and sftp
+
+The server has a built-in SFTP subsystem, which plain `scp` (`minipaw cp`)
+uses since OpenSSH 9.0, as do `sftp` and other SFTP clients (give them the
+[ProxyCommand](/docs/ssh#other-tools)). `scp -O` works too, through your
+shell.
+
+SFTP serves your files as you: relative paths start at your home directory,
+and absolute paths reach anywhere you can. **It is not a sandbox**, no more
+than the shell is.
+
+## Host key
+
+The host key is derived from serve's identity, so it stays the same as long
+as the ticket does and changes with `serve --new`.
+
+The server that plain `serve` forwards to, usually the machine's sshd, has
+its own key. Switching one ticket between `serve` and `serve --ssh` therefore
+makes ssh warn that the host key changed. Check the new fingerprint, then
+drop the old one with `ssh-keygen -R minipaw-<peer id>` (the name ssh shows).
+
+## Not supported, for now
+
+- In SFTP: changing a file's size or owner with `setstat` (only its mode and
+  times), OpenSSH's extensions (`posix-rename`, `statvfs`, `fsync`, hard
+  links, `~` expansion), and file names that are not UTF-8.
+- Port forwarding (`-L`, `-R`, `-D`), agent and X11 forwarding, sending
+  environment variables, forced commands, compression, and password or
+  certificate logins.
+- More than one session per connection, so OpenSSH's `ControlMaster`
+  multiplexing does not work. Each `ssh` run opens its own connection, as it
+  does by default.
+- Logging in as another user, even when serve runs as root.
+- Windows.
+
+## Limits
+
+- Each session buffers at most 8 MiB of input its program has not read yet.
+  A sender that gets further ahead than that, such as `cat big.iso | ssh …
+  slow-program`, has its session closed with `minipaw: input exceeded 8 MiB
+  buffer, closing` rather than being slowed down. Interactive shells, git and
+  ordinary pipes stay far below it. The same goes for SFTP requests sent
+  ahead of their replies; scp and sftp keep about 2 MiB in flight.
+- An SFTP session has at most 256 files and directories open at once, a read
+  returns at most 255 KiB, and a request longer than 257 KiB ends the
+  session.
+- A connection has 20 s to log in.
+- When a session is cut short (the client closes it or goes away, or serve
+  stops), its program gets a hangup: SIGHUP (and SIGTERM without a PTY), then
+  SIGKILL to its process group 2 s later. A program that exits by itself gets
+  none of this, so background children it left behind (`sleep 1000
+  >/dev/null 2>&1 &`) keep running, as under sshd. So can anything that left
+  the session's process groups (`setsid`, `nohup … &` in its own job-control
+  group). A second Ctrl-C, which stops serve at once, skips this cleanup.
