@@ -1,0 +1,45 @@
+/* Grey · soft. Accent and background are set in blume.config.ts. */
+:root {
+  --blume-foreground: oklch(29.2% 0.014 310.9);
+  --blume-muted: oklch(94.6% 0.006 308.4);
+  --blume-muted-foreground: oklch(53% 0.017 312);
+  --blume-border: oklch(91.7% 0.007 312.3);
+  --blume-code-background: oklch(94.6% 0.006 308.4);
+}
+
+:root[data-theme="dark"] {
+  --blume-foreground: oklch(94.2% 0.004 301.4);
+  --blume-muted: oklch(24.2% 0.01 294.9);
+  --blume-muted-foreground: oklch(67.7% 0.014 310.5);
+  --blume-border: oklch(28.1% 0.011 300.9);
+  --blume-code-background: oklch(24.2% 0.01 294.9);
+}
+
+/* Blume tightens headings by -0.05em for proportional faces; a monospace
+   heading reads cramped with that much. */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  letter-spacing: -0.02em;
+}
+
+/* Wordmark: the brand title beside the paw, in a pixel face. */
+@font-face {
+  font-family: "Pixelify Sans";
+  font-weight: 600;
+  font-display: swap;
+  src: url("/fonts/pixelify-sans-600.woff2") format("woff2");
+}
+
+/* The header caps the mark at 20px; 26px puts each sprite pixel on 2 screen pixels. */
+.minipaw-logo {
+  height: 26px !important;
+}
+
+a:has(.minipaw-logo) > .truncate {
+  font-family: "Pixelify Sans", var(--blume-font-body);
+  font-size: 1.25rem;
+}
