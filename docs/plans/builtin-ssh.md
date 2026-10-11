@@ -678,6 +678,15 @@ Where PR 3 differs from the plan above, and why:
   either way. A test-only count of running channel
   supervisors lets the channel-close test see the supervisor end while
   the connection stays up.
+- **Writes are capped at 256 KiB** in the handler: a frame has room for a
+  little more, so the frame limit alone does not enforce it.
+- **Known gap: closes left at shutdown.** A descriptor waiting for a job
+  permit to be closed (all 64 taken, by stuck filesystem work) is owned by
+  an async task. When serve stops and the runtime drops that task, the
+  descriptor is closed wherever the drop happens, with no permit, so a
+  close stuck on NFS or FUSE could slow the exit. It needs a stuck
+  filesystem, every permit taken and a stop at once; fixing it would mean
+  blocking threads waiting for permits, which the permits exist to avoid.
 
 ## Risks
 

@@ -969,6 +969,11 @@ impl Handler for Fs {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<Status, StatusReply> {
+        // A frame has room for a little more; the cap is the cap.
+        if data.len() > MAX_WRITE as usize {
+            return Err(StatusCode::Failure
+                .with_message(format!("a write carries at most {MAX_WRITE} bytes")));
+        }
         let open = self.open_handle(&handle)?;
         let append = matches!(open, Open::File { append: true, .. });
         self.jobs
@@ -1478,6 +1483,31 @@ mod tests {
             .open(3, "none".into(), OpenFlags::WRITE, FileAttributes::empty())
             .await;
         assert_eq!(code(missing), StatusCode::NoSuchFile);
+    }
+
+    /// A write of more than [`MAX_WRITE`] is refused, though its frame
+    /// would fit; one of exactly that size goes through.
+    #[tokio::test]
+    async fn writes_are_capped() {
+        let dir = Scratch::new("writes");
+        let mut fs = dir.fs();
+        let flags = OpenFlags::WRITE | OpenFlags::CREATE;
+        let handle = fs
+            .open(1, "w".into(), flags, FileAttributes::empty())
+            .await
+            .expect("open")
+            .handle;
+        let over = vec![1; MAX_WRITE as usize + 1];
+        // Type, id, handle, offset and data length: well inside a frame.
+        assert!(1 + 4 + 4 + handle.len() + 8 + 4 + over.len() <= MAX_FRAME as usize);
+        let refused = fs.write(2, handle.clone(), 0, over).await;
+        assert_eq!(code(refused), StatusCode::Failure);
+        assert_eq!(std::fs::metadata(dir.0.join("w")).expect("stat").len(), 0);
+        fs.write(3, handle, 0, vec![1; MAX_WRITE as usize])
+            .await
+            .expect("write");
+        let written = std::fs::metadata(dir.0.join("w")).expect("stat").len();
+        assert_eq!(written, u64::from(MAX_WRITE));
     }
 
     #[tokio::test]
