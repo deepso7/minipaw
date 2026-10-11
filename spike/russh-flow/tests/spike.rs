@@ -120,6 +120,19 @@ fn spawn_writer(
     })
 }
 
+/// Waits up to 5 s for `n` channel supervisors, helpers and all, to have
+/// finished, so what is measured next is not cleanup still under way.
+async fn settled(server: &Server, n: u64) {
+    let done = &server.stats.supervisors_done;
+    timeout(Duration::from_secs(5), async {
+        while get(done) < n {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} of {n} supervisors finished", get(done)));
+}
+
 async fn run_simple(server: &Server, cmd: &str) -> Outcome {
     let (h, served) = conn(server, sc::config()).await;
     let ch = h.channel_open_session().await.unwrap();
@@ -196,6 +209,18 @@ async fn case1b_cat_with_slower_download() {
     assert!(st.max_buffered.load(Relaxed) < 4 * MIB);
 }
 
+/// How a withheld-window run ended.
+#[derive(Debug, PartialEq)]
+enum Withheld {
+    /// All of `cat`'s output and exit status 0 arrived.
+    Completed,
+    /// Nothing ended within 10 s of the window coming back: the deadlock.
+    Stuck,
+    /// Anything else (an early close, a wrong status, a failed task),
+    /// which proves neither.
+    Failed(String),
+}
+
 /// The #730 repro, A/B. `cat` with 8 MiB, and for the first 2 s the client
 /// grants no window for output while it keeps uploading, as OpenSSH does
 /// when its stdout is slow (`ssh h cat <big | slow`). A proxy holds back the
@@ -209,7 +234,7 @@ async fn case1b_cat_with_slower_download() {
 ///   WINDOW_ADJUSTs: the connection stays stuck for good.
 /// - the plan's design (read half dropped, capped callback buffer) buffers
 ///   the input and completes once window comes back.
-async fn cat_with_withheld_window(naive: bool, name: &str) -> bool {
+async fn cat_with_withheld_window(naive: bool, name: &str) -> Withheld {
     let start = Instant::now();
     let st = ProxyState::new(None);
     st.hold_adjusts.store(true, Relaxed);
@@ -241,13 +266,22 @@ async fn cat_with_withheld_window(naive: bool, name: &str) -> bool {
     eprintln!("released={released}");
     let out = timeout(Duration::from_secs(10), collector).await;
     let ss = &server.stats;
-    let completed =
-        matches!(&out, Ok(Ok(o)) if o.exit_status == Some(0) && o.stdout_len == total as u64);
+    let outcome = match &out {
+        Ok(Ok(o)) if o.exit_status == Some(0) && o.stdout_len == total as u64 => {
+            Withheld::Completed
+        }
+        Err(_) => Withheld::Stuck,
+        Ok(Ok(o)) => Withheld::Failed(format!(
+            "ended early: exit={:?} stdout={}",
+            o.exit_status, o.stdout_len
+        )),
+        Ok(Err(e)) => Withheld::Failed(format!("collector failed: {e}")),
+    };
     report(
         name,
         start,
         &format!(
-            "completed={completed} adjusts_held={held} server_in={} server_out={} max_buffered={} cap_trips={}",
+            "outcome={outcome:?} adjusts_held={held} server_in={} server_out={} max_buffered={} cap_trips={}",
             get(&ss.input_bytes),
             get(&ss.reserved_out),
             ss.max_buffered.load(Relaxed),
@@ -255,7 +289,7 @@ async fn cat_with_withheld_window(naive: bool, name: &str) -> bool {
         ),
     );
     writer.abort();
-    completed
+    outcome
 }
 
 #[cfg_attr(
@@ -264,8 +298,9 @@ async fn cat_with_withheld_window(naive: bool, name: &str) -> bool {
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn case1c_naive_read_half_deadlocks() {
-    assert!(
-        !cat_with_withheld_window(true, "1c-withheld-window-naive").await,
+    assert_eq!(
+        cat_with_withheld_window(true, "1c-withheld-window-naive").await,
+        Withheld::Stuck,
         "naive design did not deadlock"
     );
 }
@@ -276,7 +311,10 @@ async fn case1c_naive_read_half_deadlocks() {
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn case1d_plan_design_survives_withheld_window() {
-    assert!(cat_with_withheld_window(false, "1d-withheld-window-plan").await);
+    assert_eq!(
+        cat_with_withheld_window(false, "1d-withheld-window-plan").await,
+        Withheld::Completed
+    );
 }
 
 /// Case 1 with the russh client wired straight to the russh server: both
@@ -415,6 +453,7 @@ async fn case3_slow_consumer_100mb_trips_cap() {
         .unwrap();
 
     let second = run_simple(&server, "echo ok").await;
+    settled(&server, 2).await;
     report(
         "3-slow-100MB-cap",
         start,
@@ -681,6 +720,12 @@ async fn case6_window_adjust_while_output_queued() {
     assert_eq!(out.exit_status, Some(7));
     assert!(out.eof && out.closed);
     assert!(get(&st.adjusts_held) > 0);
+    // The run only counts as a repro if B happened: credit taken past the
+    // window the client granted.
+    assert!(
+        ss.overcommit_max.load(Relaxed) > 0,
+        "issue B not reproduced"
+    );
 }
 
 /// The 16-bytes-on-9-credit probe for the upstream B report: the client
@@ -736,6 +781,10 @@ async fn case6b_probe_16_bytes_on_9_credit() {
     assert_eq!(out.stdout_len, 32_000);
     assert_eq!(out.stderr.len(), 32_000);
     assert_eq!(out.exit_status, Some(0));
+    assert!(
+        ss.overcommit_max.load(Relaxed) > 0,
+        "issue B not reproduced"
+    );
 }
 
 /// Case 7 (russh issue C): 1,000 sequential connections, each running a
@@ -757,6 +806,7 @@ async fn case7_thousand_connections_flat_memory() {
         .unwrap_or(1000);
     for i in 0..=n {
         if i % (n / 10).max(1) == 0 {
+            settled(&server, u64::from(i)).await;
             samples.push((i, rss_kib()));
             fds.push((i, fd_count()));
         }
@@ -768,13 +818,6 @@ async fn case7_thousand_connections_flat_memory() {
         assert_eq!(out.stdout_len, 3);
     }
     let st = &server.stats;
-    timeout(Duration::from_secs(5), async {
-        while get(&st.supervisors_done) < u64::from(n) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
     let base = samples[1].1; // after warm-up (the first tenth)
     let last = samples.last().unwrap().1;
     report(
