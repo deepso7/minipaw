@@ -25,7 +25,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Component, Path, PathBuf};
@@ -510,10 +510,29 @@ impl Drop for Jobs {
 
 /// What a handle names: an open file or directory, by descriptor, so a
 /// rename under it changes nothing.
-struct Open {
-    fd: Arc<OwnedFd>,
-    /// A directory's listing, read a page at a time.
-    entries: Option<Arc<Mutex<Dir>>>,
+#[derive(Clone)]
+enum Open {
+    File {
+        fd: Arc<OwnedFd>,
+        /// Opened with APPEND: writes go to the end, whatever their offset.
+        append: bool,
+    },
+    /// A directory stream, owning the directory's only descriptor and read
+    /// a page at a time.
+    Dir(Arc<Mutex<Dir>>),
+}
+
+impl Open {
+    /// Runs `f` on the handle's descriptor.
+    fn with_fd<T>(&self, f: impl FnOnce(BorrowedFd<'_>) -> io::Result<T>) -> io::Result<T> {
+        match self {
+            Open::File { fd, .. } => f(fd.as_fd()),
+            Open::Dir(dir) => {
+                let dir = dir.lock().unwrap_or_else(PoisonError::into_inner);
+                f(dir.fd()?)
+            }
+        }
+    }
 }
 
 /// The SFTP requests, on the serving user's files.
@@ -523,6 +542,8 @@ pub struct Fs {
     handles: HashMap<String, Open>,
     next: u64,
     jobs: Jobs,
+    /// [`MAX_HANDLES`], but for tests.
+    max_handles: usize,
 }
 
 impl Fs {
@@ -532,6 +553,7 @@ impl Fs {
             handles: HashMap::new(),
             next: 0,
             jobs,
+            max_handles: MAX_HANDLES,
         }
     }
 
@@ -541,7 +563,7 @@ impl Fs {
     }
 
     fn room(&self) -> Result<(), StatusReply> {
-        if self.handles.len() >= MAX_HANDLES {
+        if self.handles.len() >= self.max_handles {
             return Err(StatusCode::Failure.with_message("too many open handles"));
         }
         Ok(())
@@ -554,9 +576,8 @@ impl Fs {
         handle
     }
 
-    fn fd(&self, handle: &str) -> Result<Arc<OwnedFd>, StatusReply> {
-        let open = self.handles.get(handle).ok_or_else(bad_handle)?;
-        Ok(open.fd.clone())
+    fn open_handle(&self, handle: &str) -> Result<Open, StatusReply> {
+        self.handles.get(handle).cloned().ok_or_else(bad_handle)
     }
 }
 
@@ -726,13 +747,26 @@ fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
         Err(e @ (Errno::INVAL | Errno::NOSYS | Errno::NOTSUP)) => e,
         Err(e) => return Err(e.into()),
     };
+    rename_by_link(from, to, err)
+}
+
+/// [`rename_new`] where the filesystem cannot rename without replacing:
+/// link `to`, then unlink `from`. If the unlink fails, the new link is
+/// removed again and the unlink's error returned, as sftp-server does, so
+/// a retry does not find `to` in its way. A directory, which cannot be
+/// linked, gets `unsupported`.
+fn rename_by_link(from: &Path, to: &Path, unsupported: Errno) -> io::Result<()> {
+    let cwd = rustix::fs::CWD;
     let is_dir =
         rustix::fs::lstat(from).is_ok_and(|stat| bits(stat.st_mode) & 0o170_000 == 0o040_000);
     if is_dir {
-        return Err(err.into());
+        return Err(unsupported.into());
     }
     rustix::fs::linkat(cwd, from, cwd, to, AtFlags::empty())?;
-    rustix::fs::unlinkat(cwd, from, AtFlags::empty())?;
+    if let Err(e) = rustix::fs::unlinkat(cwd, from, AtFlags::empty()) {
+        let _ = rustix::fs::unlinkat(cwd, to, AtFlags::empty());
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -789,9 +823,9 @@ impl Handler for Fs {
             .jobs
             .run(move || Ok(rustix::fs::open(&path, flags, mode)?))
             .await?;
-        let handle = self.add(Open {
+        let handle = self.add(Open::File {
             fd: Arc::new(fd),
-            entries: None,
+            append: pflags.contains(OpenFlags::APPEND),
         });
         Ok(Handle { id, handle })
     }
@@ -809,23 +843,25 @@ impl Handler for Fs {
         offset: u64,
         len: u32,
     ) -> Result<Data, StatusReply> {
-        let fd = self.fd(&handle)?;
+        let open = self.open_handle(&handle)?;
         let len = len.min(MAX_READ) as usize;
         let data = self
             .jobs
             .run(move || {
-                let mut data = vec![0; len];
-                let mut got = 0;
-                while got < len {
-                    match rustix::io::pread(&*fd, &mut data[got..], offset + got as u64) {
-                        Ok(0) => break,
-                        Ok(n) => got += n,
-                        Err(Errno::INTR) => {}
-                        Err(e) => return Err(e.into()),
+                open.with_fd(|fd| {
+                    let mut data = vec![0; len];
+                    let mut got = 0;
+                    while got < len {
+                        match rustix::io::pread(fd, &mut data[got..], offset + got as u64) {
+                            Ok(0) => break,
+                            Ok(n) => got += n,
+                            Err(Errno::INTR) => {}
+                            Err(e) => return Err(e.into()),
+                        }
                     }
-                }
-                data.truncate(got);
-                Ok(data)
+                    data.truncate(got);
+                    Ok(data)
+                })
             })
             .await?;
         if data.is_empty() && len > 0 {
@@ -841,19 +877,30 @@ impl Handler for Fs {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<Status, StatusReply> {
-        let fd = self.fd(&handle)?;
+        let open = self.open_handle(&handle)?;
+        let append = matches!(open, Open::File { append: true, .. });
         self.jobs
             .run(move || {
-                let mut sent = 0;
-                while sent < data.len() {
-                    match rustix::io::pwrite(&*fd, &data[sent..], offset + sent as u64) {
-                        Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                        Ok(n) => sent += n,
-                        Err(Errno::INTR) => {}
-                        Err(e) => return Err(e.into()),
+                open.with_fd(|fd| {
+                    let mut sent = 0;
+                    while sent < data.len() {
+                        // An append handle writes at the end: write(2) on
+                        // O_APPEND does that everywhere, but pwrite(2)
+                        // ignores O_APPEND on macOS and honours it on Linux.
+                        let wrote = if append {
+                            rustix::io::write(fd, &data[sent..])
+                        } else {
+                            rustix::io::pwrite(fd, &data[sent..], offset + sent as u64)
+                        };
+                        match wrote {
+                            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                            Ok(n) => sent += n,
+                            Err(Errno::INTR) => {}
+                            Err(e) => return Err(e.into()),
+                        }
                     }
-                }
-                Ok(())
+                    Ok(())
+                })
             })
             .await?;
         Ok(ok(id))
@@ -869,8 +916,11 @@ impl Handler for Fs {
     }
 
     async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, StatusReply> {
-        let fd = self.fd(&handle)?;
-        let stat = self.jobs.run(move || Ok(rustix::fs::fstat(&*fd)?)).await?;
+        let open = self.open_handle(&handle)?;
+        let stat = self
+            .jobs
+            .run(move || open.with_fd(|fd| Ok(rustix::fs::fstat(fd)?)))
+            .await?;
         Ok(Attrs {
             id,
             attrs: attrs(&stat),
@@ -909,16 +959,18 @@ impl Handler for Fs {
         attrs: FileAttributes,
     ) -> Result<Status, StatusReply> {
         let (mode, times) = settable(&attrs)?;
-        let fd = self.fd(&handle)?;
+        let open = self.open_handle(&handle)?;
         self.jobs
             .run(move || {
-                if let Some(mode) = mode {
-                    rustix::fs::fchmod(&*fd, mode)?;
-                }
-                if let Some(times) = times {
-                    rustix::fs::futimens(&*fd, &times)?;
-                }
-                Ok(())
+                open.with_fd(|fd| {
+                    if let Some(mode) = mode {
+                        rustix::fs::fchmod(fd, mode)?;
+                    }
+                    if let Some(times) = times {
+                        rustix::fs::futimens(fd, &times)?;
+                    }
+                    Ok(())
+                })
             })
             .await?;
         Ok(ok(id))
@@ -927,29 +979,23 @@ impl Handler for Fs {
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, StatusReply> {
         self.room()?;
         let path = self.path(&path);
-        let (fd, entries) = self
+        let dir = self
             .jobs
             .run(move || {
                 let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
                 let fd = rustix::fs::open(&path, flags, Mode::empty())?;
-                let entries = Dir::read_from(&fd)?;
-                Ok((fd, entries))
+                Ok(Dir::new(fd)?)
             })
             .await?;
-        let handle = self.add(Open {
-            fd: Arc::new(fd),
-            entries: Some(Arc::new(Mutex::new(entries))),
-        });
+        let handle = self.add(Open::Dir(Arc::new(Mutex::new(dir))));
         Ok(Handle { id, handle })
     }
 
     /// The next [`READDIR_PAGE`] names at most, then `Eof`. Names that are
     /// not UTF-8 are left out rather than changed.
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, StatusReply> {
-        let open = self.handles.get(&handle).ok_or_else(bad_handle)?;
-        let (fd, entries) = match &open.entries {
-            Some(entries) => (open.fd.clone(), entries.clone()),
-            None => return Err(bad_handle()),
+        let Open::Dir(entries) = self.open_handle(&handle)? else {
+            return Err(bad_handle());
         };
         let files = self
             .jobs
@@ -970,7 +1016,8 @@ impl Handler for Fs {
                         continue;
                     };
                     // Gone since it was listed: leave it out.
-                    let Ok(stat) = rustix::fs::statat(&*fd, raw, AtFlags::SYMLINK_NOFOLLOW) else {
+                    let stat = rustix::fs::statat(entries.fd()?, raw, AtFlags::SYMLINK_NOFOLLOW);
+                    let Ok(stat) = stat else {
                         continue;
                     };
                     files.push(entry(name.to_owned(), &stat));
@@ -1277,13 +1324,17 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir.0).expect("list").count(), 0);
     }
 
+    /// With a cap of 8 rather than 256, so the test stays far below macOS's
+    /// default limit of 256 descriptors, shared with every other test.
     #[tokio::test]
     async fn handles_are_capped() {
         let dir = Scratch::new("handles");
         std::fs::write(dir.0.join("f"), b"x").expect("write");
         let mut fs = dir.fs();
+        assert_eq!(fs.max_handles, MAX_HANDLES);
+        fs.max_handles = 8;
         let mut handles = Vec::new();
-        for i in 0..MAX_HANDLES {
+        for i in 0..8 {
             let handle = if i % 2 == 0 {
                 fs.open(1, "f".into(), OpenFlags::READ, FileAttributes::empty())
                     .await
@@ -1375,18 +1426,25 @@ mod tests {
         let handle = fs.opendir(1, ".".into()).await.expect("opendir").handle;
         let mut pages = Vec::new();
         let mut names = Vec::new();
-        loop {
-            match fs.readdir(2, handle.clone()).await {
-                Ok(name) => {
-                    pages.push(name.files.len());
-                    names.extend(name.files);
-                }
-                Err(e) => {
-                    assert_eq!(e.status_code, StatusCode::Eof);
-                    break;
+        // Three pages and the EOF; a listing that repeats is cut off.
+        let listed = tokio::time::timeout(LIMIT, async {
+            for _ in 0..4 {
+                match fs.readdir(2, handle.clone()).await {
+                    Ok(name) => {
+                        pages.push(name.files.len());
+                        names.extend(name.files);
+                    }
+                    Err(e) => {
+                        assert_eq!(e.status_code, StatusCode::Eof);
+                        return true;
+                    }
                 }
             }
-        }
+            false
+        })
+        .await
+        .expect("listed in time");
+        assert!(listed, "no EOF after 4 requests: {pages:?}");
         // `.`, `..` and the odd name are not among them.
         assert_eq!(pages, [128, 128, 46], "odd name made: {odd_made}");
         assert!(names.iter().all(|f| !f.filename.contains('\u{fffd}')));
@@ -1509,6 +1567,77 @@ mod tests {
         fs.rename(2, "a".into(), "c".into()).await.expect("rename");
         assert_eq!(std::fs::read(dir.0.join("c")).expect("read"), b"a");
         assert!(!dir.0.join("a").exists());
+    }
+
+    /// An append handle writes at the end, whatever offset a write names.
+    #[tokio::test]
+    async fn append_handles_append() {
+        let dir = Scratch::new("append");
+        std::fs::write(dir.0.join("log"), b"first\n").expect("write");
+        let mut fs = dir.fs();
+        let append = OpenFlags::WRITE | OpenFlags::APPEND;
+        let handle = fs
+            .open(1, "log".into(), append, FileAttributes::empty())
+            .await
+            .expect("open")
+            .handle;
+        fs.write(2, handle.clone(), 0, b"second\n".to_vec())
+            .await
+            .expect("write");
+        fs.write(3, handle, 0, b"third\n".to_vec())
+            .await
+            .expect("write");
+        let got = std::fs::read(dir.0.join("log")).expect("read");
+        assert_eq!(got, b"first\nsecond\nthird\n");
+        // Without APPEND the offset counts.
+        let handle = fs
+            .open(4, "log".into(), OpenFlags::WRITE, FileAttributes::empty())
+            .await
+            .expect("open")
+            .handle;
+        fs.write(5, handle, 0, b"FIRST".to_vec())
+            .await
+            .expect("write");
+        let got = std::fs::read(dir.0.join("log")).expect("read");
+        assert_eq!(got, b"FIRST\nsecond\nthird\n");
+    }
+
+    /// The rename for filesystems without no-replace renames: a link and an
+    /// unlink, undone if the unlink fails.
+    #[test]
+    fn the_rename_fallback_links_then_unlinks() {
+        let dir = Scratch::new("relink");
+        let at = |name: &str| dir.0.join(name);
+        std::fs::write(at("a"), b"a").expect("write");
+        rename_by_link(&at("a"), &at("b"), Errno::INVAL).expect("rename");
+        assert_eq!(std::fs::read(at("b")).expect("read"), b"a");
+        assert!(!at("a").exists());
+        // Never replaces.
+        std::fs::write(at("c"), b"c").expect("write");
+        let taken = rename_by_link(&at("b"), &at("c"), Errno::INVAL).expect_err("exists");
+        assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(at("c")).expect("read"), b"c");
+        assert!(at("b").exists());
+        // A directory gets the error that sent it here.
+        std::fs::create_dir(at("d")).expect("mkdir");
+        let dir_err = rename_by_link(&at("d"), &at("e"), Errno::INVAL).expect_err("a directory");
+        assert_eq!(dir_err.raw_os_error(), Some(Errno::INVAL.raw_os_error()));
+        assert!(at("d").is_dir() && !at("e").exists());
+        // An unlink that fails (its directory is read-only) takes the new
+        // link back, so a retry finds the way clear. Root ignores the mode.
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        std::fs::create_dir(at("ro")).expect("mkdir");
+        std::fs::write(at("ro/f"), b"f").expect("write");
+        let ro = |mode| std::fs::set_permissions(at("ro"), std::fs::Permissions::from_mode(mode));
+        ro(0o555).expect("chmod");
+        let failed = rename_by_link(&at("ro/f"), &at("g"), Errno::INVAL);
+        ro(0o755).expect("chmod");
+        let failed = failed.expect_err("the unlink fails");
+        assert_eq!(failed.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!at("g").exists(), "the new link was left behind");
+        assert_eq!(std::fs::read(at("ro/f")).expect("read"), b"f");
     }
 
     /// realpath follows symlinks as far as the path exists, then works out

@@ -598,11 +598,16 @@ Where PR 3 differs from the plan above, and why:
   session goes does nothing. The jobs use rustix and std directly;
   `tokio::fs` would put its own unbounded blocking jobs underneath. File
   data is read and written with `pread`/`pwrite`, so a handle needs no
-  seek state, and a write's error comes with its own reply.
+  seek state, and a write's error comes with its own reply. A handle
+  opened with APPEND writes with `write(2)` instead, at the end whatever
+  the offset: `pwrite(2)` honours `O_APPEND` on Linux but not on macOS.
 - **Handles are descriptors.** A file or directory handle holds its open
   descriptor: `fstat`, `fsetstat` (`fchmod`, `futimens`) and `readdir`
   (`fdopendir`, then `fstatat` per entry) act on what was opened, even
-  after a rename or a new directory in its place.
+  after a rename or a new directory in its place. A directory handle has
+  one descriptor, its stream's. The handle cap is a field of the session
+  (256), so its test can use 8 and stay far below macOS's default limit
+  of 256 descriptors.
 - **No extensions are advertised**, in particular not
   `limits@openssh.com`: with it, OpenSSH's client raises its request size
   to the server's limit and keeps 64 requests in flight, 16 MiB, past the
@@ -620,7 +625,9 @@ Where PR 3 differs from the plan above, and why:
   macOS, through rustix's `renameat_with`. Where the filesystem has no such
   rename (EINVAL, ENOSYS, ENOTSUP), a file is moved as OpenSSH's
   sftp-server moves it, by a hard link and an unlink, which cannot replace
-  either; a directory gets the original error.
+  either; if the unlink fails, the new link is removed again and the
+  unlink's error is the reply, so a retry does not find the new name
+  taken. A directory gets the original error.
 - **open** maps SFTP's flags straight to `open(2)`'s (Rust's `OpenOptions`
   refuses a create opened only for reading), creates files with the
   client's mode less the umask (`0666` without one), and opens
@@ -647,8 +654,11 @@ Where PR 3 differs from the plan above, and why:
   the loop drains its input faster than a client can fill it, and a
   client that stops reading stalls its own russh session first. The cap's
   path is the one shell and exec use. The no-replace rename's link
-  fallback is not tested either: the test filesystems all have
-  `renameat2`/`renameatx_np`. A test-only count of running channel
+  fallback is a function of its own, tested directly (success, an
+  existing name, a directory, and an unlink that fails), since the test
+  filesystems all have `renameat2`/`renameatx_np`. The append test only
+  fails on macOS if append writes regress to `pwrite`; Linux appends
+  either way. A test-only count of running channel
   supervisors lets the channel-close test see the supervisor end while
   the connection stays up.
 
