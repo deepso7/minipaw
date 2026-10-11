@@ -1,7 +1,9 @@
 # Plan: a built-in SSH server for `minipaw serve` (russh)
 
-Status: ready for the flow-control spike (rollout step 1). Uses stock
-russh from crates.io, with no fork.
+Status: rollout steps 1 to 4 are done: the spike, the library (PR 1), the
+server with shell, exec and PTYs (PR 2), and SFTP (PR 3). Phase 3 is next.
+Uses stock russh from crates.io, with no fork. Where the code differs from
+this plan, the implementation notes below say how and why.
 
 ## Goal
 
@@ -78,7 +80,7 @@ minipaw serve --ssh [--authorized-keys PATH]... [--no-auth]
   - `auth.rs`
   - `channel.rs`: the state machine and the input buffer
   - `process.rs`: spawning, exit observation, teardown
-  - `sftp.rs`: phase 2
+  - `sftp.rs`: phase 2, the `sftp` subsystem
 - All of it sits behind a cargo feature `ssh-server` of `minipaw-cli`,
   default on and `cfg(unix)`.
 
@@ -168,7 +170,7 @@ request gets an explicit `channel_success` or `channel_failure` when
 | `pty_request` | First one ok, then failure. TERM: `[A-Za-z0-9._+-]`, ≤64 B, else `xterm-256color`. cols/rows clamped to `1..=u16::MAX`, px to `0..=u16::MAX`. Modes ignored. | failure | failure |
 | `env_request` | failure (v1) | failure | failure |
 | `shell_request` / `exec_request` | Spawn → success, then `Running`. A spawn error or a command containing NUL → failure, then close. | failure | failure |
-| `subsystem_request("sftp")` | Phase 2: success, then `Running`. v1: failure. Other names: failure. | failure | failure |
+| `subsystem_request("sftp")` | Success, then `Running` with the SFTP loop as the program (phase 2; v1 refused it). A PTY asked for before is ignored. Other names: failure. | failure | failure |
 | `window_change_request` | Store the size (clamped). | Resize the PTY (clamped). | ignore |
 | `data` | Buffer (capped at 8 MiB; over the cap → teardown). | Same. Data after EOF is a protocol violation: close the channel. | discard |
 | `extended_data` | discard | same | same |
@@ -428,7 +430,10 @@ tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 pty-process = { version = "0.5", features = ["async"] }
 rustix = { workspace = true, features = ["fs", "process"] }
 uzers = { version = "0.12", default-features = false }
-# phase 2: russh-sftp = "3", tokio += "fs"
+# phase 2: the version pinned exactly, as russh is
+russh-sftp = "=3.0.1"
+bytes = { version = "1", default-features = false }  # its Bytes; already in the tree
+# tokio += "fs" (already enabled through pty-process, now named)
 ```
 
 The library also gets `hkdf = "0.13"`.
@@ -467,7 +472,8 @@ CI changes:
   - non-session opens refused, a second exec refused.
 - **End-to-end** (CI): `serve --ssh` with system `ssh` through
   `minipaw -q`, running `ssh … true`, `ssh -tt … 'stty size'`, and
-  `ssh … cat` with 20 MB both ways. Phase 2 adds `scp` of 5 MB.
+  `ssh … cat` with 20 MB both ways. Phase 2 adds `scp` of 5 MB both
+  ways and an `sftp -b` batch.
 
 ## CLI wiring notes
 
@@ -551,6 +557,65 @@ Where PR 2 differs from the plan above, and why:
   the last queued piece (up to 32 KiB), so the 8 MiB cap bounds memory and
   not only the bytes counted.
 
+## Implementation notes (PR 3, SFTP)
+
+Where PR 3 differs from the plan above, and why:
+
+- **Our own dispatch.** russh-sftp keeps its request dispatch private to
+  its detached `server::run`. The loop in `sftp.rs` decodes requests with
+  russh-sftp's `Packet` and calls its `Handler` methods itself, mirroring
+  that dispatch. The loop runs inside the channel's supervisor in a
+  `select!` against the channel's teardown token, so its reads, file work
+  and replies are all dropped at teardown. Its replies go through the
+  channel's writer in pieces of at most 32 KiB.
+- **Framing.** A request's length may be at most 256 KiB + 1 KiB (room for
+  a 256 KiB write's header); a longer one, a zero length, a request cut
+  off by EOF, or a request of a known type that does not parse ends the
+  session. An unknown type, or a reply type sent by the client, gets
+  `OpUnsupported` with its id, and the session goes on.
+- **The end.** The client's EOF between requests is the clean end: exit
+  status 0, EOF, close. Any error ends it with status 1 (OpenSSH's
+  sftp-server uses other codes, 11 for an oversize request). The SFTP
+  reader cannot tell the input being closed (the cap, data after EOF)
+  from EOF, so when it ends with the input closed, the supervisor waits
+  for the teardown that always follows such a close, and the client gets
+  the cap's message and a close rather than status 0.
+- **File data** is read and written with `pread`/`pwrite` on the std file
+  in `spawn_blocking`; everything else is `tokio::fs`. `tokio::fs::File`
+  returns from a write before the write is done and reports its error on
+  a later call, and positional I/O needs no seek state per handle.
+- **No extensions are advertised**, in particular not
+  `limits@openssh.com`: with it, OpenSSH's client raises its request size
+  to the server's limit and keeps 64 requests in flight, 16 MiB, past the
+  8 MiB input cap. Without it, it sends 32 KiB requests, 2 MiB in flight.
+  `posix-rename`, `statvfs`, `fsync`, `hardlink` and `expand-path` are
+  missing too; `SSH_FXP_EXTENDED` gets `OpUnsupported`.
+- **setstat** applies nothing when anything but the mode and the times is
+  asked for. russh-sftp's attributes drop extended pairs, so the raw
+  attribute flags are checked on the wire as well.
+- **symlink** takes OpenSSH's argument order (target, then link path),
+  which every client follows, not the draft's (or russh-sftp's field
+  names). The target is stored as given.
+- **rename** fails when the new name exists, as SFTP v3 says.
+- **open** creates files with the client's mode less the umask (`0666`
+  without one), and opens non-blocking, so a FIFO cannot hold a blocking
+  thread forever; reading one with no data fails instead of waiting.
+- **realpath** of a path that does not exist works `.` and `..` out by
+  name.
+- **readdir** leaves out `.` and `..`, and entries that went away while
+  being listed. Long names are `ls -l` style with numeric owners.
+- **Names are UTF-8**: russh-sftp's types are `String`s, so a name that is
+  not UTF-8 has its odd bytes replaced and cannot be reached.
+- **Dependencies.** russh-sftp's own russh dependency is dev-only: no
+  second russh, tokio or crypto stack. New in the lockfile: russh-sftp,
+  dashmap (with crossbeam-utils and a second, older hashbrown),
+  serde_bytes, and gloo-timers (wasm only, never built). chrono and
+  iana-time-zone, already in the lockfile, are now built into the binary.
+- **Tests.** No in-process test drives an SFTP session past the input cap:
+  the loop drains its input faster than a client can fill it, and a
+  client that stops reading stalls its own russh session first. The cap's
+  path is the one shell and exec use.
+
 ## Risks
 
 Top risks:
@@ -571,3 +636,7 @@ Also:
 - **Process edge cases.** Children are not reaped until escalation is done,
   teardown is concurrent and bounded, and there is a last-resort registry.
   Detached and job-control survivors are documented, matching sshd.
+- **SFTP clients that pipeline deeply.** The input cap applies to SFTP
+  requests too. OpenSSH's scp and sftp keep about 2 MiB in flight; a
+  client that queues more than 8 MiB of writes ahead of their replies has
+  its session closed.
