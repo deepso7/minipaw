@@ -743,6 +743,10 @@ fn resolve(path: &Path) -> io::Result<PathBuf> {
     // The path as given first: taking it apart would drop a trailing `/`
     // or `.`, which make `file/` and `file/.` fail as they should.
     match std::fs::canonicalize(path) {
+        // macOS resolves `file/` and `file/.` to the file; Linux refuses.
+        Ok(real) if names_a_dir(path) && !real.is_dir() => {
+            return Err(io::Error::from_raw_os_error(Errno::NOTDIR.raw_os_error()));
+        }
         Ok(real) => return Ok(real),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
@@ -768,6 +772,16 @@ fn resolve(path: &Path) -> io::Result<PathBuf> {
         }
     }
     Err(io::Error::from(io::ErrorKind::NotFound))
+}
+
+/// Whether `path` can only name a directory: it ends in `/`, `.` or `..`.
+fn names_a_dir(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_bytes();
+    bytes.ends_with(b"/")
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.ends_with(b"/.")
+        || bytes.ends_with(b"/..")
 }
 
 /// Renames `from` to `to` unless `to` exists, atomically. A filesystem
