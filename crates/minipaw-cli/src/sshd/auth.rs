@@ -434,11 +434,19 @@ mod tests {
         let link = dir.0.join("link");
         std::os::unix::fs::symlink(&good, &link).expect("symlink");
         let rsa = dir.write("rsa", RSA, 0o600);
-        match load(&[link], uid()) {
+        // Whatever this checkout's ancestors are like: the link itself is
+        // refused, and what it resolves to is read.
+        assert!(dir.read(&link).is_err());
+        let text = dir
+            .read(&link.canonicalize().expect("resolve"))
+            .expect("read");
+        assert_eq!(text, std::fs::read(&good).expect("good"));
+        match load(std::slice::from_ref(&link), uid()) {
             Ok((Policy::Keys(keys), warnings)) => {
                 assert_eq!(keys.len(), 1);
                 assert_eq!(warnings.len(), 1);
-                assert!(warnings[0].contains(&format!("{}:1: skipping", good.display())));
+                // Named as it was given.
+                assert!(warnings[0].contains(&format!("{}:1: skipping", link.display())));
             }
             Ok(_) => panic!("not keys"),
             // Only where this checkout's ancestors pass the checks.
