@@ -405,7 +405,8 @@ anything else.
   - `opendir`/`readdir`, paginated at 128 entries;
   - `remove`, `mkdir`, `rmdir`, `realpath`, `rename`, `readlink`,
     `symlink`.
-- Caps: 256 handles, reads of at most 256 KiB.
+- Caps: 256 handles, reads of at most 255 KiB (so the reply fits OpenSSH's
+  256 KiB message limit, as sftp-server does), writes of at most 256 KiB.
 - Paths are relative to home; absolute paths are allowed. This is not a
   sandbox.
 - Adds `tokio/fs`.

@@ -189,7 +189,7 @@ Limits worth knowing:
   requests sent ahead of their replies; scp and sftp keep about 2 MiB in
   flight.
 - An SFTP session has at most 256 files and directories open at once, a
-  read returns at most 256 KiB, and a request longer than 257 KiB ends
+  read returns at most 255 KiB, and a request longer than 257 KiB ends
   the session.
 - A connection has 20 s to log in.
 - When a session is cut short (the client closes it or goes away, or

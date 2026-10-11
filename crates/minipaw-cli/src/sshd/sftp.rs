@@ -48,12 +48,20 @@ use tokio::sync::Semaphore;
 use super::channel::Input;
 use super::config::CHUNK;
 
-/// The most a read returns, and the most a write carries.
-pub const MAX_READ: u32 = 256 * 1024;
+/// The longest message OpenSSH's client takes; it ends the session on a
+/// longer one.
+const CLIENT_MAX_MESSAGE: u32 = 256 * 1024;
 
-/// The longest request taken: a write of [`MAX_READ`] and room for its
+/// The most a read returns: a 1 KiB margin keeps the whole reply within
+/// [`CLIENT_MAX_MESSAGE`], as OpenSSH's sftp-server does.
+pub const MAX_READ: u32 = CLIENT_MAX_MESSAGE - 1024;
+
+/// The most a write carries.
+pub const MAX_WRITE: u32 = 256 * 1024;
+
+/// The longest request taken: a write of [`MAX_WRITE`] and room for its
 /// header (type, id, handle and offset).
-pub const MAX_FRAME: u32 = MAX_READ + 1024;
+pub const MAX_FRAME: u32 = MAX_WRITE + 1024;
 
 /// How many files and directories a session may have open at once.
 pub const MAX_HANDLES: usize = 256;
@@ -1455,9 +1463,9 @@ mod tests {
         assert_eq!(tail.data[..], content[MAX_READ as usize * 2..]);
         let past = fs.read(4, handle.clone(), content.len() as u64, 100).await;
         assert_eq!(code(past), StatusCode::Eof);
-        // The reply to the biggest read still fits a frame.
+        // The reply to the biggest read fits what OpenSSH's client takes.
         let reply = Bytes::try_from(Packet::from(data)).expect("encode");
-        assert!(reply.len() - 4 <= MAX_FRAME as usize);
+        assert!(reply.len() - 4 <= CLIENT_MAX_MESSAGE as usize);
     }
 
     #[tokio::test]
