@@ -5,7 +5,7 @@
 //! timings); run them with
 //!
 //! ```text
-//! cargo test --release -p russh-flow -- --nocapture --test-threads=1
+//! cd spike/russh-flow && cargo test --release -- --nocapture --test-threads=1
 //! ```
 //!
 //! Each test prints one `RESULT` line with its wall time and the process's
@@ -144,7 +144,7 @@ async fn run_simple(server: &Server, cmd: &str) -> Outcome {
 /// front of it).
 #[cfg_attr(
     debug_assertions,
-    ignore = "spike: run with cargo test --release -p russh-flow"
+    ignore = "spike: run with cargo test --release in spike/russh-flow"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn case1_cat_100mb_both_ways() {
@@ -158,7 +158,7 @@ async fn case1_cat_100mb_both_ways() {
 /// about the download rate and the input buffer stays near one window.
 #[cfg_attr(
     debug_assertions,
-    ignore = "spike: run with cargo test --release -p russh-flow"
+    ignore = "spike: run with cargo test --release in spike/russh-flow"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn case1b_cat_with_slower_download() {
@@ -260,7 +260,7 @@ async fn cat_with_withheld_window(naive: bool, name: &str) -> bool {
 
 #[cfg_attr(
     debug_assertions,
-    ignore = "spike: run with cargo test --release -p russh-flow"
+    ignore = "spike: run with cargo test --release in spike/russh-flow"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn case1c_naive_read_half_deadlocks() {
@@ -272,7 +272,7 @@ async fn case1c_naive_read_half_deadlocks() {
 
 #[cfg_attr(
     debug_assertions,
-    ignore = "spike: run with cargo test --release -p russh-flow"
+    ignore = "spike: run with cargo test --release in spike/russh-flow"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn case1d_plan_design_survives_withheld_window() {
@@ -347,7 +347,7 @@ async fn cat_both_ways(relay: bool, name: &str) {
 /// Case 2: a slow consumer fed 4 MiB completes.
 #[cfg_attr(
     debug_assertions,
-    ignore = "spike: run with cargo test --release -p russh-flow"
+    ignore = "spike: run with cargo test --release in spike/russh-flow"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn case2_slow_consumer_4mib() {
@@ -384,7 +384,7 @@ async fn case2_slow_consumer_4mib() {
 /// and the server keeps serving.
 #[cfg_attr(
     debug_assertions,
-    ignore = "spike: run with cargo test --release -p russh-flow"
+    ignore = "spike: run with cargo test --release in spike/russh-flow"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn case3_slow_consumer_100mb_trips_cap() {
@@ -447,7 +447,7 @@ async fn case3_slow_consumer_100mb_trips_cap() {
 /// slow and 6 MiB sit in its input buffer.
 #[cfg_attr(
     debug_assertions,
-    ignore = "spike: run with cargo test --release -p russh-flow"
+    ignore = "spike: run with cargo test --release in spike/russh-flow"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn case4_keepalive_and_close_while_slow() {
@@ -561,7 +561,7 @@ async fn case4_keepalive_and_close_while_slow() {
 /// size is caught by the cap.
 #[cfg_attr(
     debug_assertions,
-    ignore = "spike: run with cargo test --release -p russh-flow"
+    ignore = "spike: run with cargo test --release in spike/russh-flow"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn case5_peer_over_window_and_packet_size() {
@@ -620,7 +620,7 @@ fn seq(n: u32) -> Vec<u8> {
 /// holds back its window, then the held WINDOW_ADJUSTs arrive in a burst.
 #[cfg_attr(
     debug_assertions,
-    ignore = "spike: run with cargo test --release -p russh-flow"
+    ignore = "spike: run with cargo test --release in spike/russh-flow"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn case6_window_adjust_while_output_queued() {
@@ -689,7 +689,7 @@ async fn case6_window_adjust_while_output_queued() {
 /// the client had granted.
 #[cfg_attr(
     debug_assertions,
-    ignore = "spike: run with cargo test --release -p russh-flow"
+    ignore = "spike: run with cargo test --release in spike/russh-flow"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn case6b_probe_16_bytes_on_9_credit() {
@@ -742,7 +742,7 @@ async fn case6b_probe_16_bytes_on_9_credit() {
 /// command; memory and descriptors stay flat.
 #[cfg_attr(
     debug_assertions,
-    ignore = "spike: run with cargo test --release -p russh-flow"
+    ignore = "spike: run with cargo test --release in spike/russh-flow"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn case7_thousand_connections_flat_memory() {
@@ -799,7 +799,7 @@ async fn case7_thousand_connections_flat_memory() {
 /// the first keeps working.
 #[cfg_attr(
     debug_assertions,
-    ignore = "spike: run with cargo test --release -p russh-flow"
+    ignore = "spike: run with cargo test --release in spike/russh-flow"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extra_second_channel_rejected() {
