@@ -245,11 +245,14 @@ hello</pre>
 </style>
 
 <script>
-  for (const button of document.querySelectorAll<HTMLButtonElement>("button.copy")) {
-    button.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(button.dataset.copy ?? "");
-      button.textContent = "copied";
-      setTimeout(() => (button.textContent = "copy"), 1500);
-    });
-  }
+  // Delegated from document: Blume's client router swaps the page's DOM on
+  // navigation but runs this module once, so a listener on the button itself
+  // would be lost after leaving the page and coming back.
+  document.addEventListener("click", async (event) => {
+    const button = (event.target as Element | null)?.closest<HTMLButtonElement>("button.copy");
+    if (!button) return;
+    await navigator.clipboard.writeText(button.dataset.copy ?? "");
+    button.textContent = "copied";
+    setTimeout(() => (button.textContent = "copy"), 1500);
+  });
 </script>
