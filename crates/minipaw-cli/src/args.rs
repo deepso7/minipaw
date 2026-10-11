@@ -21,7 +21,7 @@ use minipaw::{Config, Identity, Multiaddr, PeerAddr, Ticket};
 #[command(
     name = "minipaw",
     version,
-    override_usage = "minipaw [OPTIONS] [TICKET]\n       minipaw [-v] parse <TICKET>\n       minipaw [-v] ticket [--identity PATH] [--relay MULTIADDR]\n       minipaw [-v] serve [--forward HOST:PORT|PORT] [--identity PATH] [--new] [--max-sessions N] [--relay MULTIADDR]\n       minipaw ssh [SSH OPTIONS] [USER@]TICKET [COMMAND]\n       minipaw cp [SCP OPTIONS] SOURCE... TARGET",
+    override_usage = "minipaw [OPTIONS] [TICKET]\n       minipaw [-v] parse <TICKET>\n       minipaw [-v] ticket [--identity PATH] [--relay MULTIADDR]\n       minipaw [-v] serve [--forward HOST:PORT|PORT | --ssh [--authorized-keys PATH]... [--no-auth]] [--identity PATH] [--new] [--max-sessions N] [--relay MULTIADDR]\n       minipaw ssh [SSH OPTIONS] [USER@]TICKET [COMMAND]\n       minipaw cp [SCP OPTIONS] SOURCE... TARGET",
     after_help = "\
 Examples:
   minipaw <big.iso                 send a file; prints a ticket
@@ -29,6 +29,7 @@ Examples:
   minipaw / minipaw <ticket>       chat, when run in a terminal on both ends
   minipaw --identity my.key        listen with the same ticket every run
   minipaw serve                    forward every session to local port 22
+  minipaw serve --ssh              answer every session with a built-in SSH server
   minipaw ssh <ticket>             ssh to that machine through it
   minipaw cp f <ticket>:           copy a file to it with scp
 
@@ -100,6 +101,14 @@ impl Args {
                 ));
             }
         }
+        if let Some(Command::Serve { ssh: true, .. }) = args.command
+            && !SSH_SERVER
+        {
+            return Err(Self::command().error(
+                ErrorKind::InvalidValue,
+                "--ssh needs a minipaw built with the ssh-server feature, on Unix",
+            ));
+        }
         if args.quiet
             && matches!(
                 args.command,
@@ -138,13 +147,31 @@ pub enum Command {
         relay: Option<String>,
     },
     /// Listen with a stable ticket and forward every session to a local
-    /// TCP port, several at once, until Ctrl-C. Status goes to stderr as
-    /// `#` lines.
+    /// TCP port, or answer it with a built-in SSH server (--ssh), several
+    /// at once, until Ctrl-C. Status goes to stderr as `#` lines.
     Serve {
         /// Where to connect each session: HOST:PORT, or a PORT on
         /// 127.0.0.1. Resolved once, at startup.
         #[arg(long, value_name = "HOST:PORT", default_value = "127.0.0.1:22")]
         forward: Forward,
+        /// Answer each session with a built-in SSH server instead of
+        /// forwarding it, for machines without sshd. Every login runs as
+        /// the user running serve.
+        #[arg(long, conflicts_with = "forward")]
+        ssh: bool,
+        /// With --ssh: a file of public keys that may log in, read once at
+        /// startup; may be repeated. Defaults to ~/.ssh/authorized_keys.
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "ssh",
+            conflicts_with = "no_auth"
+        )]
+        authorized_keys: Vec<PathBuf>,
+        /// With --ssh: no keys; the ticket is the only credential, so
+        /// anyone who has it gets a shell.
+        #[arg(long, requires = "ssh")]
+        no_auth: bool,
         /// The identity file, created if missing. Defaults to serve.key in
         /// $MINIPAW_HOME, else $XDG_CONFIG_HOME/minipaw, else
         /// ~/.config/minipaw.
@@ -201,6 +228,9 @@ pub enum Command {
         args: Vec<OsString>,
     },
 }
+
+/// Whether this build has `serve --ssh`.
+const SSH_SERVER: bool = cfg!(all(unix, feature = "ssh-server"));
 
 /// Where `serve` forwards to, as given: a host (name or IP) and a port.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -573,12 +603,16 @@ mod tests {
             new,
             max_sessions,
             relay,
+            ssh,
+            authorized_keys,
+            no_auth,
         }) = args.command
         else {
             panic!("not serve");
         };
         assert_eq!(forward.to_string(), "127.0.0.1:22");
         assert!(identity.is_none() && !new && relay.is_none());
+        assert!(!ssh && authorized_keys.is_empty() && !no_auth);
         assert_eq!(max_sessions, minipaw::DEFAULT_MAX_SESSIONS);
 
         let argv = [
@@ -602,6 +636,7 @@ mod tests {
             new,
             max_sessions,
             relay,
+            ..
         }) = args.command
         else {
             panic!("not serve");
@@ -611,6 +646,62 @@ mod tests {
         assert!(new);
         assert_eq!(max_sessions, 3);
         assert_eq!(relay.as_deref(), Some(RELAY));
+    }
+
+    #[test]
+    fn serve_ssh_flags() {
+        let ssh = |argv: &[&str]| {
+            let args = parse(argv)?;
+            let Some(Command::Serve {
+                ssh,
+                authorized_keys,
+                no_auth,
+                ..
+            }) = args.command
+            else {
+                panic!("not serve");
+            };
+            Ok::<_, clap::Error>((ssh, authorized_keys, no_auth))
+        };
+        if !SSH_SERVER {
+            let e = parse(&["serve", "--ssh"]).unwrap_err();
+            assert!(e.to_string().contains("ssh-server feature"), "{e}");
+            return;
+        }
+        let (on, keys, no_auth) = ssh(&["serve", "--ssh"]).expect("ssh");
+        assert!(on && keys.is_empty() && !no_auth);
+        let argv = [
+            "serve",
+            "--ssh",
+            "--authorized-keys",
+            "a",
+            "--authorized-keys=b",
+        ];
+        let (_, keys, _) = ssh(&argv).expect("keys");
+        assert_eq!(keys, [Path::new("a"), Path::new("b")]);
+        let (_, _, no_auth) = ssh(&["serve", "--no-auth", "--ssh"]).expect("no auth");
+        assert!(no_auth);
+
+        let kind = |argv: &[&str]| parse(argv).map(|_| ()).unwrap_err().kind();
+        // --ssh replaces --forward, even when it is given as its default.
+        for forward in ["2222", "127.0.0.1:22"] {
+            assert_eq!(
+                kind(&["serve", "--ssh", "--forward", forward]),
+                ErrorKind::ArgumentConflict
+            );
+        }
+        assert_eq!(
+            kind(&["serve", "--ssh", "--no-auth", "--authorized-keys", "a"]),
+            ErrorKind::ArgumentConflict
+        );
+        for argv in [
+            &["serve", "--no-auth"][..],
+            &["serve", "--authorized-keys", "a"],
+        ] {
+            assert_eq!(kind(argv), ErrorKind::MissingRequiredArgument, "{argv:?}");
+        }
+        assert_eq!(kind(&["--ssh"]), ErrorKind::UnknownArgument);
+        assert_eq!(kind(&["serve", "--ssh", "x"]), ErrorKind::UnknownArgument);
     }
 
     #[test]

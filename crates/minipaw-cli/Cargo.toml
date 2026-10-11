@@ -12,6 +12,11 @@ name = "minipaw"
 path = "src/main.rs"
 doc = false
 
+[features]
+default = ["ssh-server"]
+# `serve --ssh`: a built-in SSH server (Unix only).
+ssh-server = ["dep:russh", "dep:tokio", "dep:tokio-util", "dep:pty-process", "dep:rustix", "dep:uzers"]
+
 [dependencies]
 minipaw.workspace = true
 clap.workspace = true
@@ -21,6 +26,15 @@ ratatui.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 signal-hook.workspace = true
+russh = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+pty-process = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
+uzers = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -65,7 +65,8 @@ any error (including the other side hitting one), `130` on Ctrl-C.
 `minipaw serve` keeps listening with a stable ticket and forwards every
 session to a local TCP port, several at once (16 by default,
 `--max-sessions N`). It defaults to sshd on `127.0.0.1:22`; `--forward
-HOST:PORT` or `--forward PORT` picks another.
+HOST:PORT` or `--forward PORT` picks another, and `--ssh` answers with a
+built-in SSH server instead ([below](#built-in-ssh-server---ssh)).
 
 ```console
 $ minipaw serve                             # on the machine to reach
@@ -119,6 +120,74 @@ minipaw.
   across each cut, but the relay also rate limits new circuits, so a long,
   large relayed transfer can fail.
 - The ticket is a secret: anyone holding it can reach the forwarded port.
+
+### Built-in SSH server (`--ssh`)
+
+On a machine with no sshd, or where you can't run one, `minipaw serve
+--ssh` answers each session with an SSH server inside minipaw, as the user
+running it, with no setup. `minipaw ssh` connects to it as above.
+
+```console
+$ minipaw serve --ssh
+# identity: /home/me/.config/minipaw/serve.key (existing)
+# ssh: built-in server as me, 2 keys
+# 🐾 listening; connect with:
+minipaw mpAQ…
+# ssh: minipaw ssh user@mpAQ…
+```
+
+- **Who gets in.** A key in `~/.ssh/authorized_keys` of the serving user,
+  or in the files given with `--authorized-keys PATH` (repeatable). Keys
+  are read once at startup, so restart serve to apply edits and
+  revocations. ed25519 and ecdsa keys work; RSA, DSA and security-key
+  (`sk-*`) lines are skipped with a warning. A line with options
+  (`command=`, `from=`, `restrict`, …) or `cert-authority` is an error, so
+  nothing is quietly loosened. The file and every directory above it must
+  be owned by you or root and not be writable by anyone else, as sshd's
+  StrictModes requires; so must the directory holding any symlink on the
+  way, and the directories above it.
+- **`--no-auth`** accepts anyone who reaches the server: **the ticket is the
+  only credential**, and whoever has it gets a shell as you. serve says so
+  on every start. `SSH_PEER_ID` in the shell is the dialer's peer id, which
+  under `--no-auth` it may have made up, so use it for logs only.
+- **Every login runs as the serving user**, whatever user name the client
+  asks for (it is logged, nothing more): your shell from the passwd entry,
+  in your home directory, with a clean environment (`HOME`, `USER`,
+  `LOGNAME`, `SHELL`, `PATH`, `TERM` with a PTY, `SSH_CONNECTION`,
+  `SSH_PEER_ID`).
+- The host key is derived from serve's identity, so it stays the same as
+  long as the ticket does and changes with `serve --new`.
+- `-v` logs each login: the key, the user name asked for, and what ran.
+
+Not supported, for now:
+
+- SFTP. Plain `scp` uses SFTP since OpenSSH 9.0, so use `scp -O` (or
+  `minipaw cp -O`), and `sftp` does not work.
+- Port forwarding (`-L`, `-R`, `-D`), agent and X11 forwarding, sending
+  environment variables, forced commands, compression, and password or
+  certificate logins.
+- More than one session per connection, so OpenSSH's `ControlMaster`
+  multiplexing does not work. Each `ssh` run opens its own connection, as
+  it does by default.
+- Logging in as another user, even when serve runs as root.
+- Windows.
+
+Limits worth knowing:
+
+- Each session buffers at most 8 MiB of input its program has not read
+  yet. A sender that gets further ahead than that, such as `cat big.iso |
+  ssh … slow-program`, has its session closed with `minipaw: input exceeded
+  8 MiB buffer, closing` rather than being slowed down. Interactive shells,
+  git and ordinary pipes stay far below it.
+- A connection has 20 s to log in.
+- When a session is cut short (the client closes it or goes away, or
+  serve stops), its program gets a hangup: SIGHUP (and SIGTERM without a
+  PTY), then SIGKILL to its process group 2 s later. A program that exits
+  by itself gets none of this, so background children it left behind
+  (`sleep 1000 >/dev/null 2>&1 &`) keep running, as under sshd. So can
+  anything that left the session's process groups (`setsid`, `nohup … &`
+  in its own job-control group). A second Ctrl-C, which stops serve at
+  once, skips this cleanup.
 
 ## Terminal UI
 
@@ -213,7 +282,10 @@ scripts/bench-remote.sh <ssh-host>  # real-network throughput
 ```
 
 The workspace has two crates: `crates/minipaw` is the library and
-`crates/minipaw-cli` is the `minipaw` command built on it.
+`crates/minipaw-cli` is the `minipaw` command built on it. The built-in SSH
+server is the CLI's `ssh-server` feature, on by default (Unix only);
+`cargo build -p minipaw-cli --no-default-features` leaves it, and its
+tokio and russh dependencies, out.
 
 The scripts start a throwaway local relay from a sibling `../minip2p`
 checkout; build it once with
