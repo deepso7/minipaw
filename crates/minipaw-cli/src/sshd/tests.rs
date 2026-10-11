@@ -10,6 +10,7 @@
 
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream as StdStream;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
@@ -18,6 +19,7 @@ use russh::client::{self, Handle};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
+use russh_sftp::client::SftpSession;
 use rustix::process::{Pid, Signal};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
@@ -613,8 +615,9 @@ async fn requests_out_of_turn_are_refused() {
         let (handle, _cut) = server.login(false).await;
         let channel = handle.channel_open_session().await.expect("session");
         channel.set_env(true, "FOO", "bar").await.expect("env");
+        // Only sftp is a subsystem.
         channel
-            .request_subsystem(true, "sftp")
+            .request_subsystem(true, "shell")
             .await
             .expect("subsystem");
         channel
@@ -622,6 +625,10 @@ async fn requests_out_of_turn_are_refused() {
             .await
             .expect("exec");
         channel.exec(true, "true").await.expect("exec");
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .expect("subsystem");
         channel.request_shell(true).await.expect("shell");
         channel
             .request_pty(true, "xterm", 80, 24, 0, 0, &[])
@@ -630,7 +637,7 @@ async fn requests_out_of_turn_are_refused() {
         let (mut read, write) = channel.split();
         let mut replies = Vec::new();
         let mut output = Vec::new();
-        while replies.len() < 6 || output.is_empty() {
+        while replies.len() < 7 || output.is_empty() {
             match read.wait().await.expect("open") {
                 ChannelMsg::Success => replies.push(Ev::Success),
                 ChannelMsg::Failure => replies.push(Ev::Failure),
@@ -641,7 +648,9 @@ async fn requests_out_of_turn_are_refused() {
         use Ev::{Failure, Success};
         assert_eq!(
             replies,
-            [Failure, Failure, Success, Failure, Failure, Failure]
+            [
+                Failure, Failure, Success, Failure, Failure, Failure, Failure
+            ]
         );
         assert_eq!(output, b"\n", "env must not pass");
 
@@ -983,6 +992,272 @@ async fn sequential_connections_leave_nothing_behind() {
             cut.shutdown(Shutdown::Both).expect("cut");
         }
         none_running(&server).await;
+        server.stop().await;
+    })
+    .await;
+}
+
+// --- sftp ------------------------------------------------------------------
+
+/// A fresh directory standing in for the serving user's home.
+struct Home(std::path::PathBuf);
+
+impl Home {
+    fn new(name: &str) -> Home {
+        let dir = std::env::temp_dir().join(format!("minipaw-sftp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        Home(dir)
+    }
+
+    /// A server whose account lives here.
+    fn server(&self) -> Server {
+        let account = Account {
+            home: self.0.clone(),
+            ..account()
+        };
+        Server::with(keys(), account)
+    }
+}
+
+impl Drop for Home {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Opens the `sftp` subsystem on a new session channel.
+async fn sftp(handle: &Handle<Client>) -> SftpSession {
+    let mut channel = handle.channel_open_session().await.expect("session");
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .expect("subsystem");
+    loop {
+        match channel.wait().await.expect("a reply") {
+            ChannelMsg::Success => break,
+            ChannelMsg::Failure => panic!("sftp refused"),
+            _ => {}
+        }
+    }
+    SftpSession::new(channel.into_stream())
+        .await
+        .expect("sftp session")
+}
+
+/// `n` bytes of the test pattern, and their hash.
+fn pattern(n: usize) -> (Vec<u8>, u64) {
+    let mut data = vec![0; n];
+    Pattern(0x2545_f491_4f6c_dd1d).fill(&mut data);
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    fnv(&mut hash, &data);
+    (data, hash)
+}
+
+/// A few MB up and down through a relay, with the same bytes each way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sftp_moves_files_both_ways() {
+    bounded(async {
+        const TOTAL: usize = 5_000_000;
+        let home = Home::new("move");
+        let server = home.server();
+        let (handle, _cut) = server.login(true).await;
+        let sftp = sftp(&handle).await;
+        // Relative paths start at home.
+        let real = sftp.canonicalize(".").await.expect("realpath");
+        let want = std::fs::canonicalize(&home.0).expect("canonical home");
+        assert_eq!(Path::new(&real), want);
+
+        let (data, hash) = pattern(TOTAL);
+        let mut file = sftp.create("up.bin").await.expect("create");
+        file.write_all(&data).await.expect("upload");
+        file.close().await.expect("close");
+        let on_disk = std::fs::read(home.0.join("up.bin")).expect("read");
+        let mut got = 0xcbf2_9ce4_8422_2325;
+        fnv(&mut got, &on_disk);
+        assert_eq!((on_disk.len(), got), (TOTAL, hash));
+        assert_eq!(
+            sftp.metadata("up.bin").await.expect("stat").size,
+            Some(TOTAL as u64)
+        );
+
+        std::fs::write(home.0.join("down.bin"), &data).expect("write");
+        let mut file = sftp.open("down.bin").await.expect("open");
+        let mut back = Vec::new();
+        file.read_to_end(&mut back).await.expect("download");
+        file.close().await.expect("close");
+        let mut got = 0xcbf2_9ce4_8422_2325;
+        fnv(&mut got, &back);
+        assert_eq!((back.len(), got), (TOTAL, hash));
+
+        // An absolute path reaches outside home: this is not a sandbox.
+        let outside = home.0.with_extension("outside");
+        std::fs::write(&outside, b"there").expect("write");
+        let abs = outside.to_str().expect("utf-8").to_owned();
+        assert_eq!(sftp.read(abs).await.expect("read"), b"there");
+        let _ = std::fs::remove_file(&outside);
+        sftp.close().await.expect("close");
+        server.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sftp_lists_and_changes_the_tree() {
+    bounded(async {
+        let home = Home::new("tree");
+        std::fs::create_dir(home.0.join("many")).expect("mkdir");
+        for i in 0..300 {
+            std::fs::write(home.0.join(format!("many/f{i}")), b"").expect("write");
+        }
+        let server = home.server();
+        let (handle, _cut) = server.login(false).await;
+        let sftp = sftp(&handle).await;
+        let mut names: Vec<String> = sftp
+            .read_dir("many")
+            .await
+            .expect("readdir")
+            .map(|e| e.file_name())
+            .collect();
+        names.sort();
+        let mut want: Vec<String> = (0..300).map(|i| format!("f{i}")).collect();
+        want.sort();
+        assert_eq!(names, want);
+
+        sftp.create_dir("d").await.expect("mkdir");
+        assert!(home.0.join("d").is_dir());
+        sftp.write("d/a", b"")
+            .await
+            .expect_err("write needs CREATE");
+        let mut file = sftp.create("d/a").await.expect("create");
+        file.write_all(b"hello").await.expect("write");
+        file.close().await.expect("close");
+        sftp.rename("d/a", "d/b").await.expect("rename");
+        assert_eq!(std::fs::read(home.0.join("d/b")).expect("read"), b"hello");
+        // Plain SFTP v3 rename does not replace.
+        std::fs::write(home.0.join("d/c"), b"").expect("write");
+        assert!(sftp.rename("d/b", "d/c").await.is_err());
+        // OpenSSH's order: the target, then the link.
+        sftp.symlink("b", "d/link").await.expect("symlink");
+        assert_eq!(sftp.read_link("d/link").await.expect("readlink"), "b");
+        assert!(
+            sftp.symlink_metadata("d/link")
+                .await
+                .expect("lstat")
+                .is_symlink()
+        );
+        assert_eq!(sftp.metadata("d/link").await.expect("stat").size, Some(5));
+        assert!(sftp.remove_dir("d").await.is_err(), "not empty");
+        for name in ["d/b", "d/c", "d/link"] {
+            sftp.remove_file(name).await.expect("remove");
+        }
+        sftp.remove_dir("d").await.expect("rmdir");
+        assert!(!home.0.join("d").exists());
+        assert!(!sftp.try_exists("d").await.expect("stat"));
+        sftp.close().await.expect("close");
+        server.stop().await;
+    })
+    .await;
+}
+
+/// Each connection has its own SFTP session, and one running does not hold
+/// up another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sftp_runs_on_two_connections_at_once() {
+    bounded(async {
+        let home = Home::new("two");
+        std::fs::write(home.0.join("f"), b"one").expect("write");
+        let server = home.server();
+        let (first, _cut1) = server.login(false).await;
+        let (second, _cut2) = server.login(false).await;
+        let a = sftp(&first).await;
+        let mut held = a.open("f").await.expect("open");
+        let b = sftp(&second).await;
+        assert_eq!(b.read("f").await.expect("read"), b"one");
+        b.write("f", b"two").await.expect("write");
+        let mut got = Vec::new();
+        held.read_to_end(&mut got).await.expect("read");
+        assert_eq!(got, b"two");
+        server.stop().await;
+    })
+    .await;
+}
+
+/// The client's EOF ends SFTP as sftp-server's exit does: status 0, EOF and
+/// close. A request over the size limit ends it with status 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sftp_ends_with_status_eof_and_close() {
+    bounded(async {
+        let home = Home::new("end");
+        let server = home.server();
+        let init = [0, 0, 0, 5, 1, 0, 0, 0, 3];
+        for (input, status) in [(&init[..], 0), (&[0x7f, 0xff, 0xff, 0xff, 1][..], 1)] {
+            let (handle, _cut) = server.login(false).await;
+            let channel = handle.channel_open_session().await.expect("session");
+            channel
+                .request_subsystem(true, "sftp")
+                .await
+                .expect("subsystem");
+            channel.data(input).await.expect("data");
+            channel.eof().await.expect("eof");
+            let (mut read, _write) = channel.split();
+            let events = collect(&mut read).await;
+            assert_eq!(events[0], Ev::Success, "{events:?}");
+            let end = &events[events.len() - 3..];
+            assert_eq!(end, [Ev::Status(status), Ev::Eof, Ev::Close]);
+            if status == 0 {
+                // The version reply: SFTP v3 and no extensions.
+                let Ev::Out(reply) = &events[1] else {
+                    panic!("{events:?}");
+                };
+                assert_eq!(reply[..9], [0, 0, 0, 5, 2, 0, 0, 0, 3], "{reply:?}");
+            }
+        }
+        server.stop().await;
+    })
+    .await;
+}
+
+/// A client that goes away in the middle of a download, with the server
+/// waiting on its window, is torn down at once, and the server goes on
+/// serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_gone_mid_transfer_ends_its_sftp() {
+    bounded(async {
+        let home = Home::new("gone");
+        let (data, _) = pattern(20_000_000);
+        std::fs::write(home.0.join("big"), &data).expect("write");
+        let server = home.server();
+        for how in ["the channel closes", "the connection drops"] {
+            let (handle, cut) = server.login(true).await;
+            let sftp = sftp(&handle).await;
+            let mut file = sftp.open("big").await.expect("open");
+            let mut buf = vec![0; 64 * 1024];
+            file.read_exact(&mut buf).await.expect("read");
+            // Stop reading, with requests still in flight.
+            if how == "the channel closes" {
+                drop(file);
+                drop(sftp);
+                sleep(Duration::from_millis(100)).await;
+            }
+            cut.shutdown(Shutdown::Both).expect("cut");
+            drop(handle);
+            server.conns.close();
+            timeout(
+                config::CONNECTION_END + Duration::from_secs(1),
+                server.conns.wait(),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("still serving after {how}"));
+            server.conns.reopen();
+        }
+        // Still serving.
+        let (handle, _cut) = server.login(true).await;
+        let sftp = sftp(&handle).await;
+        assert_eq!(
+            sftp.metadata("big").await.expect("stat").size,
+            Some(data.len() as u64)
+        );
         server.stop().await;
     })
     .await;

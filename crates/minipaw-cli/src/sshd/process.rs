@@ -86,7 +86,7 @@ impl Account {
     }
 
     /// Where a login starts: home, else `/`.
-    fn cwd(&self) -> &Path {
+    pub fn cwd(&self) -> &Path {
         if self.home.is_dir() {
             &self.home
         } else {

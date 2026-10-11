@@ -12,6 +12,9 @@ authors = ["Deepso"]
 [workspace.dependencies]
 minipaw = { path = "crates/minipaw", version = "0.1.0" }
 base64 = "0.23"
+# The buffer type russh-sftp parses packets from; already in the tree
+# through tokio.
+bytes = { version = "1", default-features = false }
 clap = { version = "4.6", features = ["derive"] }
 ctrlc = "3"
 getrandom = "0.4"
@@ -31,11 +34,15 @@ rustix = { version = "1.1", default-features = false, features = ["std", "fs", "
 # channel lifecycle are relied on as they are (docs/plans/builtin-ssh.md).
 # ring only, so no aws-lc-rs, flate2 or rsa.
 russh = { version = "=0.64.1", default-features = false, features = ["ring"] }
+# SFTP for `serve --ssh`: its protocol types and server Handler trait only,
+# under our own supervised loop. Pinned like russh. Its russh dependency is
+# a dev-dependency, so it brings no second russh or crypto stack.
+russh-sftp = "=3.0.1"
 sha2 = { version = "0.11", default-features = false }
 # Handling SIGHUP for `-q` (ssh hangs up its ProxyCommand as it exits);
 # already in the tree through crossterm.
 signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
-tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "net", "io-util", "process", "sync", "time", "macros"] }
+tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "net", "io-util", "process", "sync", "time", "macros", "fs"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 # The serving account's passwd entry (name, home, shell) for `serve --ssh`.
 uzers = { version = "0.12", default-features = false }

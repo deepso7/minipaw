@@ -1,6 +1,6 @@
 //! One connection's russh handler: auth, and its session channel's state
 //! machine and input buffer, then the channel's supervisor, which runs the
-//! program and sends its output and exit.
+//! program (a process, or the SFTP loop) and sends its output and exit.
 //!
 //! A connection has at most one session channel, so russh's per-connection
 //! stalls (docs/plans/builtin-ssh.md, "Flow control") have no sibling
@@ -30,6 +30,7 @@ use tokio_util::task::TaskTracker;
 use super::Shared;
 use super::config::{CAP_MESSAGE, CHUNK, INPUT_CAP};
 use super::process::{self, Exit, Io, Login, Process, WinSize};
+use super::sftp;
 
 /// How long a PTY whose shell has exited may stay quiet before its output
 /// counts as drained, when something else still holds the terminal open.
@@ -109,6 +110,11 @@ impl Input {
         self.notify.notify_one();
     }
 
+    /// Whether the input was closed, rather than ended by the client.
+    pub fn is_closed(&self) -> bool {
+        self.lock().closed
+    }
+
     /// Drops what is queued and anything that comes later.
     pub fn close(&self) {
         let mut state = self.lock();
@@ -125,7 +131,7 @@ impl Input {
     }
 
     /// The next piece of input; `None` at EOF or once closed.
-    async fn pop(&self) -> Option<Vec<u8>> {
+    pub async fn pop(&self) -> Option<Vec<u8>> {
         loop {
             {
                 let mut state = self.lock();
@@ -263,11 +269,11 @@ impl Conn {
         );
     }
 
-    /// Starts the program for `shell` (no `command`) or `exec`.
+    /// Starts the channel's program: a shell, a command, or SFTP.
     fn start(
         &mut self,
         id: ChannelId,
-        command: Option<&OsStr>,
+        run: Run<'_>,
         session: &mut Session,
     ) -> Result<(), russh::Error> {
         let shared = self.shared.clone();
@@ -292,21 +298,33 @@ impl Conn {
             chan.state = state;
             return session.channel_failure(id);
         };
-        let what = describe(command, term.is_some());
-        let login = Login {
-            command,
-            pty: term.as_deref().map(|t| (t, size)),
-            peer: &peer,
-        };
-        let spawned = if stopping {
+        let what = describe(run, term.is_some());
+        let started = if stopping {
             Err(std::io::Error::other("the server is stopping"))
-        } else if command.is_some_and(|c| c.as_bytes().contains(&0)) {
-            Err(std::io::Error::other("the command has a NUL byte"))
         } else {
-            process::spawn(&shared.account, &login, &shared.registry)
+            match run {
+                Run::Sftp => Ok(Program::Sftp(sftp::Fs::new(
+                    shared.account.cwd().to_owned(),
+                ))),
+                Run::Exec(cmd) if cmd.as_bytes().contains(&0) => {
+                    Err(std::io::Error::other("the command has a NUL byte"))
+                }
+                Run::Shell | Run::Exec(_) => {
+                    let login = Login {
+                        command: match run {
+                            Run::Exec(cmd) => Some(cmd),
+                            _ => None,
+                        },
+                        pty: term.as_deref().map(|t| (t, size)),
+                        peer: &peer,
+                    };
+                    process::spawn(&shared.account, &login, &shared.registry)
+                        .map(|(process, io)| Program::Process(process, io))
+                }
+            }
         };
-        let (process, io) = match spawned {
-            Ok(spawned) => spawned,
+        let program = match started {
+            Ok(program) => program,
             Err(e) => {
                 log::info!("ssh {label}: could not run {what}: {e}");
                 input.close();
@@ -314,9 +332,16 @@ impl Conn {
                 return session.close(id);
             }
         };
-        log::info!("ssh {label}: running {what} (pid {})", process.pid());
+        match &program {
+            Program::Process(process, _) => {
+                log::info!("ssh {label}: running {what} (pid {})", process.pid());
+            }
+            Program::Sftp(_) => log::info!("ssh {label}: running {what}"),
+        }
         session.channel_success(id)?;
-        let pty = term.is_some();
+        // SFTP ignores a PTY it was given: its bytes go to it as they are,
+        // and its input can reach EOF.
+        let pty = term.is_some() && !matches!(run, Run::Sftp);
         if eof && !pty {
             input.eof();
         }
@@ -337,7 +362,6 @@ impl Conn {
             write,
             handle,
             input,
-            process,
             resized,
             finished,
             reason,
@@ -346,21 +370,30 @@ impl Conn {
             label,
             what,
         };
-        tasks.spawn(supervisor.run(io));
+        tasks.spawn(supervisor.run(program));
         Ok(())
     }
 }
 
+/// What a channel was asked to run.
+#[derive(Clone, Copy)]
+enum Run<'a> {
+    Shell,
+    Exec(&'a OsStr),
+    Sftp,
+}
+
 /// How log lines describe what ran.
-fn describe(command: Option<&OsStr>, pty: bool) -> String {
+fn describe(run: Run<'_>, pty: bool) -> String {
     let with = if pty { " with a PTY" } else { "" };
-    match command {
-        None => format!("a shell{with}"),
-        Some(cmd) => {
+    match run {
+        Run::Shell => format!("a shell{with}"),
+        Run::Exec(cmd) => {
             let cmd = cmd.to_string_lossy();
             let cmd: String = cmd.chars().take(200).collect();
             format!("{cmd:?}{with}")
         }
+        Run::Sftp => "sftp".to_owned(),
     }
 }
 
@@ -491,7 +524,7 @@ impl server::Handler for Conn {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.start(channel, None, session)
+        self.start(channel, Run::Shell, session)
     }
 
     async fn exec_request(
@@ -500,7 +533,7 @@ impl server::Handler for Conn {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.start(channel, Some(OsStr::from_bytes(data)), session)
+        self.start(channel, Run::Exec(OsStr::from_bytes(data)), session)
     }
 
     async fn subsystem_request(
@@ -509,7 +542,9 @@ impl server::Handler for Conn {
         name: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // SFTP comes later; until then scp needs `scp -O`.
+        if name == "sftp" {
+            return self.start(channel, Run::Sftp, session);
+        }
         log::info!("ssh {}: refused subsystem {name:?}", self.label);
         session.channel_failure(channel)
     }
@@ -634,13 +669,19 @@ fn close(chan: &mut Chan, why: Reason, session: &mut Session) -> Result<(), russ
     }
 }
 
+/// What a channel's supervisor runs.
+#[expect(clippy::large_enum_variant, reason = "one per channel, moved once")]
+enum Program {
+    Process(Process, Io),
+    Sftp(sftp::Fs),
+}
+
 /// Runs a channel's program and reports its end to the client.
 struct Supervisor {
     id: ChannelId,
     write: ChannelWriteHalf<Msg>,
     handle: server::Handle,
     input: Arc<Input>,
-    process: Process,
     resized: watch::Receiver<WinSize>,
     finished: Arc<AtomicBool>,
     reason: Arc<OnceLock<Reason>>,
@@ -654,89 +695,145 @@ struct Supervisor {
 }
 
 impl Supervisor {
-    async fn run(self, io: Io) {
+    async fn run(self, program: Program) {
+        match program {
+            Program::Process(process, io) => self.process(process, io).await,
+            Program::Sftp(fs) => self.sftp(fs).await,
+        }
+        self.finished.store(true, Ordering::Release);
+    }
+
+    /// Runs a process until it exits, then reaps it and reports its end;
+    /// or, torn down, ends it.
+    async fn process(&self, process: Process, io: Io) {
         let exited = match io {
-            Io::Pipes(stdin, stdout, stderr) => self.pipes(stdin, stdout, stderr).await,
-            Io::Pty(read, write) => self.pty(read, write).await,
+            Io::Pipes(stdin, stdout, stderr) => self.pipes(&process, stdin, stdout, stderr).await,
+            Io::Pty(read, write) => self.pty(&process, read, write).await,
         };
-        let Supervisor {
-            id,
-            write,
-            handle,
-            input,
-            process,
-            finished,
-            reason,
-            teardown,
-            connection,
-            label,
-            what,
-            ..
-        } = self;
-        input.close();
+        self.input.close();
         if exited {
-            // The normal end: reap, then exit status, EOF and close, each
-            // cut short by a teardown.
-            let status = process.reap().await;
-            let exit = match status {
+            let exit = match process.reap().await {
                 Ok(status) => process::exit_of(status),
                 Err(_) => Exit::Status(255),
             };
-            log::info!("ssh {label}: {what} ended: {exit:?}");
-            let report = async {
-                let sent = match exit {
-                    Exit::Status(code) => handle.exit_status_request(id, code).await,
-                    Exit::Signal(name, core) => {
-                        let sig = Exit::sig(name);
-                        handle
-                            .exit_signal_request(id, sig, core, String::new(), String::new())
-                            .await
-                    }
-                };
-                if sent.is_ok() && write.eof().await.is_ok() {
-                    let _ = write.close().await;
-                }
-            };
-            tokio::select! {
-                () = report => {}
-                () = teardown.cancelled() => {}
-            }
+            log::info!("ssh {}: {} ended: {exit:?}", self.label, self.what);
+            self.report(exit).await;
         } else {
-            let why = reason.get().copied();
-            log::info!(
-                "ssh {label}: ending {what} ({})",
-                match why {
-                    Some(Reason::Closed) => "the client closed the channel",
-                    Some(Reason::Cap) => "too much input",
-                    Some(Reason::Violation) => "data after EOF",
-                    None => "the connection ended",
-                }
-            );
-            // The cap's message goes first, while the client still reads
-            // the channel; the program is ended either way.
-            let say = async {
-                if why == Some(Reason::Cap) {
-                    let mut stderr = write.make_writer_ext(Some(1));
-                    let _ = stderr.write_all(CAP_MESSAGE.as_bytes()).await;
-                }
-            };
-            bounded(&connection, CAP_MESSAGE_TIMEOUT, say).await;
+            let why = self.ending().await;
             process.end().await;
             let _ = process.reap().await;
-            if matches!(why, Some(Reason::Cap | Reason::Violation)) {
-                bounded(&connection, CAP_MESSAGE_TIMEOUT, async {
-                    let _ = write.close().await;
-                })
-                .await;
+            self.close_after(why).await;
+        }
+    }
+
+    /// Serves SFTP until the client's EOF or the first framing or transport
+    /// error, then reports the end as sftp-server's exit would (status 0,
+    /// or 1 after an error); or, torn down, stops at once.
+    async fn sftp(&self, mut fs: sftp::Fs) {
+        let served = async {
+            let input = sftp::InputReader::new(self.input.clone());
+            sftp::serve(&mut fs, input, &mut self.write.make_writer()).await
+        };
+        let served = tokio::select! {
+            served = served => Some(served),
+            () = self.teardown.cancelled() => None,
+        };
+        // Its input closed under it (the cap, or data after EOF), which
+        // reads as EOF: the teardown that follows every such close decides.
+        let served = match served {
+            Some(_) if self.input.is_closed() => {
+                self.teardown.cancelled().await;
+                None
+            }
+            served => served,
+        };
+        // Its files are closed before the client hears of the end.
+        drop(fs);
+        self.input.close();
+        match served {
+            Some(served) => {
+                let exit = match served {
+                    Ok(()) => Exit::Status(0),
+                    Err(e) => {
+                        log::info!("ssh {}: sftp: {e}", self.label);
+                        Exit::Status(1)
+                    }
+                };
+                log::info!("ssh {}: {} ended: {exit:?}", self.label, self.what);
+                self.report(exit).await;
+            }
+            None => {
+                let why = self.ending().await;
+                self.close_after(why).await;
             }
         }
-        finished.store(true, Ordering::Release);
+    }
+
+    /// The normal end: exit status, EOF and close, each cut short by a
+    /// teardown.
+    async fn report(&self, exit: Exit) {
+        let report = async {
+            let sent = match exit {
+                Exit::Status(code) => self.handle.exit_status_request(self.id, code).await,
+                Exit::Signal(name, core) => {
+                    let sig = Exit::sig(name);
+                    self.handle
+                        .exit_signal_request(self.id, sig, core, String::new(), String::new())
+                        .await
+                }
+            };
+            if sent.is_ok() && self.write.eof().await.is_ok() {
+                let _ = self.write.close().await;
+            }
+        };
+        tokio::select! {
+            () = report => {}
+            () = self.teardown.cancelled() => {}
+        }
+    }
+
+    /// Logs why the program is being torn down and, if it is for the cap,
+    /// sends the cap's message first, while the client still reads the
+    /// channel.
+    async fn ending(&self) -> Option<Reason> {
+        let why = self.reason.get().copied();
+        log::info!(
+            "ssh {}: ending {} ({})",
+            self.label,
+            self.what,
+            match why {
+                Some(Reason::Closed) => "the client closed the channel",
+                Some(Reason::Cap) => "too much input",
+                Some(Reason::Violation) => "data after EOF",
+                None => "the connection ended",
+            }
+        );
+        let say = async {
+            if why == Some(Reason::Cap) {
+                let mut stderr = self.write.make_writer_ext(Some(1));
+                let _ = stderr.write_all(CAP_MESSAGE.as_bytes()).await;
+            }
+        };
+        bounded(&self.connection, CAP_MESSAGE_TIMEOUT, say).await;
+        why
+    }
+
+    /// Closes the channel after a teardown the server started; the client's
+    /// own close was answered already.
+    async fn close_after(&self, why: Option<Reason>) {
+        if matches!(why, Some(Reason::Cap | Reason::Violation)) {
+            bounded(&self.connection, CAP_MESSAGE_TIMEOUT, async {
+                let _ = self.write.close().await;
+            })
+            .await;
+        }
     }
 
     /// Runs a program without a PTY until it exits and its stdout and
     /// stderr reach EOF (`true`), or until teardown (`false`).
     async fn pipes(
         &self,
+        process: &Process,
         stdin: ChildStdin,
         stdout: tokio::process::ChildStdout,
         stderr: tokio::process::ChildStderr,
@@ -745,7 +842,7 @@ impl Supervisor {
             tokio::join!(
                 pump(stdout, self.write.make_writer()),
                 pump(stderr, self.write.make_writer_ext(Some(1))),
-                self.process.exited(),
+                process.exited(),
             );
         };
         let feeding = async {
@@ -762,10 +859,10 @@ impl Supervisor {
     /// Runs a program on a PTY until it exits and the terminal is drained
     /// (`true`), or until teardown (`false`). The PTY's halves are dropped
     /// on return, which closes its only master descriptor.
-    async fn pty(&self, read: OwnedReadPty, write: OwnedWritePty) -> bool {
+    async fn pty(&self, process: &Process, read: OwnedReadPty, write: OwnedWritePty) -> bool {
         let done = async {
-            pump_pty(read, self.write.make_writer(), &self.process).await;
-            self.process.exited().await;
+            pump_pty(read, self.write.make_writer(), process).await;
+            process.exited().await;
         };
         let feeding = async {
             feed_pty(write, &self.input, self.resized.clone()).await;

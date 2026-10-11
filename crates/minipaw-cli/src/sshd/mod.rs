@@ -11,11 +11,13 @@
 //! - `channel.rs`: the handler, the channel state machine and its input
 //!   buffer, and the channel's supervisor
 //! - `process.rs`: spawning, exit observation and teardown
+//! - `sftp.rs`: the `sftp` subsystem, run by a channel's supervisor
 
 mod auth;
 mod channel;
 mod config;
 mod process;
+mod sftp;
 #[cfg(test)]
 mod tests;
 
