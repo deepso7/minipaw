@@ -497,16 +497,38 @@ impl Jobs {
             .await
             .map_err(|e| StatusCode::Failure.with_message(e.to_string()))?;
         let gone = self.gone.clone();
-        let done = tokio::task::spawn_blocking(move || {
+        let mut done = Unclaimed(Some(tokio::task::spawn_blocking(move || {
             let _permit = permit;
             if gone.load(Ordering::Acquire) {
                 return Err(io::Error::other("the session ended"));
             }
             job()
-        });
-        done.await
+        })));
+        let result = done.0.as_mut().expect("set above").await;
+        done.0 = None;
+        result
             .map_err(|e| StatusCode::Failure.with_message(e.to_string()))?
             .map_err(failed)
+    }
+}
+
+/// A job whose caller may stop waiting for it, at teardown. What it then
+/// returns, an open descriptor say, is dropped off the runtime, since
+/// close(2) can hang on a stuck filesystem; dropping the finished task's
+/// handle here would close it on an async worker.
+struct Unclaimed<T: Send + 'static>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T: Send + 'static> Drop for Unclaimed<T> {
+    fn drop(&mut self) {
+        if let Some(job) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move {
+                if let Ok(value) = job.await {
+                    tokio::task::spawn_blocking(move || drop(value));
+                }
+            });
+        }
     }
 }
 
@@ -792,10 +814,11 @@ fn names_a_dir(path: &Path) -> bool {
         || bytes.ends_with(b"/..")
 }
 
-/// Renames `from` to `to` unless `to` exists, atomically. A filesystem
-/// without no-replace renames (EINVAL, ENOSYS, ENOTSUP) gets what OpenSSH's
-/// sftp-server does: a hard link and an unlink, which is atomic too, for
-/// anything but a directory; a directory gets the original error.
+/// Renames `from` to `to` unless `to` exists, atomically where the
+/// filesystem can. One without no-replace renames (EINVAL, ENOSYS,
+/// ENOTSUP) gets what OpenSSH's sftp-server does for anything but a
+/// directory: a hard link, then an unlink. That still never replaces `to`,
+/// but both names exist for a moment. A directory gets the original error.
 fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
     let cwd = rustix::fs::CWD;
     let err = match rustix::fs::renameat_with(cwd, from, cwd, to, RenameFlags::NOREPLACE) {
@@ -1073,11 +1096,15 @@ impl Handler for Fs {
                         log::debug!("sftp: leaving out a name that is not UTF-8: {raw:?}");
                         continue;
                     };
-                    // Gone since it was listed: leave it out.
-                    let stat = rustix::fs::statat(entries.fd()?, raw, AtFlags::SYMLINK_NOFOLLOW);
-                    let Ok(stat) = stat else {
-                        continue;
-                    };
+                    // Gone since it was listed: leave it out. Any other error
+                    // (no search permission, say) fails the listing rather
+                    // than making it look shorter, or empty.
+                    let stat =
+                        match rustix::fs::statat(entries.fd()?, raw, AtFlags::SYMLINK_NOFOLLOW) {
+                            Ok(stat) => stat,
+                            Err(Errno::NOENT) => continue,
+                            Err(e) => return Err(e.into()),
+                        };
                     files.push(entry(name.to_owned(), &stat));
                 }
                 Ok(files)
@@ -1466,6 +1493,26 @@ mod tests {
         // The reply to the biggest read fits what OpenSSH's client takes.
         let reply = Bytes::try_from(Packet::from(data)).expect("encode");
         assert!(reply.len() - 4 <= CLIENT_MAX_MESSAGE as usize);
+    }
+
+    /// A directory whose names can be read but whose entries cannot be
+    /// looked at fails its listing rather than looking empty.
+    #[tokio::test]
+    async fn readdir_fails_when_entries_cannot_be_stated() {
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let dir = Scratch::new("readdir-noexec");
+        let shut = dir.0.join("shut");
+        std::fs::create_dir(&shut).expect("mkdir");
+        std::fs::write(shut.join("f"), b"").expect("write");
+        let mut fs = dir.fs();
+        let handle = fs.opendir(1, "shut".into()).await.expect("opendir").handle;
+        // Readable, not searchable.
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o400)).expect("chmod");
+        let listed = tokio::time::timeout(LIMIT, fs.readdir(2, handle)).await;
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert_eq!(code(listed.expect("in time")), StatusCode::PermissionDenied);
     }
 
     #[tokio::test]

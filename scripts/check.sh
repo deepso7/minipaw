@@ -1021,7 +1021,7 @@ sftp_as() { # sftp_as <key> [sftp args...]
   host=minipaw-$("$BIN" parse "$TICKET" | sed -n 's/^peer: *//p')
   MINIPAW_DIRECT=$DIRECT sftp -F /dev/null -i "$key" -o IdentitiesOnly=yes \
     -o BatchMode=yes -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new \
-    -o UserKnownHostsFile="$KEYS/known_hosts" -o "ProxyCommand=$BIN -q $TICKET" \
+    -o UserKnownHostsFile="$KEYS/known_hosts" -o "ProxyCommand=$(printf %q "$BIN") -q $TICKET" \
     -o "HostKeyAlias=$host" "$@" "me@$host"
 }
 
@@ -1083,8 +1083,9 @@ check_serve_ssh() {
     { fail "scp downloaded different data"; return; }
   grep -q 'running sftp' "$T/serve.err" || { fail "scp did not use SFTP"; return; }
   local r=$KEYS/sftp
-  printf '%s\n' "mkdir $r" "put $T/scp.up $r/a" "ls $r" "rename $r/a $r/b" "get $r/b $T/sftp.got" \
-    "rm $r/b" "rmdir $r" >"$T/batch"
+  # Quoted for sftp's own parser, in case a path has spaces.
+  printf '%s\n' "mkdir \"$r\"" "put \"$T/scp.up\" \"$r/a\"" "ls \"$r\"" \
+    "rename \"$r/a\" \"$r/b\"" "get \"$r/b\" \"$T/sftp.got\"" "rm \"$r/b\"" "rmdir \"$r\"" >"$T/batch"
   sftp_as "$key" -b "$T/batch" </dev/null >"$T/sftp.out" 2>"$T/sftp.err" &
   pid=$!
   track $pid
