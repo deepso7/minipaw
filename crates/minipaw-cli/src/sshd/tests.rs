@@ -403,13 +403,18 @@ async fn only_an_authorized_key_logs_in() {
     bounded(async {
         let server = Server::new(keys());
         let (handle, _cut) = server.login(false).await;
-        let (mut read, _write) = run(&handle, "echo \"$USER $HOME $TERM\"", false).await;
+        let (mut read, _write) = run(&handle, "echo \"$USER $HOME ${TERM-none}\"", false).await;
         let account = &server.shared.account;
-        let want = format!("{} {} \n", account.name, account.home.display());
-        assert_eq!(
-            collect(&mut read).await,
-            [out(&want), Ev::Status(0), Ev::Eof, Ev::Close]
-        );
+        let events = collect(&mut read).await;
+        assert_eq!(events[1..], [Ev::Status(0), Ev::Eof, Ev::Close]);
+        // No TERM without a PTY, though macOS's /bin/sh makes one up.
+        let Ev::Out(got) = &events[0] else {
+            panic!("{events:?}")
+        };
+        let got = String::from_utf8_lossy(got);
+        let (who, term) = got.trim_end().rsplit_once(' ').expect("three words");
+        assert_eq!(who, format!("{} {}", account.name, account.home.display()));
+        assert!(term == "none" || term == "dumb", "{term:?}");
 
         let (mut handle, _cut) = server.connect(false).await;
         let wrong = PrivateKeyWithHashAlg::new(Arc::new(key(2)), None);
