@@ -433,7 +433,7 @@ uzers = { version = "0.12", default-features = false }
 # phase 2: the version pinned exactly, as russh is
 russh-sftp = "=3.0.1"
 bytes = { version = "1", default-features = false }  # its Bytes; already in the tree
-# tokio += "fs" (already enabled through pty-process, now named)
+# no tokio "fs": the file operations run on our own bounded jobs
 ```
 
 The library also gets `hkdf = "0.13"`.
@@ -569,10 +569,18 @@ Where PR 3 differs from the plan above, and why:
   and replies are all dropped at teardown. Its replies go through the
   channel's writer in pieces of at most 32 KiB.
 - **Framing.** A request's length may be at most 256 KiB + 1 KiB (room for
-  a 256 KiB write's header); a longer one, a zero length, a request cut
-  off by EOF, or a request of a known type that does not parse ends the
-  session. An unknown type, or a reply type sent by the client, gets
-  `OpUnsupported` with its id, and the session goes on.
+  a 256 KiB write's header); a longer one, a zero length, or a request cut
+  off by EOF ends the session. An unknown type, or a reply type sent by
+  the client, gets `OpUnsupported` with its id, and the session goes on.
+- **Strict layouts.** russh-sftp's decoder takes a request cut short after
+  a field as having empty attributes (so an `OPEN` cut off after its
+  flags would create or truncate a file), ignores trailing bytes, and
+  replaces bytes of names that are not UTF-8. So each request's layout is
+  read from the wire first: every field its type has, the attribute
+  fields its flags promise (extended pairs included), and nothing after.
+  A known request that does not have its layout ends the session, as
+  other framing errors do. A path, handle or link target that is not
+  UTF-8 gets `Failure` and nothing is done.
 - **The end.** The client's EOF between requests is the clean end: exit
   status 0, EOF, close. Any error ends it with status 1 (OpenSSH's
   sftp-server uses other codes, 11 for an oversize request). The SFTP
@@ -580,10 +588,21 @@ Where PR 3 differs from the plan above, and why:
   from EOF, so when it ends with the input closed, the supervisor waits
   for the teardown that always follows such a close, and the client gets
   the cap's message and a close rather than status 0.
-- **File data** is read and written with `pread`/`pwrite` on the std file
-  in `spawn_blocking`; everything else is `tokio::fs`. `tokio::fs::File`
-  returns from a write before the write is done and reports its error on
-  a later call, and positional I/O needs no seek state per handle.
+- **Bounded file operations, not `tokio::fs`.** Every file operation runs
+  on the blocking pool through one runner, holding one of 64 server-wide
+  permits, moved into the job, until the syscall really returns. A
+  teardown drops its wait at once but cannot abort a syscall: a job stuck
+  in the filesystem (NFS, FUSE) keeps its permit, so stuck jobs cannot
+  use up tokio's blocking pool, and once all 64 are stuck, new file
+  operations wait (cancellably) for one. A job still queued when its
+  session goes does nothing. The jobs use rustix and std directly;
+  `tokio::fs` would put its own unbounded blocking jobs underneath. File
+  data is read and written with `pread`/`pwrite`, so a handle needs no
+  seek state, and a write's error comes with its own reply.
+- **Handles are descriptors.** A file or directory handle holds its open
+  descriptor: `fstat`, `fsetstat` (`fchmod`, `futimens`) and `readdir`
+  (`fdopendir`, then `fstatat` per entry) act on what was opened, even
+  after a rename or a new directory in its place.
 - **No extensions are advertised**, in particular not
   `limits@openssh.com`: with it, OpenSSH's client raises its request size
   to the server's limit and keeps 64 requests in flight, 16 MiB, past the
@@ -596,16 +615,29 @@ Where PR 3 differs from the plan above, and why:
 - **symlink** takes OpenSSH's argument order (target, then link path),
   which every client follows, not the draft's (or russh-sftp's field
   names). The target is stored as given.
-- **rename** fails when the new name exists, as SFTP v3 says.
-- **open** creates files with the client's mode less the umask (`0666`
-  without one), and opens non-blocking, so a FIFO cannot hold a blocking
-  thread forever; reading one with no data fails instead of waiting.
-- **realpath** of a path that does not exist works `.` and `..` out by
-  name.
-- **readdir** leaves out `.` and `..`, and entries that went away while
-  being listed. Long names are `ls -l` style with numeric owners.
-- **Names are UTF-8**: russh-sftp's types are `String`s, so a name that is
-  not UTF-8 has its odd bytes replaced and cannot be reached.
+- **rename** fails when the new name exists, as SFTP v3 says, atomically:
+  `renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on
+  macOS, through rustix's `renameat_with`. Where the filesystem has no such
+  rename (EINVAL, ENOSYS, ENOTSUP), a file is moved as OpenSSH's
+  sftp-server moves it, by a hard link and an unlink, which cannot replace
+  either; a directory gets the original error.
+- **open** maps SFTP's flags straight to `open(2)`'s (Rust's `OpenOptions`
+  refuses a create opened only for reading), creates files with the
+  client's mode less the umask (`0666` without one), and opens
+  non-blocking, so a FIFO cannot hold a job forever; reading one with no
+  data fails instead of waiting.
+- **realpath** resolves the longest prefix of the path that exists,
+  symlinks and all, then works the rest, which does not exist, out by
+  name (`link/../new`, with `link` pointing at `/srv/data`, is
+  `/srv/new`). Only a missing component is passed over; any other error
+  is the reply.
+- **readdir** leaves out `.` and `..`, entries that went away while being
+  listed, and names that are not UTF-8 (logged at debug). Long names are
+  `ls -l` style with numeric owners.
+- **Names are UTF-8**: russh-sftp's types are `String`s. No name is ever
+  converted lossily: requests with other names are refused, listings
+  leave them out, and `readlink` or `realpath` of a result that is not
+  UTF-8 fails.
 - **Dependencies.** russh-sftp's own russh dependency is dev-only: no
   second russh, tokio or crypto stack. New in the lockfile: russh-sftp,
   dashmap (with crossbeam-utils and a second, older hashbrown),
@@ -614,7 +646,11 @@ Where PR 3 differs from the plan above, and why:
 - **Tests.** No in-process test drives an SFTP session past the input cap:
   the loop drains its input faster than a client can fill it, and a
   client that stops reading stalls its own russh session first. The cap's
-  path is the one shell and exec use.
+  path is the one shell and exec use. The no-replace rename's link
+  fallback is not tested either: the test filesystems all have
+  `renameat2`/`renameatx_np`. A test-only count of running channel
+  supervisors lets the channel-close test see the supervisor end while
+  the connection stays up.
 
 ## Risks
 

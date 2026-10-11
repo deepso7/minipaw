@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use minipaw::{Io, PeerId};
 use tokio::runtime::Runtime;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tokio_util::task::task_tracker::TaskTrackerToken;
@@ -54,6 +55,12 @@ struct Shared {
     policy: Policy,
     account: Account,
     registry: Arc<Registry>,
+    /// The permits for SFTP's file operations, across every session:
+    /// [`sftp::MAX_JOBS`].
+    sftp_jobs: Arc<Semaphore>,
+    /// How many channel supervisors are running.
+    #[cfg(test)]
+    supervisors: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Who may log in and as whom, settled before the server starts.
@@ -176,6 +183,9 @@ impl Sshd {
             policy: setup.policy,
             account: setup.account,
             registry: registry.clone(),
+            sftp_jobs: Arc::new(Semaphore::new(sftp::MAX_JOBS)),
+            #[cfg(test)]
+            supervisors: Arc::default(),
         });
         let tracker = TaskTracker::new();
         let acceptor = Acceptor {

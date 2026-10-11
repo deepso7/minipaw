@@ -42,7 +42,7 @@ sha2 = { version = "0.11", default-features = false }
 # Handling SIGHUP for `-q` (ssh hangs up its ProxyCommand as it exits);
 # already in the tree through crossterm.
 signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
-tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "net", "io-util", "process", "sync", "time", "macros", "fs"] }
+tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "net", "io-util", "process", "sync", "time", "macros"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 # The serving account's passwd entry (name, home, shell) for `serve --ssh`.
 uzers = { version = "0.12", default-features = false }

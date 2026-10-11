@@ -99,6 +99,8 @@ impl Server {
                 policy,
                 account,
                 registry: Arc::default(),
+                sftp_jobs: Arc::new(tokio::sync::Semaphore::new(sftp::MAX_JOBS)),
+                supervisors: Arc::default(),
             }),
             stop: CancellationToken::new(),
             conns: TaskTracker::new(),
@@ -1218,9 +1220,76 @@ async fn sftp_ends_with_status_eof_and_close() {
     .await;
 }
 
-/// A client that goes away in the middle of a download, with the server
-/// waiting on its window, is torn down at once, and the server goes on
-/// serving.
+/// Waits for `server`'s channel supervisors to number `n`.
+async fn supervisors(server: &Server, n: usize) {
+    timeout(Duration::from_secs(5), async {
+        while server.shared.supervisors.load(Ordering::SeqCst) != n {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("not {n} supervisors running"));
+}
+
+/// A client that closes its SFTP channel in the middle of a download, with
+/// requests in flight, ends that channel's supervisor at once, while the
+/// connection stays up and answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_the_channel_mid_transfer_ends_its_sftp() {
+    bounded(async {
+        let home = Home::new("closed");
+        let (data, _) = pattern(20_000_000);
+        std::fs::write(home.0.join("big"), &data).expect("write");
+        let server = home.server();
+        let (handle, cut) = server.login(true).await;
+        let sftp = sftp(&handle).await;
+        let mut file = sftp.open("big").await.expect("open");
+        let mut buf = vec![0; 64 * 1024];
+        file.read_exact(&mut buf).await.expect("read");
+        supervisors(&server, 1).await;
+        // Dropping the session drops its channel stream, which closes the
+        // channel; the connection stays.
+        drop(file);
+        drop(sftp);
+        supervisors(&server, 0).await;
+        for _ in 0..3 {
+            timeout(Duration::from_secs(2), handle.send_ping())
+                .await
+                .expect("ping in time")
+                .expect("ping");
+        }
+        cut.shutdown(Shutdown::Both).expect("cut");
+
+        // The same with nothing in flight, so that only the teardown, not a
+        // failed reply, can end the loop waiting on its input.
+        let (handle, cut) = server.login(true).await;
+        let channel = handle.channel_open_session().await.expect("session");
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .expect("subsystem");
+        channel
+            .data(&[0, 0, 0, 5, 1, 0, 0, 0, 3][..])
+            .await
+            .expect("init");
+        let (mut read, write) = channel.split();
+        assert_eq!(reply(&mut read).await, Ev::Success);
+        output_until(&mut read, "\x02").await;
+        supervisors(&server, 1).await;
+        write.close().await.expect("close");
+        supervisors(&server, 0).await;
+        timeout(Duration::from_secs(2), handle.send_ping())
+            .await
+            .expect("ping in time")
+            .expect("ping");
+        cut.shutdown(Shutdown::Both).expect("cut");
+        server.stop().await;
+    })
+    .await;
+}
+
+/// A client whose connection drops in the middle of a download is torn
+/// down at once, and the server goes on serving.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_gone_mid_transfer_ends_its_sftp() {
     bounded(async {
@@ -1228,29 +1297,23 @@ async fn a_client_gone_mid_transfer_ends_its_sftp() {
         let (data, _) = pattern(20_000_000);
         std::fs::write(home.0.join("big"), &data).expect("write");
         let server = home.server();
-        for how in ["the channel closes", "the connection drops"] {
-            let (handle, cut) = server.login(true).await;
-            let sftp = sftp(&handle).await;
-            let mut file = sftp.open("big").await.expect("open");
-            let mut buf = vec![0; 64 * 1024];
-            file.read_exact(&mut buf).await.expect("read");
-            // Stop reading, with requests still in flight.
-            if how == "the channel closes" {
-                drop(file);
-                drop(sftp);
-                sleep(Duration::from_millis(100)).await;
-            }
-            cut.shutdown(Shutdown::Both).expect("cut");
-            drop(handle);
-            server.conns.close();
-            timeout(
-                config::CONNECTION_END + Duration::from_secs(1),
-                server.conns.wait(),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("still serving after {how}"));
-            server.conns.reopen();
-        }
+        let (handle, cut) = server.login(true).await;
+        let old = sftp(&handle).await;
+        let mut file = old.open("big").await.expect("open");
+        let mut buf = vec![0; 64 * 1024];
+        file.read_exact(&mut buf).await.expect("read");
+        // Stop reading, with requests still in flight.
+        cut.shutdown(Shutdown::Both).expect("cut");
+        drop(handle);
+        server.conns.close();
+        timeout(
+            config::CONNECTION_END + Duration::from_secs(1),
+            server.conns.wait(),
+        )
+        .await
+        .expect("still serving after the connection dropped");
+        server.conns.reopen();
+        supervisors(&server, 0).await;
         // Still serving.
         let (handle, _cut) = server.login(true).await;
         let sftp = sftp(&handle).await;
@@ -1258,6 +1321,7 @@ async fn a_client_gone_mid_transfer_ends_its_sftp() {
             sftp.metadata("big").await.expect("stat").size,
             Some(data.len() as u64)
         );
+        drop((file, old));
         server.stop().await;
     })
     .await;

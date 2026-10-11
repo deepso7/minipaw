@@ -6,22 +6,32 @@
 //! `server::run`: it runs inside the channel's supervisor, which cancels it
 //! with the channel, and it ends at the first framing or transport error.
 //! It reads the channel's capped input buffer through [`InputReader`], and
-//! a request's length is checked before anything is allocated for it.
+//! a request's length is checked before anything is allocated for it. Each
+//! request's layout is checked on the wire before russh-sftp decodes it,
+//! since its decoder lets missing fields and trailing bytes through.
+//!
+//! Every file operation runs on the blocking pool through [`Jobs`], at most
+//! [`MAX_JOBS`] at once across the server: a stuck filesystem can hold a
+//! job past its session's end, but cannot use up the pool.
 //!
 //! Paths are relative to the serving user's home, and absolute paths reach
 //! anywhere that user can: this is not a sandbox, any more than a shell is.
-//! Names are UTF-8 strings in russh-sftp's types, so a name that is not
-//! UTF-8 arrives with its odd bytes replaced and is not found.
+//! Names must be UTF-8 (russh-sftp's types are `String`s): a request with
+//! another name is refused, and listings leave such names out, so no name
+//! is ever changed on its way to or from the filesystem.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt;
-use std::fs::{Metadata, Permissions};
 use std::future::Future;
 use std::io;
-use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -30,8 +40,10 @@ use russh_sftp::protocol::{
     StatusCode, Version,
 };
 use russh_sftp::server::{Handler, StatusReply};
-use rustix::fs::{AtFlags, Mode, Timespec, Timestamps};
+use rustix::fs::{AtFlags, Dir, Mode, OFlags, RenameFlags, Stat, Timespec, Timestamps};
+use rustix::io::Errno;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
+use tokio::sync::Semaphore;
 
 use super::channel::Input;
 use super::config::CHUNK;
@@ -49,14 +61,31 @@ pub const MAX_HANDLES: usize = 256;
 /// How many names one `readdir` returns.
 pub const READDIR_PAGE: usize = 128;
 
-/// The request types a client may send (SSH_FXP_INIT, OPEN through
-/// SYMLINK, and EXTENDED); anything else gets `OpUnsupported`.
-fn is_request(kind: u8) -> bool {
-    matches!(kind, 1 | 3..=20 | 200)
-}
+/// How many file operations may run at once, across every SFTP session of
+/// the server. A session runs one at a time; the rest is room for jobs
+/// stuck in the filesystem after their session ended.
+pub const MAX_JOBS: usize = 64;
 
+const SSH_FXP_INIT: u8 = 1;
+const SSH_FXP_OPEN: u8 = 3;
+const SSH_FXP_CLOSE: u8 = 4;
+const SSH_FXP_READ: u8 = 5;
+const SSH_FXP_WRITE: u8 = 6;
+const SSH_FXP_LSTAT: u8 = 7;
+const SSH_FXP_FSTAT: u8 = 8;
 const SSH_FXP_SETSTAT: u8 = 9;
 const SSH_FXP_FSETSTAT: u8 = 10;
+const SSH_FXP_OPENDIR: u8 = 11;
+const SSH_FXP_READDIR: u8 = 12;
+const SSH_FXP_REMOVE: u8 = 13;
+const SSH_FXP_MKDIR: u8 = 14;
+const SSH_FXP_RMDIR: u8 = 15;
+const SSH_FXP_REALPATH: u8 = 16;
+const SSH_FXP_STAT: u8 = 17;
+const SSH_FXP_RENAME: u8 = 18;
+const SSH_FXP_READLINK: u8 = 19;
+const SSH_FXP_SYMLINK: u8 = 20;
+const SSH_FXP_EXTENDED: u8 = 200;
 
 /// Why the loop ended early.
 #[derive(Debug)]
@@ -67,8 +96,8 @@ pub enum Error {
     Empty,
     /// The input ended inside a request.
     Truncated,
-    /// A request of a known type did not parse, or its reply did not
-    /// encode.
+    /// A request of a known type did not have its type's layout, or its
+    /// reply did not encode.
     Malformed(String),
     /// The channel failed.
     Io(io::Error),
@@ -135,35 +164,184 @@ async fn read_exact(input: &mut (impl AsyncRead + Unpin), buf: &mut [u8]) -> Res
 /// The reply to one request (type and payload, without the length).
 async fn answer(fs: &mut Fs, mut frame: Bytes) -> Result<Packet, Error> {
     let kind = frame[0];
-    if !is_request(kind) {
+    let Some(shape) = Shape::of(&frame) else {
+        if is_request(kind) {
+            return Err(Error::Malformed(format!("type {kind}")));
+        }
         let id = frame
             .get(1..5)
             .map_or(0, |id| u32::from_be_bytes(id.try_into().expect("4 bytes")));
         return Ok(status(id, StatusCode::OpUnsupported.into()));
+    };
+    if !shape.utf8 {
+        let reply = StatusCode::Failure.with_message("names must be UTF-8");
+        return Ok(status(shape.id, reply));
     }
     // russh-sftp's attributes drop the extended pairs; the raw flags still
     // show them.
     if matches!(kind, SSH_FXP_SETSTAT | SSH_FXP_FSETSTAT)
-        && let Some((id, flags)) = setstat_flags(&frame)
-        && flags & !(FileAttr::PERMISSIONS | FileAttr::ACMODTIME).bits() != 0
+        && shape.attrs.unwrap_or(0) & !(FileAttr::PERMISSIONS | FileAttr::ACMODTIME).bits() != 0
     {
-        return Ok(status(id, unsupported_attrs()));
+        return Ok(status(shape.id, unsupported_attrs()));
     }
     let request = Packet::try_from(&mut frame).map_err(|e| Error::Malformed(e.to_string()))?;
     Ok(dispatch(fs, request).await)
 }
 
-/// A `setstat` or `fsetstat`'s id and raw attribute flags: after the type,
-/// the id, then a path or handle string.
-fn setstat_flags(frame: &[u8]) -> Option<(u32, u32)> {
-    let u32_at = |at: usize| {
-        let bytes = frame.get(at..at.checked_add(4)?)?;
-        Some(u32::from_be_bytes(bytes.try_into().ok()?))
-    };
-    let id = u32_at(1)?;
-    let name = usize::try_from(u32_at(5)?).ok()?;
-    let flags = u32_at(9usize.checked_add(name)?)?;
-    Some((id, flags))
+/// The request types a client may send (SSH_FXP_INIT, OPEN through
+/// SYMLINK, and EXTENDED); anything else gets `OpUnsupported`.
+fn is_request(kind: u8) -> bool {
+    matches!(
+        kind,
+        SSH_FXP_INIT | SSH_FXP_OPEN..=SSH_FXP_SYMLINK | SSH_FXP_EXTENDED
+    )
+}
+
+/// What a request's layout says, read from the wire before russh-sftp
+/// decodes it: its decoder takes a request cut short after a field as
+/// having empty attributes, ignores trailing bytes, and replaces bytes that
+/// are not UTF-8 in names.
+#[derive(Debug, PartialEq, Eq)]
+struct Shape {
+    id: u32,
+    /// The attribute flags, for a request with attributes.
+    attrs: Option<u32>,
+    /// Whether every name in it is UTF-8.
+    utf8: bool,
+}
+
+impl Shape {
+    /// `None` for a request that is not a request type, or does not have
+    /// its type's layout to the last byte.
+    fn of(frame: &[u8]) -> Option<Shape> {
+        let mut wire = Wire {
+            rest: &frame[1..],
+            utf8: true,
+        };
+        let kind = frame[0];
+        if kind == SSH_FXP_INIT {
+            wire.u32()?;
+            // Extension pairs, to the end.
+            while !wire.rest.is_empty() {
+                wire.bytes()?;
+                wire.bytes()?;
+            }
+            return Some(Shape {
+                id: 0,
+                attrs: None,
+                utf8: true,
+            });
+        }
+        let id = wire.u32()?;
+        let mut attrs = None;
+        match kind {
+            SSH_FXP_OPEN => {
+                wire.name()?;
+                wire.u32()?;
+                attrs = Some(wire.attrs()?);
+            }
+            SSH_FXP_SETSTAT | SSH_FXP_FSETSTAT | SSH_FXP_MKDIR => {
+                wire.name()?;
+                attrs = Some(wire.attrs()?);
+            }
+            SSH_FXP_READ => {
+                wire.name()?;
+                wire.u64()?;
+                wire.u32()?;
+            }
+            SSH_FXP_WRITE => {
+                wire.name()?;
+                wire.u64()?;
+                wire.bytes()?;
+            }
+            SSH_FXP_CLOSE | SSH_FXP_LSTAT | SSH_FXP_FSTAT | SSH_FXP_OPENDIR | SSH_FXP_READDIR
+            | SSH_FXP_REMOVE | SSH_FXP_RMDIR | SSH_FXP_REALPATH | SSH_FXP_STAT
+            | SSH_FXP_READLINK => {
+                wire.name()?;
+            }
+            SSH_FXP_RENAME | SSH_FXP_SYMLINK => {
+                wire.name()?;
+                wire.name()?;
+            }
+            SSH_FXP_EXTENDED => {
+                // Its name, then whatever the extension takes.
+                wire.bytes()?;
+                wire.rest = &[];
+            }
+            _ => return None,
+        }
+        wire.rest.is_empty().then_some(Shape {
+            id,
+            attrs,
+            utf8: wire.utf8,
+        })
+    }
+}
+
+/// A request's fields, read in order.
+struct Wire<'a> {
+    rest: &'a [u8],
+    /// Cleared by a name that is not UTF-8.
+    utf8: bool,
+}
+
+impl<'a> Wire<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let rest: &'a [u8] = self.rest;
+        let (taken, rest) = rest.split_at_checked(n)?;
+        self.rest = rest;
+        Some(taken)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn bytes(&mut self) -> Option<&'a [u8]> {
+        let len = usize::try_from(self.u32()?).ok()?;
+        self.take(len)
+    }
+
+    /// A path, handle or link target.
+    fn name(&mut self) -> Option<()> {
+        let name = self.bytes()?;
+        if std::str::from_utf8(name).is_err() {
+            self.utf8 = false;
+        }
+        Some(())
+    }
+
+    /// An attributes block: its flags, then the fields they say it has.
+    fn attrs(&mut self) -> Option<u32> {
+        let flags = self.u32()?;
+        let has = |flag: FileAttr| flags & flag.bits() != 0;
+        if has(FileAttr::SIZE) {
+            self.u64()?;
+        }
+        if has(FileAttr::UIDGID) {
+            self.u32()?;
+            self.u32()?;
+        }
+        if has(FileAttr::PERMISSIONS) {
+            self.u32()?;
+        }
+        if has(FileAttr::ACMODTIME) {
+            self.u32()?;
+            self.u32()?;
+        }
+        if has(FileAttr::EXTENDED) {
+            // Each pair takes at least 8 bytes, so this ends with the frame.
+            for _ in 0..self.u32()? {
+                self.bytes()?;
+                self.bytes()?;
+            }
+        }
+        Some(flags)
+    }
 }
 
 fn status(id: u32, reply: StatusReply) -> Packet {
@@ -279,13 +457,63 @@ impl AsyncRead for InputReader {
     }
 }
 
-/// What a handle names.
-enum Open {
-    File(Arc<std::fs::File>),
-    Dir {
-        path: PathBuf,
-        entries: tokio::fs::ReadDir,
-    },
+/// Runs a session's file operations on the blocking pool, each holding one
+/// of the server's [`MAX_JOBS`] permits until it is really done.
+///
+/// A syscall cannot be aborted: when the session is torn down, a job
+/// already running finishes by itself and only then gives its permit back,
+/// and the teardown does not wait for it. A job queued but not yet started
+/// does nothing once its session is gone.
+pub struct Jobs {
+    permits: Arc<Semaphore>,
+    /// Set when the session goes.
+    gone: Arc<AtomicBool>,
+}
+
+impl Jobs {
+    pub fn new(permits: Arc<Semaphore>) -> Jobs {
+        Jobs {
+            permits,
+            gone: Arc::default(),
+        }
+    }
+
+    async fn run<T: Send + 'static>(
+        &self,
+        job: impl FnOnce() -> io::Result<T> + Send + 'static,
+    ) -> Result<T, StatusReply> {
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| StatusCode::Failure.with_message(e.to_string()))?;
+        let gone = self.gone.clone();
+        let done = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            if gone.load(Ordering::Acquire) {
+                return Err(io::Error::other("the session ended"));
+            }
+            job()
+        });
+        done.await
+            .map_err(|e| StatusCode::Failure.with_message(e.to_string()))?
+            .map_err(failed)
+    }
+}
+
+impl Drop for Jobs {
+    fn drop(&mut self) {
+        self.gone.store(true, Ordering::Release);
+    }
+}
+
+/// What a handle names: an open file or directory, by descriptor, so a
+/// rename under it changes nothing.
+struct Open {
+    fd: Arc<OwnedFd>,
+    /// A directory's listing, read a page at a time.
+    entries: Option<Arc<Mutex<Dir>>>,
 }
 
 /// The SFTP requests, on the serving user's files.
@@ -294,14 +522,16 @@ pub struct Fs {
     home: PathBuf,
     handles: HashMap<String, Open>,
     next: u64,
+    jobs: Jobs,
 }
 
 impl Fs {
-    pub fn new(home: PathBuf) -> Fs {
+    pub fn new(home: PathBuf, jobs: Jobs) -> Fs {
         Fs {
             home,
             handles: HashMap::new(),
             next: 0,
+            jobs,
         }
     }
 
@@ -310,25 +540,23 @@ impl Fs {
         self.home.join(path)
     }
 
-    fn add(&mut self, open: Open) -> Result<String, StatusReply> {
+    fn room(&self) -> Result<(), StatusReply> {
         if self.handles.len() >= MAX_HANDLES {
             return Err(StatusCode::Failure.with_message("too many open handles"));
         }
+        Ok(())
+    }
+
+    fn add(&mut self, open: Open) -> String {
         self.next += 1;
         let handle = self.next.to_string();
         self.handles.insert(handle.clone(), open);
-        Ok(handle)
+        handle
     }
 
-    fn get(&self, handle: &str) -> Result<&Open, StatusReply> {
-        self.handles.get(handle).ok_or_else(bad_handle)
-    }
-
-    fn file(&self, handle: &str) -> Result<Arc<std::fs::File>, StatusReply> {
-        match self.get(handle)? {
-            Open::File(file) => Ok(file.clone()),
-            Open::Dir { .. } => Err(bad_handle()),
-        }
+    fn fd(&self, handle: &str) -> Result<Arc<OwnedFd>, StatusReply> {
+        let open = self.handles.get(handle).ok_or_else(bad_handle)?;
+        Ok(open.fd.clone())
     }
 }
 
@@ -359,38 +587,57 @@ fn ok(id: u32) -> Status {
     }
 }
 
-/// Runs a blocking file operation off the runtime's threads.
-async fn blocking<T: Send + 'static>(
-    f: impl FnOnce() -> io::Result<T> + Send + 'static,
-) -> Result<T, StatusReply> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| StatusCode::Failure.with_message(e.to_string()))?
-        .map_err(failed)
+/// A name for the client, which must be UTF-8 to be sent unchanged.
+fn utf8(name: OsString) -> io::Result<String> {
+    name.into_string().map_err(|name| {
+        io::Error::other(format!(
+            "{} is not UTF-8",
+            String::from_utf8_lossy(name.as_bytes())
+        ))
+    })
+}
+
+/// The permission bits of `mode` as rustix takes them (`mode_t` is 16 bits
+/// on macOS).
+fn mode(mode: u32) -> Mode {
+    Mode::from_bits_truncate(narrow(mode & 0o7777))
+}
+
+fn narrow<T: TryFrom<u32> + Default>(n: u32) -> T {
+    T::try_from(n).unwrap_or_default()
+}
+
+/// `stat` fields widened, whatever their width on this platform.
+fn wide<T: Into<i64>>(n: T) -> i64 {
+    n.into()
+}
+
+fn bits<T: Into<u32>>(n: T) -> u32 {
+    n.into()
 }
 
 fn seconds(t: i64) -> u32 {
     t.clamp(0, i64::from(u32::MAX)) as u32
 }
 
-/// `metadata` as SFTP attributes: the raw mode, with its file type.
-fn attrs(metadata: &Metadata) -> FileAttributes {
+/// `stat` as SFTP attributes: the raw mode, with its file type.
+fn attrs(stat: &Stat) -> FileAttributes {
     FileAttributes {
-        size: Some(metadata.len()),
-        uid: Some(metadata.uid()),
+        size: Some(u64::try_from(wide(stat.st_size)).unwrap_or(0)),
+        uid: Some(stat.st_uid),
         user: None,
-        gid: Some(metadata.gid()),
+        gid: Some(stat.st_gid),
         group: None,
-        permissions: Some(metadata.mode()),
-        atime: Some(seconds(metadata.atime())),
-        mtime: Some(seconds(metadata.mtime())),
+        permissions: Some(bits(stat.st_mode)),
+        atime: Some(seconds(wide(stat.st_atime))),
+        mtime: Some(seconds(wide(stat.st_mtime))),
     }
 }
 
 /// A directory entry, with an `ls -l` style long name.
-fn entry(name: String, metadata: &Metadata) -> File {
-    let mut file = File::new(name, attrs(metadata));
-    let kind = match metadata.mode() & 0o170_000 {
+fn entry(name: String, stat: &Stat) -> File {
+    let mut file = File::new(name, attrs(stat));
+    let kind = match bits(stat.st_mode) & 0o170_000 {
         0o040_000 => "d",
         0o120_000 => "l",
         0o010_000 => "p",
@@ -404,42 +651,98 @@ fn entry(name: String, metadata: &Metadata) -> File {
 }
 
 /// A single name, as `realpath` and `readlink` answer.
-fn name(id: u32, path: &Path) -> Name {
-    let path = path.to_string_lossy().into_owned();
+fn name(id: u32, name: String) -> Name {
     Name {
         id,
         files: vec![File {
-            filename: path.clone(),
-            longname: path,
+            filename: name.clone(),
+            longname: name,
             attrs: FileAttributes::empty(),
         }],
     }
 }
 
-/// `path` with `.` and `..` worked out by name alone, for a path that does
-/// not exist (yet).
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::from("/");
-    for part in path.components() {
-        match part {
-            Component::Normal(name) => out.push(name),
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+/// The open(2) flags for SFTP's, mapped directly: Rust's `OpenOptions`
+/// refuses to create a file opened only for reading. Never blocking, so a
+/// FIFO cannot hold a job forever.
+fn open_flags(pflags: OpenFlags) -> OFlags {
+    let read = pflags.contains(OpenFlags::READ);
+    let write = pflags.contains(OpenFlags::WRITE);
+    let mut flags = match (read, write) {
+        (true, true) => OFlags::RDWR,
+        (false, true) => OFlags::WRONLY,
+        _ => OFlags::RDONLY,
+    } | OFlags::NONBLOCK
+        | OFlags::CLOEXEC
+        | OFlags::NOCTTY;
+    for (sftp, unix) in [
+        (OpenFlags::APPEND, OFlags::APPEND),
+        (OpenFlags::CREATE, OFlags::CREATE),
+        (OpenFlags::TRUNCATE, OFlags::TRUNC),
+        (OpenFlags::EXCLUDE, OFlags::EXCL),
+    ] {
+        if pflags.contains(sftp) {
+            flags |= unix;
         }
     }
-    out
+    flags
+}
+
+/// The canonical form of `path`: its longest existing prefix resolved,
+/// symlinks and all, and the rest, which does not exist, with `.` and `..`
+/// worked out by name. Only a missing component is passed over.
+fn resolve(path: &Path) -> io::Result<PathBuf> {
+    let parts: Vec<Component<'_>> = path.components().collect();
+    for split in (1..=parts.len()).rev() {
+        let prefix: PathBuf = parts[..split].iter().collect();
+        match std::fs::canonicalize(&prefix) {
+            Ok(mut real) => {
+                for part in &parts[split..] {
+                    match part {
+                        Component::Normal(name) => real.push(name),
+                        Component::ParentDir => {
+                            real.pop();
+                        }
+                        Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+                    }
+                }
+                return Ok(real);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::from(io::ErrorKind::NotFound))
+}
+
+/// Renames `from` to `to` unless `to` exists, atomically. A filesystem
+/// without no-replace renames (EINVAL, ENOSYS, ENOTSUP) gets what OpenSSH's
+/// sftp-server does: a hard link and an unlink, which is atomic too, for
+/// anything but a directory; a directory gets the original error.
+fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
+    let cwd = rustix::fs::CWD;
+    let err = match rustix::fs::renameat_with(cwd, from, cwd, to, RenameFlags::NOREPLACE) {
+        Ok(()) => return Ok(()),
+        Err(e @ (Errno::INVAL | Errno::NOSYS | Errno::NOTSUP)) => e,
+        Err(e) => return Err(e.into()),
+    };
+    let is_dir =
+        rustix::fs::lstat(from).is_ok_and(|stat| bits(stat.st_mode) & 0o170_000 == 0o040_000);
+    if is_dir {
+        return Err(err.into());
+    }
+    rustix::fs::linkat(cwd, from, cwd, to, AtFlags::empty())?;
+    rustix::fs::unlinkat(cwd, from, AtFlags::empty())?;
+    Ok(())
 }
 
 /// What a `setstat` asks for: the mode and the times, nothing else.
-fn settable(attrs: &FileAttributes) -> Result<(Option<u32>, Option<Timestamps>), StatusReply> {
+fn settable(attrs: &FileAttributes) -> Result<(Option<Mode>, Option<Timestamps>), StatusReply> {
     if attrs.size.is_some() || attrs.uid.is_some() || attrs.gid.is_some() {
         return Err(unsupported_attrs());
     }
-    let mode = attrs.permissions.map(|mode| mode & 0o7777);
     let time = |t: u32| Timespec {
-        tv_sec: i64::from(t),
+        tv_sec: t.into(),
         tv_nsec: 0,
     };
     let times = match (attrs.atime, attrs.mtime) {
@@ -449,7 +752,7 @@ fn settable(attrs: &FileAttributes) -> Result<(Option<u32>, Option<Timestamps>),
         }),
         _ => None,
     };
-    Ok((mode, times))
+    Ok((attrs.permissions.map(mode), times))
 }
 
 impl Handler for Fs {
@@ -470,6 +773,7 @@ impl Handler for Fs {
         Ok(Version::new())
     }
 
+    /// Created with the client's mode less the umask, as sftp-server does.
     async fn open(
         &mut self,
         id: u32,
@@ -477,21 +781,18 @@ impl Handler for Fs {
         pflags: OpenFlags,
         attrs: FileAttributes,
     ) -> Result<Handle, StatusReply> {
-        if self.handles.len() >= MAX_HANDLES {
-            return Err(StatusCode::Failure.with_message("too many open handles"));
-        }
-        let mut options = std::fs::OpenOptions::from(pflags);
-        // Created with the client's mode, less the umask, as sftp-server
-        // does. Non-blocking, so a FIFO cannot hold a thread forever.
-        options
-            .mode(attrs.permissions.map_or(0o666, |mode| mode & 0o7777))
-            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
-        let file = tokio::fs::OpenOptions::from(options)
-            .open(self.path(&filename))
-            .await
-            .map_err(failed)?;
-        let file = Arc::new(file.into_std().await);
-        let handle = self.add(Open::File(file))?;
+        self.room()?;
+        let path = self.path(&filename);
+        let flags = open_flags(pflags);
+        let mode = mode(attrs.permissions.unwrap_or(0o666));
+        let fd = self
+            .jobs
+            .run(move || Ok(rustix::fs::open(&path, flags, mode)?))
+            .await?;
+        let handle = self.add(Open {
+            fd: Arc::new(fd),
+            entries: None,
+        });
         Ok(Handle { id, handle })
     }
 
@@ -508,23 +809,25 @@ impl Handler for Fs {
         offset: u64,
         len: u32,
     ) -> Result<Data, StatusReply> {
-        let file = self.file(&handle)?;
+        let fd = self.fd(&handle)?;
         let len = len.min(MAX_READ) as usize;
-        let data = blocking(move || {
-            let mut data = vec![0; len];
-            let mut got = 0;
-            while got < len {
-                match file.read_at(&mut data[got..], offset + got as u64) {
-                    Ok(0) => break,
-                    Ok(n) => got += n,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    Err(e) => return Err(e),
+        let data = self
+            .jobs
+            .run(move || {
+                let mut data = vec![0; len];
+                let mut got = 0;
+                while got < len {
+                    match rustix::io::pread(&*fd, &mut data[got..], offset + got as u64) {
+                        Ok(0) => break,
+                        Ok(n) => got += n,
+                        Err(Errno::INTR) => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
-            }
-            data.truncate(got);
-            Ok(data)
-        })
-        .await?;
+                data.truncate(got);
+                Ok(data)
+            })
+            .await?;
         if data.is_empty() && len > 0 {
             return Err(StatusCode::Eof.into());
         }
@@ -538,32 +841,39 @@ impl Handler for Fs {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<Status, StatusReply> {
-        let file = self.file(&handle)?;
-        blocking(move || file.write_all_at(&data, offset)).await?;
+        let fd = self.fd(&handle)?;
+        self.jobs
+            .run(move || {
+                let mut sent = 0;
+                while sent < data.len() {
+                    match rustix::io::pwrite(&*fd, &data[sent..], offset + sent as u64) {
+                        Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                        Ok(n) => sent += n,
+                        Err(Errno::INTR) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                Ok(())
+            })
+            .await?;
         Ok(ok(id))
     }
 
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, StatusReply> {
-        let metadata = tokio::fs::symlink_metadata(self.path(&path))
-            .await
-            .map_err(failed)?;
+        let path = self.path(&path);
+        let stat = self.jobs.run(move || Ok(rustix::fs::lstat(&path)?)).await?;
         Ok(Attrs {
             id,
-            attrs: attrs(&metadata),
+            attrs: attrs(&stat),
         })
     }
 
     async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, StatusReply> {
-        let metadata = match self.get(&handle)? {
-            Open::File(file) => {
-                let file = file.clone();
-                blocking(move || file.metadata()).await?
-            }
-            Open::Dir { path, .. } => tokio::fs::metadata(path).await.map_err(failed)?,
-        };
+        let fd = self.fd(&handle)?;
+        let stat = self.jobs.run(move || Ok(rustix::fs::fstat(&*fd)?)).await?;
         Ok(Attrs {
             id,
-            attrs: attrs(&metadata),
+            attrs: attrs(&stat),
         })
     }
 
@@ -577,21 +887,21 @@ impl Handler for Fs {
     ) -> Result<Status, StatusReply> {
         let (mode, times) = settable(&attrs)?;
         let path = self.path(&path);
-        if let Some(mode) = mode {
-            tokio::fs::set_permissions(&path, Permissions::from_mode(mode))
-                .await
-                .map_err(failed)?;
-        }
-        if let Some(times) = times {
-            blocking(move || {
-                rustix::fs::utimensat(rustix::fs::CWD, &path, &times, AtFlags::empty())
-                    .map_err(io::Error::from)
+        self.jobs
+            .run(move || {
+                if let Some(mode) = mode {
+                    rustix::fs::chmod(&path, mode)?;
+                }
+                if let Some(times) = times {
+                    rustix::fs::utimensat(rustix::fs::CWD, &path, &times, AtFlags::empty())?;
+                }
+                Ok(())
             })
             .await?;
-        }
         Ok(ok(id))
     }
 
+    /// As `setstat`, on the open file or directory itself.
     async fn fsetstat(
         &mut self,
         id: u32,
@@ -599,55 +909,75 @@ impl Handler for Fs {
         attrs: FileAttributes,
     ) -> Result<Status, StatusReply> {
         let (mode, times) = settable(&attrs)?;
-        match self.get(&handle)? {
-            Open::File(file) => {
-                let file = file.clone();
-                blocking(move || {
-                    if let Some(mode) = mode {
-                        rustix::fs::fchmod(&*file, Mode::from_raw_mode(mode))?;
-                    }
-                    if let Some(times) = times {
-                        rustix::fs::futimens(&*file, &times)?;
-                    }
-                    Ok(())
-                })
-                .await?;
-                Ok(ok(id))
-            }
-            Open::Dir { path, .. } => {
-                let path = path.to_string_lossy().into_owned();
-                self.setstat(id, path, attrs).await
-            }
-        }
+        let fd = self.fd(&handle)?;
+        self.jobs
+            .run(move || {
+                if let Some(mode) = mode {
+                    rustix::fs::fchmod(&*fd, mode)?;
+                }
+                if let Some(times) = times {
+                    rustix::fs::futimens(&*fd, &times)?;
+                }
+                Ok(())
+            })
+            .await?;
+        Ok(ok(id))
     }
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, StatusReply> {
-        if self.handles.len() >= MAX_HANDLES {
-            return Err(StatusCode::Failure.with_message("too many open handles"));
-        }
+        self.room()?;
         let path = self.path(&path);
-        let entries = tokio::fs::read_dir(&path).await.map_err(failed)?;
-        let handle = self.add(Open::Dir { path, entries })?;
+        let (fd, entries) = self
+            .jobs
+            .run(move || {
+                let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+                let fd = rustix::fs::open(&path, flags, Mode::empty())?;
+                let entries = Dir::read_from(&fd)?;
+                Ok((fd, entries))
+            })
+            .await?;
+        let handle = self.add(Open {
+            fd: Arc::new(fd),
+            entries: Some(Arc::new(Mutex::new(entries))),
+        });
         Ok(Handle { id, handle })
     }
 
-    /// The next [`READDIR_PAGE`] names at most, then `Eof`.
+    /// The next [`READDIR_PAGE`] names at most, then `Eof`. Names that are
+    /// not UTF-8 are left out rather than changed.
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, StatusReply> {
-        let Some(Open::Dir { entries, .. }) = self.handles.get_mut(&handle) else {
-            return Err(bad_handle());
+        let open = self.handles.get(&handle).ok_or_else(bad_handle)?;
+        let (fd, entries) = match &open.entries {
+            Some(entries) => (open.fd.clone(), entries.clone()),
+            None => return Err(bad_handle()),
         };
-        let mut files = Vec::new();
-        while files.len() < READDIR_PAGE {
-            let Some(entry) = entries.next_entry().await.map_err(failed)? else {
-                break;
-            };
-            // Gone since it was listed: leave it out.
-            let Ok(metadata) = entry.metadata().await else {
-                continue;
-            };
-            let name = entry.file_name().to_string_lossy().into_owned();
-            files.push(self::entry(name, &metadata));
-        }
+        let files = self
+            .jobs
+            .run(move || {
+                let mut entries = entries.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut files = Vec::new();
+                while files.len() < READDIR_PAGE {
+                    let Some(dirent) = entries.read() else {
+                        break;
+                    };
+                    let dirent = dirent?;
+                    let raw = dirent.file_name();
+                    if matches!(raw.to_bytes(), b"." | b"..") {
+                        continue;
+                    }
+                    let Ok(name) = raw.to_str() else {
+                        log::debug!("sftp: leaving out a name that is not UTF-8: {raw:?}");
+                        continue;
+                    };
+                    // Gone since it was listed: leave it out.
+                    let Ok(stat) = rustix::fs::statat(&*fd, raw, AtFlags::SYMLINK_NOFOLLOW) else {
+                        continue;
+                    };
+                    files.push(entry(name.to_owned(), &stat));
+                }
+                Ok(files)
+            })
+            .await?;
         if files.is_empty() {
             return Err(StatusCode::Eof.into());
         }
@@ -655,9 +985,8 @@ impl Handler for Fs {
     }
 
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, StatusReply> {
-        tokio::fs::remove_file(self.path(&filename))
-            .await
-            .map_err(failed)?;
+        let path = self.path(&filename);
+        self.jobs.run(move || std::fs::remove_file(path)).await?;
         Ok(ok(id))
     }
 
@@ -667,43 +996,40 @@ impl Handler for Fs {
         path: String,
         attrs: FileAttributes,
     ) -> Result<Status, StatusReply> {
-        tokio::fs::DirBuilder::new()
-            .mode(attrs.permissions.map_or(0o777, |mode| mode & 0o7777))
-            .create(self.path(&path))
-            .await
-            .map_err(failed)?;
+        let path = self.path(&path);
+        let mode = attrs.permissions.map_or(0o777, |mode| mode & 0o7777);
+        self.jobs
+            .run(move || std::fs::DirBuilder::new().mode(mode).create(path))
+            .await?;
         Ok(ok(id))
     }
 
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, StatusReply> {
-        tokio::fs::remove_dir(self.path(&path))
-            .await
-            .map_err(failed)?;
+        let path = self.path(&path);
+        self.jobs.run(move || std::fs::remove_dir(path)).await?;
         Ok(ok(id))
     }
 
-    /// The canonical path, or for a path that does not exist, the path with
-    /// `.` and `..` worked out.
+    /// The canonical path, following symlinks as far as the path exists.
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, StatusReply> {
         let path = self.path(&path);
-        let real = match tokio::fs::canonicalize(&path).await {
-            Ok(real) => real,
-            Err(_) => normalize(&path),
-        };
-        Ok(name(id, &real))
+        let real = self
+            .jobs
+            .run(move || utf8(resolve(&path)?.into_os_string()))
+            .await?;
+        Ok(name(id, real))
     }
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, StatusReply> {
-        let metadata = tokio::fs::metadata(self.path(&path))
-            .await
-            .map_err(failed)?;
+        let path = self.path(&path);
+        let stat = self.jobs.run(move || Ok(rustix::fs::stat(&path)?)).await?;
         Ok(Attrs {
             id,
-            attrs: attrs(&metadata),
+            attrs: attrs(&stat),
         })
     }
 
-    /// As SFTP v3 says: an error if `newpath` exists.
+    /// As SFTP v3 says: an error if `newpath` exists, checked atomically.
     async fn rename(
         &mut self,
         id: u32,
@@ -711,18 +1037,18 @@ impl Handler for Fs {
         newpath: String,
     ) -> Result<Status, StatusReply> {
         let (from, to) = (self.path(&oldpath), self.path(&newpath));
-        if tokio::fs::symlink_metadata(&to).await.is_ok() {
-            return Err(StatusCode::Failure.with_message("the new name exists"));
-        }
-        tokio::fs::rename(from, to).await.map_err(failed)?;
+        self.jobs.run(move || rename_new(&from, &to)).await?;
         Ok(ok(id))
     }
 
+    /// The link's target, which must be UTF-8 to be sent unchanged.
     async fn readlink(&mut self, id: u32, path: String) -> Result<Name, StatusReply> {
-        let target = tokio::fs::read_link(self.path(&path))
-            .await
-            .map_err(failed)?;
-        Ok(name(id, &target))
+        let path = self.path(&path);
+        let target = self
+            .jobs
+            .run(move || utf8(std::fs::read_link(path)?.into_os_string()))
+            .await?;
+        Ok(name(id, target))
     }
 
     /// In OpenSSH's order, which every client follows: the target first,
@@ -734,16 +1060,23 @@ impl Handler for Fs {
         target: String,
         link: String,
     ) -> Result<Status, StatusReply> {
-        tokio::fs::symlink(target, self.path(&link))
-            .await
-            .map_err(failed)?;
+        let link = self.path(&link);
+        self.jobs
+            .run(move || std::os::unix::fs::symlink(target, link))
+            .await?;
         Ok(ok(id))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::time::Duration;
+
     use super::*;
+
+    /// The longest any wait below may take.
+    const LIMIT: Duration = Duration::from_secs(10);
 
     /// A fresh directory to serve, under the system's temporary directory.
     struct Scratch(PathBuf);
@@ -758,7 +1091,7 @@ mod tests {
         }
 
         fn fs(&self) -> Fs {
-            Fs::new(self.0.clone())
+            fs_at(&self.0)
         }
     }
 
@@ -766,6 +1099,13 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn fs_at(home: &Path) -> Fs {
+        Fs::new(
+            home.to_owned(),
+            Jobs::new(Arc::new(Semaphore::new(MAX_JOBS))),
+        )
     }
 
     fn code(reply: Result<impl fmt::Debug, StatusReply>) -> StatusCode {
@@ -779,22 +1119,48 @@ mod tests {
         out
     }
 
+    /// SFTP's string: a length, then the bytes.
+    fn string(out: &mut Vec<u8>, s: &[u8]) {
+        out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        out.extend_from_slice(s);
+    }
+
+    /// The replies in `output`, decoded.
+    fn replies(output: Vec<u8>) -> Vec<Packet> {
+        let mut output = Bytes::from(output);
+        let mut out = Vec::new();
+        while !output.is_empty() {
+            let len = u32::from_be_bytes(output[..4].try_into().unwrap()) as usize;
+            let mut reply = output.split_to(4 + len).split_off(4);
+            out.push(Packet::try_from(&mut reply).expect("parse"));
+        }
+        out
+    }
+
+    fn status_of(packet: &Packet) -> (u32, StatusCode) {
+        let Packet::Status(status) = packet else {
+            panic!("not a status: {packet:?}");
+        };
+        (status.id, status.status_code)
+    }
+
     #[tokio::test]
     async fn an_oversize_length_is_refused_before_reading_on() {
-        // Only the length arrives: a reader that read on, or allocated for
-        // it, would say Truncated (or run out of memory).
+        // Only the length arrives, and the writer stays open: a reader that
+        // read on, or allocated for it, would wait (or run out of memory).
         let (mut client, mut server) = tokio::io::duplex(64);
         client
             .write_all(&u32::MAX.to_be_bytes())
             .await
             .expect("write");
+        let read = tokio::time::timeout(LIMIT, read_frame(&mut server))
+            .await
+            .expect("refused without waiting for more");
+        assert!(matches!(read, Err(Error::TooLong(u32::MAX))));
+        drop(client);
+        let len = (MAX_FRAME + 1).to_be_bytes();
         assert!(matches!(
-            read_frame(&mut server).await,
-            Err(Error::TooLong(u32::MAX))
-        ));
-        let mut input = &(MAX_FRAME + 1).to_be_bytes()[..];
-        assert!(matches!(
-            read_frame(&mut input).await,
+            read_frame(&mut &len[..]).await,
             Err(Error::TooLong(n)) if n == MAX_FRAME + 1
         ));
         // The limit itself is fine.
@@ -823,7 +1189,7 @@ mod tests {
         // The serving loop ends on it, after answering what came whole.
         let mut input = frame(&[1, 0, 0, 0, 3]);
         input.extend_from_slice(&[0, 0, 1]);
-        let mut fs = Fs::new("/".into());
+        let mut fs = fs_at(Path::new("/"));
         let mut output = Vec::new();
         let served = serve(&mut fs, &input[..], &mut output).await;
         assert!(matches!(served, Err(Error::Truncated)), "{served:?}");
@@ -832,7 +1198,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_types_get_op_unsupported() {
-        let mut fs = Fs::new("/".into());
+        let mut fs = fs_at(Path::new("/"));
         // A reply type from a client, and an unassigned type.
         for kind in [101, 42] {
             let mut input = frame(&[kind, 0, 0, 0, 9]);
@@ -841,19 +1207,74 @@ mod tests {
             serve(&mut fs, &input[..], &mut output)
                 .await
                 .expect("served");
-            let mut output = Bytes::from(output);
-            for want in [9, 10] {
-                let len = u32::from_be_bytes(output[..4].try_into().unwrap()) as usize;
-                let mut reply = output.split_to(4 + len).split_off(4);
-                let Packet::Status(status) = Packet::try_from(&mut reply).expect("parse") else {
-                    panic!("not a status");
-                };
-                assert_eq!(
-                    (status.id, status.status_code),
-                    (want, StatusCode::OpUnsupported)
-                );
-            }
+            let got: Vec<_> = replies(output).iter().map(status_of).collect();
+            assert_eq!(
+                got,
+                [
+                    (9, StatusCode::OpUnsupported),
+                    (10, StatusCode::OpUnsupported)
+                ]
+            );
         }
+    }
+
+    /// An OPEN cut off after its flags would decode as one with no
+    /// attributes; it ends the session instead, and creates nothing.
+    #[tokio::test]
+    async fn a_truncated_open_ends_the_session() {
+        let dir = Scratch::new("truncated");
+        let mut fs = dir.fs();
+        let mut open = vec![SSH_FXP_OPEN, 0, 0, 0, 1];
+        string(&mut open, b"made");
+        let pflags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE;
+        open.extend_from_slice(&pflags.bits().to_be_bytes());
+        let mut output = Vec::new();
+        let served = serve(&mut fs, &frame(&open)[..], &mut output).await;
+        assert!(matches!(served, Err(Error::Malformed(_))), "{served:?}");
+        assert!(output.is_empty());
+        assert!(!dir.0.join("made").exists());
+        // An attributes block whose flags promise a field it lacks.
+        open.extend_from_slice(&FileAttr::PERMISSIONS.bits().to_be_bytes());
+        let served = serve(&mut fs, &frame(&open)[..], &mut Vec::new()).await;
+        assert!(matches!(served, Err(Error::Malformed(_))), "{served:?}");
+        assert!(!dir.0.join("made").exists());
+        // Whole, it works.
+        open.extend_from_slice(&0o600u32.to_be_bytes());
+        let mut output = Vec::new();
+        serve(&mut fs, &frame(&open)[..], &mut output)
+            .await
+            .expect("served");
+        assert!(matches!(replies(output)[..], [Packet::Handle(_)]));
+        assert!(dir.0.join("made").exists());
+    }
+
+    #[tokio::test]
+    async fn trailing_bytes_end_the_session() {
+        let dir = Scratch::new("trailing");
+        std::fs::write(dir.0.join("f"), b"").expect("write");
+        let mut fs = dir.fs();
+        let mut remove = vec![SSH_FXP_REMOVE, 0, 0, 0, 1];
+        string(&mut remove, b"f");
+        remove.push(0);
+        let served = serve(&mut fs, &frame(&remove)[..], &mut Vec::new()).await;
+        assert!(matches!(served, Err(Error::Malformed(_))), "{served:?}");
+        assert!(dir.0.join("f").exists());
+    }
+
+    /// A name that is not UTF-8 is refused, not changed into another name.
+    #[tokio::test]
+    async fn names_that_are_not_utf8_are_refused() {
+        let dir = Scratch::new("utf8");
+        let mut fs = dir.fs();
+        let mut mkdir = vec![SSH_FXP_MKDIR, 0, 0, 0, 4];
+        string(&mut mkdir, b"a\xff");
+        mkdir.extend_from_slice(&[0, 0, 0, 0]);
+        let mut output = Vec::new();
+        serve(&mut fs, &frame(&mkdir)[..], &mut output)
+            .await
+            .expect("served");
+        assert_eq!(status_of(&replies(output)[0]), (4, StatusCode::Failure));
+        assert_eq!(std::fs::read_dir(&dir.0).expect("list").count(), 0);
     }
 
     #[tokio::test]
@@ -880,6 +1301,36 @@ mod tests {
         fs.close(3, handles.pop().unwrap()).await.expect("close");
         fs.opendir(4, ".".into()).await.expect("room again");
         assert_eq!(code(fs.close(5, "nope".into()).await), StatusCode::Failure);
+    }
+
+    #[tokio::test]
+    async fn open_flags_map_as_sftp_means_them() {
+        let dir = Scratch::new("flags");
+        let mut fs = dir.fs();
+        // Created though opened only for reading, with the mode asked for.
+        let attrs = FileAttributes {
+            permissions: Some(0o640),
+            ..FileAttributes::empty()
+        };
+        let read_create = OpenFlags::READ | OpenFlags::CREATE;
+        fs.open(1, "new".into(), read_create, attrs)
+            .await
+            .expect("read-only create");
+        let metadata = std::fs::metadata(dir.0.join("new")).expect("created");
+        assert_eq!(metadata.mode() & 0o7777 & !0o022, 0o640 & !0o022);
+        // Exclusive creation of a file that exists fails, and leaves it.
+        std::fs::write(dir.0.join("new"), b"kept").expect("write");
+        let exclusive = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE;
+        let again = fs
+            .open(2, "new".into(), exclusive, FileAttributes::empty())
+            .await;
+        assert_eq!(code(again), StatusCode::Failure);
+        assert_eq!(std::fs::read(dir.0.join("new")).expect("read"), b"kept");
+        // Without CREATE nothing is made.
+        let missing = fs
+            .open(3, "none".into(), OpenFlags::WRITE, FileAttributes::empty())
+            .await;
+        assert_eq!(code(missing), StatusCode::NoSuchFile);
     }
 
     #[tokio::test]
@@ -916,6 +1367,10 @@ mod tests {
         }
         std::fs::create_dir(dir.0.join("sub")).expect("mkdir");
         std::os::unix::fs::symlink("f000", dir.0.join("link")).expect("symlink");
+        // Some filesystems (APFS) take no such name; then there is nothing
+        // to leave out.
+        let odd = std::ffi::OsStr::from_bytes(b"odd\xff");
+        let odd_made = std::fs::write(dir.0.join(odd), b"").is_ok();
         let mut fs = dir.fs();
         let handle = fs.opendir(1, ".".into()).await.expect("opendir").handle;
         let mut pages = Vec::new();
@@ -932,7 +1387,9 @@ mod tests {
                 }
             }
         }
-        assert_eq!(pages, [128, 128, 46]);
+        // `.`, `..` and the odd name are not among them.
+        assert_eq!(pages, [128, 128, 46], "odd name made: {odd_made}");
+        assert!(names.iter().all(|f| !f.filename.contains('\u{fffd}')));
         let long = |n: &str| {
             let file = names.iter().find(|f| f.filename == n).expect(n);
             file.longname.clone()
@@ -948,7 +1405,7 @@ mod tests {
         let dir = Scratch::new("setstat");
         let path = dir.0.join("f");
         std::fs::write(&path, b"x").expect("write");
-        std::fs::set_permissions(&path, Permissions::from_mode(0o644)).expect("chmod");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         let mut fs = dir.fs();
         let mode = |path: &Path| std::fs::metadata(path).expect("stat").mode() & 0o7777;
         for refused in [
@@ -1010,23 +1467,181 @@ mod tests {
         body.extend_from_slice(&0o777u32.to_be_bytes());
         body.extend_from_slice(&[0, 0, 0, 0]);
         let reply = answer(&mut fs, Bytes::from(body)).await.expect("answer");
-        let Packet::Status(status) = reply else {
-            panic!("{reply:?}");
-        };
-        assert_eq!(
-            (status.id, status.status_code),
-            (7, StatusCode::OpUnsupported)
-        );
+        assert_eq!(status_of(&reply), (7, StatusCode::OpUnsupported));
         assert_eq!(mode(&path), 0o640);
+    }
+
+    /// A directory handle stays on the directory it opened, through a
+    /// rename and a new directory in its place.
+    #[tokio::test]
+    async fn a_directory_handle_follows_its_directory() {
+        let dir = Scratch::new("dirfd");
+        std::fs::create_dir(dir.0.join("d")).expect("mkdir");
+        std::fs::write(dir.0.join("d/inside"), b"").expect("write");
+        let mut fs = dir.fs();
+        let handle = fs.opendir(1, "d".into()).await.expect("opendir").handle;
+        std::fs::rename(dir.0.join("d"), dir.0.join("moved")).expect("rename");
+        std::fs::create_dir(dir.0.join("d")).expect("mkdir");
+        let set = FileAttributes {
+            permissions: Some(0o700),
+            ..FileAttributes::empty()
+        };
+        fs.fsetstat(2, handle.clone(), set).await.expect("fsetstat");
+        let mode = |name: &str| std::fs::metadata(dir.0.join(name)).expect("stat").mode();
+        assert_eq!(mode("moved") & 0o7777, 0o700);
+        assert_ne!(mode("d") & 0o7777, 0o700);
+        let attrs = fs.fstat(3, handle.clone()).await.expect("fstat").attrs;
+        assert_eq!(attrs.permissions, Some(mode("moved")));
+        let names = fs.readdir(4, handle).await.expect("readdir").files;
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].filename, "inside");
+    }
+
+    #[tokio::test]
+    async fn rename_never_replaces() {
+        let dir = Scratch::new("rename");
+        std::fs::write(dir.0.join("a"), b"a").expect("write");
+        std::fs::write(dir.0.join("b"), b"b").expect("write");
+        let mut fs = dir.fs();
+        let replace = fs.rename(1, "a".into(), "b".into()).await;
+        assert_eq!(code(replace), StatusCode::Failure);
+        assert_eq!(std::fs::read(dir.0.join("b")).expect("read"), b"b");
+        fs.rename(2, "a".into(), "c".into()).await.expect("rename");
+        assert_eq!(std::fs::read(dir.0.join("c")).expect("read"), b"a");
+        assert!(!dir.0.join("a").exists());
+    }
+
+    /// realpath follows symlinks as far as the path exists, then works out
+    /// the rest by name.
+    #[tokio::test]
+    async fn realpath_resolves_the_existing_prefix() {
+        let dir = Scratch::new("realpath");
+        let base = std::fs::canonicalize(&dir.0).expect("canonical");
+        std::fs::create_dir_all(base.join("srv/data")).expect("mkdir");
+        std::fs::create_dir(base.join("home")).expect("mkdir");
+        std::os::unix::fs::symlink(base.join("srv/data"), base.join("home/link")).expect("symlink");
+        let mut fs = fs_at(&base.join("home"));
+        let real = |name: Name| name.files[0].filename.clone();
+        let got = real(
+            fs.realpath(1, "link/../new".into())
+                .await
+                .expect("realpath"),
+        );
+        assert_eq!(Path::new(&got), base.join("srv/new"));
+        let got = real(fs.realpath(2, ".".into()).await.expect("realpath"));
+        assert_eq!(Path::new(&got), base.join("home"));
+        let got = real(fs.realpath(3, "a/./b/../c".into()).await.expect("realpath"));
+        assert_eq!(Path::new(&got), base.join("home/a/c"));
+        // Other errors are not passed over.
+        std::fs::write(base.join("home/file"), b"").expect("write");
+        let not_dir = fs.realpath(4, "file/x".into()).await;
+        assert_eq!(code(not_dir), StatusCode::Failure);
+    }
+
+    #[tokio::test]
+    async fn a_link_target_that_is_not_utf8_is_refused() {
+        let dir = Scratch::new("readlink");
+        let target = std::ffi::OsStr::from_bytes(b"t\xff");
+        if std::os::unix::fs::symlink(target, dir.0.join("l")).is_err() {
+            return; // Not on this filesystem.
+        }
+        let mut fs = dir.fs();
+        assert_eq!(code(fs.readlink(1, "l".into()).await), StatusCode::Failure);
+    }
+
+    /// A job stuck in the filesystem keeps its permit until it really ends,
+    /// without holding up its session's teardown; a job still queued when
+    /// the session goes never runs.
+    #[test]
+    fn jobs_are_bounded_and_end_with_their_session() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let permits = Arc::new(Semaphore::new(MAX_JOBS));
+            let jobs = Jobs::new(permits.clone());
+            let (started_tx, started) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let stuck = jobs.run(move || {
+                let _ = started_tx.send(());
+                let _ = released.recv_timeout(LIMIT);
+                Ok(())
+            });
+            // The session gives up on it at once.
+            let gave_up = tokio::time::timeout(Duration::from_millis(200), stuck).await;
+            assert!(gave_up.is_err());
+            started.recv_timeout(LIMIT).expect("the job started");
+            assert_eq!(permits.available_permits(), MAX_JOBS - 1);
+            // Queued behind it, on the only blocking thread.
+            let ran = Arc::new(AtomicBool::new(false));
+            let flag = ran.clone();
+            let queued = jobs.run(move || {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            });
+            let gave_up = tokio::time::timeout(Duration::from_millis(200), queued).await;
+            assert!(gave_up.is_err());
+            drop(jobs);
+            release.send(()).expect("release");
+            tokio::time::timeout(LIMIT, async {
+                while permits.available_permits() < MAX_JOBS {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("every permit back");
+            assert!(
+                !ran.load(Ordering::SeqCst),
+                "a queued job ran after its session"
+            );
+        });
     }
 
     #[test]
     fn paths_are_relative_to_home_or_absolute() {
-        let fs = Fs::new("/home/me".into());
+        let fs = fs_at(Path::new("/home/me"));
         assert_eq!(fs.path("a/b"), Path::new("/home/me/a/b"));
         assert_eq!(fs.path(""), Path::new("/home/me"));
         assert_eq!(fs.path("/etc/hosts"), Path::new("/etc/hosts"));
-        assert_eq!(normalize(Path::new("/a/./b/../c/")), Path::new("/a/c"));
-        assert_eq!(normalize(Path::new("/../..")), Path::new("/"));
+    }
+
+    #[test]
+    fn request_layouts() {
+        let mut stat = vec![SSH_FXP_STAT, 0, 0, 0, 5];
+        string(&mut stat, b"x");
+        assert_eq!(
+            Shape::of(&stat),
+            Some(Shape {
+                id: 5,
+                attrs: None,
+                utf8: true
+            })
+        );
+        assert_eq!(Shape::of(&stat[..stat.len() - 1]), None);
+        stat.push(0);
+        assert_eq!(Shape::of(&stat), None);
+        // A string longer than what is left.
+        assert_eq!(
+            Shape::of(&[SSH_FXP_STAT, 0, 0, 0, 5, 0, 0, 0, 9, b'x']),
+            None
+        );
+        // Extended pairs in attributes are counted and skipped.
+        let mut mkdir = vec![SSH_FXP_MKDIR, 0, 0, 0, 6];
+        string(&mut mkdir, b"d");
+        mkdir.extend_from_slice(&FileAttr::EXTENDED.bits().to_be_bytes());
+        mkdir.extend_from_slice(&1u32.to_be_bytes());
+        string(&mut mkdir, b"k");
+        string(&mut mkdir, b"v");
+        let shape = Shape::of(&mkdir).expect("whole");
+        assert_eq!(shape.attrs, Some(FileAttr::EXTENDED.bits()));
+        // INIT has no id, then extension pairs to the end.
+        let mut init = vec![SSH_FXP_INIT, 0, 0, 0, 3];
+        string(&mut init, b"a");
+        assert_eq!(Shape::of(&init), None);
+        string(&mut init, b"b");
+        assert!(Shape::of(&init).is_some());
     }
 }

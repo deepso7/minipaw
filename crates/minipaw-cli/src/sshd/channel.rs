@@ -305,6 +305,7 @@ impl Conn {
             match run {
                 Run::Sftp => Ok(Program::Sftp(sftp::Fs::new(
                     shared.account.cwd().to_owned(),
+                    sftp::Jobs::new(shared.sftp_jobs.clone()),
                 ))),
                 Run::Exec(cmd) if cmd.as_bytes().contains(&0) => {
                     Err(std::io::Error::other("the command has a NUL byte"))
@@ -369,6 +370,8 @@ impl Conn {
             connection: token,
             label,
             what,
+            #[cfg(test)]
+            _live: Live::new(&shared.supervisors),
         };
         tasks.spawn(supervisor.run(program));
         Ok(())
@@ -670,7 +673,6 @@ fn close(chan: &mut Chan, why: Reason, session: &mut Session) -> Result<(), russ
 }
 
 /// What a channel's supervisor runs.
-#[expect(clippy::large_enum_variant, reason = "one per channel, moved once")]
 enum Program {
     Process(Process, Io),
     Sftp(sftp::Fs),
@@ -692,6 +694,27 @@ struct Supervisor {
     connection: CancellationToken,
     label: String,
     what: String,
+    #[cfg(test)]
+    _live: Live,
+}
+
+/// Counts a running supervisor, for tests, until it is dropped.
+#[cfg(test)]
+struct Live(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl Live {
+    fn new(count: &Arc<std::sync::atomic::AtomicUsize>) -> Live {
+        count.fetch_add(1, Ordering::SeqCst);
+        Live(count.clone())
+    }
+}
+
+#[cfg(test)]
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Supervisor {
