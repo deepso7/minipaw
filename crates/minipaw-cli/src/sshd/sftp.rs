@@ -497,15 +497,18 @@ impl Jobs {
             .await
             .map_err(|e| StatusCode::Failure.with_message(e.to_string()))?;
         let gone = self.gone.clone();
-        let mut done = Unclaimed(Some(tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            if gone.load(Ordering::Acquire) {
-                return Err(io::Error::other("the session ended"));
-            }
-            job()
-        })));
-        let result = done.0.as_mut().expect("set above").await;
-        done.0 = None;
+        let mut done = Unclaimed(
+            self.permits.clone(),
+            Some(tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                if gone.load(Ordering::Acquire) {
+                    return Err(io::Error::other("the session ended"));
+                }
+                job()
+            })),
+        );
+        let result = done.1.as_mut().expect("set above").await;
+        done.1 = None;
         result
             .map_err(|e| StatusCode::Failure.with_message(e.to_string()))?
             .map_err(failed)
@@ -515,17 +518,25 @@ impl Jobs {
 /// A job whose caller may stop waiting for it, at teardown. What it then
 /// returns, an open descriptor say, is dropped off the runtime, since
 /// close(2) can hang on a stuck filesystem; dropping the finished task's
-/// handle here would close it on an async worker.
-struct Unclaimed<T: Send + 'static>(Option<tokio::task::JoinHandle<T>>);
+/// handle here would close it on an async worker. The drop takes a permit
+/// like any job, so stuck closes stay within the limit.
+struct Unclaimed<T: Send + 'static>(Arc<Semaphore>, Option<tokio::task::JoinHandle<T>>);
 
 impl<T: Send + 'static> Drop for Unclaimed<T> {
     fn drop(&mut self) {
-        if let Some(job) = self.0.take()
+        if let Some(job) = self.1.take()
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
+            let permits = self.0.clone();
             runtime.spawn(async move {
-                if let Ok(value) = job.await {
-                    tokio::task::spawn_blocking(move || drop(value));
+                // The semaphore is never closed.
+                if let Ok(value) = job.await
+                    && let Ok(permit) = permits.acquire_owned().await
+                {
+                    tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        drop(value);
+                    });
                 }
             });
         }
