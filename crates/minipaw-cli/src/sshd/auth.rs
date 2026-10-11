@@ -427,6 +427,12 @@ mod tests {
         assert!(dir.error(&dir.0.join("missing")).contains("No such file"));
     }
 
+    /// Whether `e` is the policy refusing a directory above the test's own,
+    /// as it may wherever this checkout lives.
+    fn refused_above(e: &str) -> bool {
+        e.contains("writable by group or others") || e.contains("owned by neither root nor")
+    }
+
     #[test]
     fn loading_resolves_symlinks_first() {
         let dir = Dir::new("auth-load");
@@ -450,11 +456,11 @@ mod tests {
             }
             Ok(_) => panic!("not keys"),
             // Only where this checkout's ancestors pass the checks.
-            Err(e) => assert!(e.contains("writable by group or others"), "{e}"),
+            Err(e) => assert!(refused_above(&e), "{e}"),
         }
         let e = load(std::slice::from_ref(&rsa), uid()).unwrap_err();
         assert!(
-            e.starts_with("no usable key in ") || e.contains("writable by group or others"),
+            e.starts_with("no usable key in ") || refused_above(&e),
             "{e}"
         );
         let e = load(&[dir.0.join("missing")], uid()).unwrap_err();
