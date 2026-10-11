@@ -251,8 +251,16 @@ hello</pre>
   document.addEventListener("click", async (event) => {
     const button = (event.target as Element | null)?.closest<HTMLButtonElement>("button.copy");
     if (!button) return;
-    await navigator.clipboard.writeText(button.dataset.copy ?? "");
-    button.textContent = "copied";
-    setTimeout(() => (button.textContent = "copy"), 1500);
+    try {
+      await navigator.clipboard.writeText(button.dataset.copy ?? "");
+      button.textContent = "copied";
+    } catch {
+      // No clipboard access (denied, or not a secure context): select the
+      // command so a manual copy is one keystroke away.
+      const code = button.parentElement?.querySelector("code");
+      if (code) window.getSelection()?.selectAllChildren(code);
+      button.textContent = "press ⌘/Ctrl+C";
+    }
+    setTimeout(() => (button.textContent = "copy"), 2500);
   });
 </script>
