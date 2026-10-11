@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
 
 use pty_process::{OwnedReadPty, OwnedWritePty};
 use russh::Sig;
@@ -279,11 +278,6 @@ impl Process {
         }
     }
 
-    /// Waits for the leader to exit, for up to `limit`.
-    async fn exited_within(&self, limit: Duration) -> bool {
-        tokio::time::timeout(limit, self.exited()).await.is_ok()
-    }
-
     /// Signals the leader's group. Safe while the leader is unreaped.
     fn signal(&self, signal: Signal) {
         #[cfg(test)]
@@ -305,12 +299,14 @@ impl Process {
         }
     }
 
-    /// Ends a program without a PTY: SIGHUP and SIGTERM to its group, up to
-    /// [`GRACE`] to exit, then SIGKILL to whatever is left of the group.
+    /// Ends a program without a PTY: SIGHUP and SIGTERM to its group,
+    /// [`GRACE`] for the group to handle them, then SIGKILL to whatever is
+    /// left of it. The full grace even if the leader exits early: the rest
+    /// of its group may still be cleaning up.
     async fn end_group(&self) {
         self.signal(Signal::HUP);
         self.signal(Signal::TERM);
-        self.exited_within(GRACE).await;
+        tokio::time::sleep(GRACE).await;
         self.signal(Signal::KILL);
     }
 

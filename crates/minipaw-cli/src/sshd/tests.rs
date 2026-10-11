@@ -323,6 +323,23 @@ fn alive(pid: Pid) -> bool {
     rustix::process::test_kill_process(pid).is_ok()
 }
 
+/// Waits up to `limit` for `pid`, a child of this test process (the
+/// server's), to exit, reaped or not, and says how long it took.
+async fn ended(pid: Pid, limit: Duration) -> Duration {
+    use rustix::process::{WaitId, WaitIdOptions};
+    let options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
+    let start = Instant::now();
+    timeout(limit, async {
+        // Some status: exited, unreaped. An error: reaped already.
+        while let Ok(None) = rustix::process::waitid(WaitId::Pid(pid), options) {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{pid:?} still running after {limit:?}"));
+    start.elapsed()
+}
+
 /// Waits up to `limit` for `pid` to be gone, and says how long it took.
 async fn gone(pid: Pid, limit: Duration) -> Duration {
     let start = Instant::now();
@@ -718,8 +735,10 @@ async fn closing_the_channel_kills_its_program() {
         let (mut read, write) = run(&handle, "echo $$; exec sleep 1000", false).await;
         let pid = read_pid(&mut read).await;
         write.close().await.expect("close");
-        // SIGHUP does it at once, well inside the grace.
-        assert!(gone(pid, Duration::from_secs(5)).await < config::GRACE);
+        // SIGHUP does it at once, well inside the grace; it is reaped
+        // once the grace is over.
+        assert!(ended(pid, Duration::from_secs(5)).await < config::GRACE);
+        gone(pid, config::GRACE + Duration::from_secs(3)).await;
         none_running(&server).await;
         server.stop().await;
     })

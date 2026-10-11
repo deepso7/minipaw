@@ -180,11 +180,14 @@ Limits worth knowing:
   8 MiB buffer, closing` rather than being slowed down. Interactive shells,
   git and ordinary pipes stay far below it.
 - A connection has 20 s to log in.
-- When a session ends, its program gets a hangup: SIGHUP (and SIGTERM
-  without a PTY), then SIGKILL to its process group 2 s later. As under
-  sshd, anything that left the session's process groups (`setsid`,
-  `nohup … &` in its own job-control group) can outlive the session. A
-  second Ctrl-C, which stops serve at once, skips this cleanup.
+- When a session is cut short (the client closes it or goes away, or
+  serve stops), its program gets a hangup: SIGHUP (and SIGTERM without a
+  PTY), then SIGKILL to its process group 2 s later. A program that exits
+  by itself gets none of this, so background children it left behind
+  (`sleep 1000 >/dev/null 2>&1 &`) keep running, as under sshd. So can
+  anything that left the session's process groups (`setsid`, `nohup … &`
+  in its own job-control group). A second Ctrl-C, which stops serve at
+  once, skips this cleanup.
 
 ## Terminal UI
 
