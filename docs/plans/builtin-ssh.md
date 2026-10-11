@@ -3,7 +3,10 @@
 Status: rollout steps 1 to 4 are done: the spike, the library (PR 1), the
 server with shell, exec and PTYs (PR 2), and SFTP (PR 3). Phase 3 is next.
 Uses stock russh from crates.io, with no fork. Where the code differs from
-this plan, the implementation notes below say how and why.
+this plan, the implementation notes below say how and why. The spike's
+results are in [builtin-ssh-spike.md](builtin-ssh-spike.md), its code in
+`spike/russh-flow`, and draft reports for russh in
+[russh-upstream-reports.md](russh-upstream-reports.md).
 
 ## Goal
 

@@ -1,0 +1,20 @@
+[package]
+name = "russh-flow"
+description = "Throwaway spike: flow control on stock russh 0.64.1 (docs/plans/builtin-ssh.md, rollout step 1)"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace: kept out of minipaw's build, CI and lockfile.
+[workspace]
+
+[dependencies]
+bytes = "1"
+russh = { version = "=0.64.1", default-features = false, features = ["ring"] }
+rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
+sha2 = "0.11"
+tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "net", "io-util", "process", "sync", "time", "macros"] }
+
+[lints.rust]
+unsafe_code = "forbid"

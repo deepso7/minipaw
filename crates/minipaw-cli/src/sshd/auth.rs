@@ -69,8 +69,14 @@ pub fn load(paths: &[PathBuf], uid: u32) -> Result<(Policy, Vec<String>), String
     let mut keys = Vec::new();
     let mut warnings = Vec::new();
     for path in paths {
-        let text =
-            read(path, uid).map_err(|e| format!("authorized keys {}: {e}", path.display()))?;
+        let text = read(path, uid).map_err(|e| {
+            let hint = if e.kind() == io::ErrorKind::NotFound {
+                " (add a public key there, pass --authorized-keys PATH, or --no-auth)"
+            } else {
+                ""
+            };
+            format!("authorized keys {}: {e}{hint}", path.display())
+        })?;
         parse(&path.display().to_string(), &text, &mut keys, &mut warnings)?;
     }
     if keys.is_empty() {
@@ -572,7 +578,9 @@ mod tests {
         );
         let e = load(&[dir.0.join("missing")], uid()).unwrap_err();
         assert!(
-            e.starts_with("authorized keys ") && e.contains("No such file"),
+            e.starts_with("authorized keys ")
+                && e.contains("No such file")
+                && e.ends_with("pass --authorized-keys PATH, or --no-auth)"),
             "{e}"
         );
     }

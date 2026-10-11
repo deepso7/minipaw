@@ -162,7 +162,12 @@ minipaw mpAQ…
   start at your home directory, and absolute paths reach anywhere you can.
   **It is not a sandbox**, no more than the shell is.
 - The host key is derived from serve's identity, so it stays the same as
-  long as the ticket does and changes with `serve --new`.
+  long as the ticket does and changes with `serve --new`. The server that
+  plain `serve` forwards to, usually the machine's sshd, has its own key,
+  so switching one ticket between `serve` and `serve --ssh` makes ssh warn
+  that the host key changed: check the new fingerprint, then drop the old
+  one with
+  `ssh-keygen -R minipaw-<peer id>` (the name ssh shows).
 - `-v` logs each login: the key, the user name asked for, and what ran.
 
 Not supported, for now:
