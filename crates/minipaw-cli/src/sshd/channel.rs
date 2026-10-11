@@ -84,12 +84,20 @@ impl Input {
         if state.closed {
             return true;
         }
+        if data.is_empty() {
+            return true;
+        }
         if state.len + data.len() > INPUT_CAP {
             drop(state);
             self.close();
             return false;
         }
-        state.queue.push_back(data.to_vec());
+        // Small packets join the last piece, so the cap bounds memory and
+        // not just the bytes counted.
+        match state.queue.back_mut() {
+            Some(last) if last.len() + data.len() <= CHUNK => last.extend_from_slice(data),
+            _ => state.queue.push_back(data.to_vec()),
+        }
         state.len += data.len();
         drop(state);
         self.notify.notify_one();
@@ -910,5 +918,22 @@ mod tests {
         assert_eq!(input.len(), 0);
         assert!(input.push(&chunk));
         assert_eq!(input.len(), 0);
+    }
+
+    /// Empty and tiny packets cost no more than the bytes they carry: they
+    /// add no pieces of their own, so the cap bounds memory.
+    #[test]
+    fn small_input_is_coalesced() {
+        let input = Input::default();
+        for _ in 0..1000 {
+            assert!(input.push(&[]));
+        }
+        assert_eq!(input.lock().queue.len(), 0);
+        for _ in 0..CHUNK + 1 {
+            assert!(input.push(&[1]));
+        }
+        assert_eq!(input.len(), CHUNK + 1);
+        let queue = &input.lock().queue;
+        assert_eq!(queue.iter().map(Vec::len).collect::<Vec<_>>(), [CHUNK, 1]);
     }
 }

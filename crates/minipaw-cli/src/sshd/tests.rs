@@ -776,8 +776,32 @@ async fn a_pty_hangup_reaches_the_foreground_job() {
         let marked = std::fs::read_to_string(&marker).unwrap_or_default();
         let _ = std::fs::remove_file(&marker);
         assert!(marked.starts_with("job-hup\n"), "{marked:?}");
-        // The hangup did it all: nothing needed a signal of ours.
-        assert_eq!(*server.registry().signals.lock().unwrap(), []);
+        // The hangup did it all; the SIGKILL to the shell's group after it
+        // only sweeps up stragglers, and the shell is still unreaped.
+        let signals = server.registry().signals.lock().unwrap().clone();
+        let shell = shell.as_raw_nonzero().get();
+        assert_eq!(signals, [(shell, Signal::KILL.as_raw())]);
+        server.stop().await;
+    })
+    .await;
+}
+
+/// A member of the shell's group that ignores the hangup is killed even
+/// though the shell itself exits in time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pty_group_member_ignoring_the_hangup_is_killed() {
+    bounded(async {
+        let server = Server::new(keys());
+        let (handle, _cut) = server.login(false).await;
+        let script = "echo $$; sh -c 'trap \"\" HUP; echo $$; exec sleep 1000' & wait";
+        let (mut read, write) = run(&handle, script, true).await;
+        let pids = lines(&mut read, 2).await;
+        let (shell, member) = (pid(&pids[0]), pid(&pids[1]));
+        write.close().await.expect("close");
+        // The shell goes at the hangup, but stays unreaped for the grace.
+        gone(member, config::GRACE + Duration::from_secs(3)).await;
+        gone(shell, Duration::from_secs(3)).await;
+        none_running(&server).await;
         server.stop().await;
     })
     .await;
@@ -1009,7 +1033,7 @@ async fn a_stop_ends_every_login_in_time() {
             account: account(),
             lines: Vec::new(),
         };
-        let sshd = Sshd::start(setup, &[9; 32]).expect("start");
+        let sshd = OffRuntime(Some(Sshd::start(setup, &[9; 32]).expect("start")));
         let registry = sshd.registry.clone();
         let acceptor = sshd.acceptor();
         let mut pids = Vec::new();
@@ -1057,6 +1081,27 @@ async fn a_stop_ends_every_login_in_time() {
         assert!(acceptor.open("12D3KooWTestPeer").is_err());
     })
     .await;
+}
+
+/// Owns an [`Sshd`] inside a runtime, whose drop blocks on a runtime of its
+/// own: a test that fails or times out still stops it on another thread
+/// rather than panicking again in the destructor.
+struct OffRuntime(Option<Sshd>);
+
+impl std::ops::Deref for OffRuntime {
+    type Target = Sshd;
+
+    fn deref(&self) -> &Sshd {
+        self.0.as_ref().expect("running")
+    }
+}
+
+impl Drop for OffRuntime {
+    fn drop(&mut self) {
+        if let Some(sshd) = self.0.take() {
+            let _ = std::thread::spawn(move || drop(sshd)).join();
+        }
+    }
 }
 
 /// A client for [`Sshd`]'s own host key, from another seed.

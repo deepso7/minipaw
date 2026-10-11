@@ -538,6 +538,14 @@ Where PR 2 differs from the plan above, and why:
     already runs on ubuntu and macos. Its key file lives under `$HOME`,
     since the path policy refuses a world-writable `/tmp`.
 - **No `deny.toml`**: `cargo deny check advisories` passes on its defaults.
+- **PTY teardown always waits the full 2 s grace**, then SIGKILLs the
+  shell's group, even when the shell exits at the hangup. Members of its
+  group that ignore SIGHUP would otherwise survive, and killing as soon as
+  the shell leaves would cut short a job still handling the hangup. The
+  shell stays unreaped, so its pgid stays ours, until then.
+- **Input is coalesced**: empty `data` is ignored and small packets join
+  the last queued piece (up to 32 KiB), so the 8 MiB cap bounds memory and
+  not only the bytes counted.
 
 ## Risks
 

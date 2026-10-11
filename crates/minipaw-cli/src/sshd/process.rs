@@ -315,13 +315,14 @@ impl Process {
     }
 
     /// Ends a program on a PTY whose master is already closed, which hung
-    /// the terminal up: up to [`GRACE`] to exit, then SIGKILL to the
-    /// shell's group. Other job-control groups get only the hangup, as
+    /// the terminal up: [`GRACE`] for the shell's group to handle it, then
+    /// SIGKILL to that group. The full grace even if the shell leaves
+    /// early, since members of its group may still be handling the hangup,
+    /// or ignoring it. Other job-control groups get only the hangup, as
     /// under sshd: their ids may be reused once the shell reaps them.
     async fn end_session(&self) {
-        if !self.exited_within(GRACE).await {
-            self.signal(Signal::KILL);
-        }
+        tokio::time::sleep(GRACE).await;
+        self.signal(Signal::KILL);
     }
 
     /// Reaps the leader, its registry entry gone first, for its exit.
