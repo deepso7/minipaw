@@ -21,8 +21,10 @@ The built-in server is Unix only.
 
 ## Who gets in
 
-A key in `~/.ssh/authorized_keys` of the serving user gets in, as does one in
-the files given with `--authorized-keys PATH` (repeatable).
+A key in `~/.ssh/authorized_keys` of the serving user gets in. To use other
+files, pass `--authorized-keys PATH` (repeatable). The flag replaces the
+default file rather than adding to it, so to accept both, pass
+`~/.ssh/authorized_keys` as one of the paths.
 
 - Keys are read once at startup, so restart serve to apply edits and
   revocations.
