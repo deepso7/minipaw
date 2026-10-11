@@ -155,14 +155,21 @@ minipaw mpAQ…
   in your home directory, with a clean environment (`HOME`, `USER`,
   `LOGNAME`, `SHELL`, `PATH`, `TERM` with a PTY, `SSH_CONNECTION`,
   `SSH_PEER_ID`).
+- **scp and sftp work.** The server has a built-in SFTP subsystem, which
+  plain `scp` (`minipaw cp`) uses since OpenSSH 9.0, as do `sftp` and
+  other SFTP clients (give them the ProxyCommand above); `scp -O` works
+  too, through your shell. SFTP serves your files as you: relative paths
+  start at your home directory, and absolute paths reach anywhere you can.
+  **It is not a sandbox**, no more than the shell is.
 - The host key is derived from serve's identity, so it stays the same as
   long as the ticket does and changes with `serve --new`.
 - `-v` logs each login: the key, the user name asked for, and what ran.
 
 Not supported, for now:
 
-- SFTP. Plain `scp` uses SFTP since OpenSSH 9.0, so use `scp -O` (or
-  `minipaw cp -O`), and `sftp` does not work.
+- In SFTP: changing a file's size or owner with `setstat` (only its mode
+  and times), OpenSSH's extensions (`posix-rename`, `statvfs`, `fsync`,
+  hard links, `~` expansion), and file names that are not UTF-8.
 - Port forwarding (`-L`, `-R`, `-D`), agent and X11 forwarding, sending
   environment variables, forced commands, compression, and password or
   certificate logins.
@@ -178,7 +185,12 @@ Limits worth knowing:
   yet. A sender that gets further ahead than that, such as `cat big.iso |
   ssh … slow-program`, has its session closed with `minipaw: input exceeded
   8 MiB buffer, closing` rather than being slowed down. Interactive shells,
-  git and ordinary pipes stay far below it.
+  git and ordinary pipes stay far below it. The same goes for SFTP
+  requests sent ahead of their replies; scp and sftp keep about 2 MiB in
+  flight.
+- An SFTP session has at most 256 files and directories open at once, a
+  read returns at most 255 KiB, and a request longer than 257 KiB ends
+  the session.
 - A connection has 20 s to log in.
 - When a session is cut short (the client closes it or goes away, or
   serve stops), its program gets a hangup: SIGHUP (and SIGTERM without a

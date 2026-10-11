@@ -1004,9 +1004,32 @@ ssh_as() { # ssh_as <key> [ssh args...]
     -o UserKnownHostsFile="$KEYS/known_hosts" "$@"
 }
 
+# The same for scp, through `minipaw cp`.
+cp_as() { # cp_as <key> [scp args...]
+  local key=$1
+  shift
+  MINIPAW_DIRECT=$DIRECT "$BIN" cp -F /dev/null -i "$key" -o IdentitiesOnly=yes \
+    -o BatchMode=yes -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new \
+    -o UserKnownHostsFile="$KEYS/known_hosts" "$@"
+}
+
+# The same for sftp, which has no minipaw wrapper: it gets the ProxyCommand
+# and host key alias `minipaw ssh` would give it, and logs in to TICKET.
+sftp_as() { # sftp_as <key> [sftp args...]
+  local key=$1 host
+  shift
+  host=minipaw-$("$BIN" parse "$TICKET" | sed -n 's/^peer: *//p')
+  MINIPAW_DIRECT=$DIRECT sftp -F /dev/null -i "$key" -o IdentitiesOnly=yes \
+    -o BatchMode=yes -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new \
+    -o UserKnownHostsFile="$KEYS/known_hosts" -o "ProxyCommand=$(printf %q "$BIN") -q $TICKET" \
+    -o "HostKeyAlias=$host" "$@" "me@$host"
+}
+
 # `serve --ssh` answers sessions itself. The system's ssh logs in with a key
 # through `minipaw ssh` (so `minipaw -q`), runs a command with and without a
-# PTY, gets its exit status, and moves 20 MB each way through cat.
+# PTY, gets its exit status, and moves 20 MB each way through cat. scp, in
+# its default SFTP mode, moves 5 MB each way, and an sftp batch makes,
+# lists, renames and removes.
 #
 # The keys live under $HOME: serve refuses an authorized_keys file in a
 # shared directory such as /tmp, as sshd's StrictModes does.
@@ -1043,6 +1066,33 @@ check_serve_ssh() {
   track $pid
   expect_exit cat $pid 0 120 || return
   cmp -s "$T/up" "$T/cat.out" || { fail "cat sent back different data"; return; }
+  # scp in SFTP mode, its default since OpenSSH 9.0. The remote files live
+  # with the keys, under $HOME.
+  head -c 5000000 /dev/urandom >"$T/scp.up"
+  cp_as "$key" "$T/scp.up" "me@$TICKET:$KEYS/scp.up" </dev/null >/dev/null 2>"$T/scp.err" &
+  pid=$!
+  track $pid
+  expect_exit scp $pid 0 120 || return
+  head -c 5000000 /dev/urandom >"$KEYS/scp.down"
+  cp_as "$key" "me@$TICKET:$KEYS/scp.down" "$T/scp.down" </dev/null >/dev/null 2>"$T/scp.err" &
+  pid=$!
+  track $pid
+  expect_exit scp $pid 0 120 || return
+  [ "$(cksum <"$T/scp.up")" = "$(cksum <"$KEYS/scp.up")" ] || { fail "scp uploaded different data"; return; }
+  [ "$(cksum <"$KEYS/scp.down")" = "$(cksum <"$T/scp.down")" ] ||
+    { fail "scp downloaded different data"; return; }
+  grep -q 'running sftp' "$T/serve.err" || { fail "scp did not use SFTP"; return; }
+  local r=$KEYS/sftp
+  # Quoted for sftp's own parser, in case a path has spaces.
+  printf '%s\n' "mkdir \"$r\"" "put \"$T/scp.up\" \"$r/a\"" "ls \"$r\"" \
+    "rename \"$r/a\" \"$r/b\"" "get \"$r/b\" \"$T/sftp.got\"" "rm \"$r/b\"" "rmdir \"$r\"" >"$T/batch"
+  sftp_as "$key" -b "$T/batch" </dev/null >"$T/sftp.out" 2>"$T/sftp.err" &
+  pid=$!
+  track $pid
+  expect_exit sftp $pid 0 120 || return
+  grep -q "^$r/a *$" "$T/sftp.out" || { fail "sftp ls printed '$(tail -3 "$T/sftp.out")'"; return; }
+  cmp -s "$T/scp.up" "$T/sftp.got" || { fail "sftp moved different data"; return; }
+  [ ! -e "$r" ] || { fail "sftp left $r behind"; return; }
   # A key that is not listed is refused.
   ssh-keygen -q -t ed25519 -N '' -C other -f "$KEYS/other" || { fail "ssh-keygen"; return; }
   ssh_as "$KEYS/other" "me@$TICKET" true </dev/null >/dev/null 2>"$T/other.err" &
@@ -1052,7 +1102,7 @@ check_serve_ssh() {
   wait_upto $pid 60 || code=$?
   [ "$code" = 255 ] || { fail "an unlisted key got in (exit $code)"; return; }
   kill -0 "$SERVER_PID" 2>/dev/null || { fail "serve exited"; return; }
-  pass "ssh true, exit 3, a PTY, and 20 MB each way through cat; a stranger's key refused"
+  pass "ssh true, exit 3, a PTY, 20 MB each way through cat; scp 5 MB each way; an sftp batch; a stranger's key refused"
 }
 
 ALL="transfer forced_relay resume heartbeat interrupt_client interrupt_server interrupt_blocked

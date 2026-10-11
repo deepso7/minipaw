@@ -15,7 +15,7 @@ doc = false
 [features]
 default = ["ssh-server"]
 # `serve --ssh`: a built-in SSH server (Unix only).
-ssh-server = ["dep:russh", "dep:tokio", "dep:tokio-util", "dep:pty-process", "dep:rustix", "dep:uzers"]
+ssh-server = ["dep:russh", "dep:russh-sftp", "dep:bytes", "dep:tokio", "dep:tokio-util", "dep:pty-process", "dep:rustix", "dep:uzers"]
 
 [dependencies]
 minipaw.workspace = true
@@ -27,6 +27,8 @@ ratatui.workspace = true
 [target.'cfg(unix)'.dependencies]
 signal-hook.workspace = true
 russh = { workspace = true, optional = true }
+russh-sftp = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 pty-process = { workspace = true, optional = true }
