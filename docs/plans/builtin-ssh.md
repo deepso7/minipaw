@@ -587,7 +587,10 @@ Where PR 3 differs from the plan above, and why:
   reader cannot tell the input being closed (the cap, data after EOF)
   from EOF, so when it ends with the input closed, the supervisor waits
   for the teardown that always follows such a close, and the client gets
-  the cap's message and a close rather than status 0.
+  the cap's message and a close rather than status 0. A teardown that
+  cuts the exit report short (of a process or of SFTP) goes on as any
+  teardown does, so the server's close is still sent for the cap or data
+  after EOF.
 - **Bounded file operations, not `tokio::fs`.** Every file operation runs
   on the blocking pool through one runner, holding one of 64 server-wide
   permits, moved into the job, until the syscall really returns. A
@@ -601,6 +604,13 @@ Where PR 3 differs from the plan above, and why:
   seek state, and a write's error comes with its own reply. A handle
   opened with APPEND writes with `write(2)` instead, at the end whatever
   the offset: `pwrite(2)` honours `O_APPEND` on Linux but not on macOS.
+- **Closing never blocks the runtime.** close(2) can hang on a stuck
+  filesystem too, so descriptors are dropped on the blocking pool, as a
+  job under a permit (so they are bounded with everything else) but even
+  once the session is gone, and nothing waits for them: `CLOSE` is
+  answered at once, and a session's open handles are closed in the
+  background when it ends. Its home is used as configured, without the
+  stat a shell's working directory gets, for the same reason.
 - **Handles are descriptors.** A file or directory handle holds its open
   descriptor: `fstat`, `fsetstat` (`fchmod`, `futimens`) and `readdir`
   (`fdopendir`, then `fstatat` per entry) act on what was opened, even
@@ -633,7 +643,9 @@ Where PR 3 differs from the plan above, and why:
   client's mode less the umask (`0666` without one), and opens
   non-blocking, so a FIFO cannot hold a job forever; reading one with no
   data fails instead of waiting.
-- **realpath** resolves the longest prefix of the path that exists,
+- **realpath** canonicalizes the path as given first, so `file/` and
+  `file/.` fail as they should; only if part of it is missing does it
+  resolve the longest prefix of the path that exists,
   symlinks and all, then works the rest, which does not exist, out by
   name (`link/../new`, with `link` pointing at `/srv/data`, is
   `/srv/new`). Only a missing component is passed over; any other error
@@ -656,7 +668,11 @@ Where PR 3 differs from the plan above, and why:
   path is the one shell and exec use. The no-replace rename's link
   fallback is a function of its own, tested directly (success, an
   existing name, a directory, and an unlink that fails), since the test
-  filesystems all have `renameat2`/`renameatx_np`. The append test only
+  filesystems all have `renameat2`/`renameatx_np`. A teardown landing
+  inside the exit report has no test: no hook makes it land there without
+  test-only waits in the supervisor. The close test checks that closes
+  happen and give their permits back, not that they are off the runtime.
+  The append test only
   fails on macOS if append writes regress to `pwrite`; Linux appends
   either way. A test-only count of running channel
   supervisors lets the channel-close test see the supervisor end while

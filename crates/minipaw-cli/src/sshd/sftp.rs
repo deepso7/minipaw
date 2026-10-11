@@ -502,6 +502,24 @@ impl Jobs {
     }
 }
 
+impl Jobs {
+    /// Drops `value`, closing the descriptors it holds, on the blocking pool
+    /// under a permit, as a job, but even once the session is gone; nothing
+    /// waits for it, since close(2) can hang on a stuck filesystem too.
+    fn dispose<T: Send + 'static>(&self, value: T) {
+        let permits = self.permits.clone();
+        tokio::spawn(async move {
+            // The semaphore is never closed.
+            if let Ok(permit) = permits.acquire_owned().await {
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    drop(value);
+                });
+            }
+        });
+    }
+}
+
 impl Drop for Jobs {
     fn drop(&mut self) {
         self.gone.store(true, Ordering::Release);
@@ -554,6 +572,15 @@ impl Fs {
             next: 0,
             jobs,
             max_handles: MAX_HANDLES,
+        }
+    }
+
+    /// Ends the session: closes its open handles in the background, and
+    /// tells its queued jobs not to start.
+    pub fn close_all(mut self) {
+        let handles = std::mem::take(&mut self.handles);
+        if !handles.is_empty() {
+            self.jobs.dispose(handles);
         }
     }
 
@@ -713,6 +740,13 @@ fn open_flags(pflags: OpenFlags) -> OFlags {
 /// symlinks and all, and the rest, which does not exist, with `.` and `..`
 /// worked out by name. Only a missing component is passed over.
 fn resolve(path: &Path) -> io::Result<PathBuf> {
+    // The path as given first: taking it apart would drop a trailing `/`
+    // or `.`, which make `file/` and `file/.` fail as they should.
+    match std::fs::canonicalize(path) {
+        Ok(real) => return Ok(real),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let parts: Vec<Component<'_>> = path.components().collect();
     for split in (1..=parts.len()).rev() {
         let prefix: PathBuf = parts[..split].iter().collect();
@@ -830,8 +864,10 @@ impl Handler for Fs {
         Ok(Handle { id, handle })
     }
 
+    /// Answered at once; the descriptor is closed in the background.
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, StatusReply> {
-        self.handles.remove(&handle).ok_or_else(bad_handle)?;
+        let open = self.handles.remove(&handle).ok_or_else(bad_handle)?;
+        self.jobs.dispose(open);
         Ok(ok(id))
     }
 
@@ -1665,6 +1701,54 @@ mod tests {
         std::fs::write(base.join("home/file"), b"").expect("write");
         let not_dir = fs.realpath(4, "file/x".into()).await;
         assert_eq!(code(not_dir), StatusCode::Failure);
+        // A file named as a directory is not one, trailing `/` or `.` and all.
+        for odd in ["file/", "file/."] {
+            let not_dir = fs.realpath(5, odd.into()).await;
+            assert_eq!(code(not_dir), StatusCode::Failure, "{odd}");
+        }
+        let got = real(fs.realpath(6, "file".into()).await.expect("realpath"));
+        assert_eq!(Path::new(&got), base.join("home/file"));
+    }
+
+    /// A handle's descriptor, without keeping it open.
+    fn weak_fd(fs: &Fs, handle: &str) -> std::sync::Weak<OwnedFd> {
+        match fs.open_handle(handle).expect("open") {
+            Open::File { fd, .. } => Arc::downgrade(&fd),
+            Open::Dir(_) => panic!("not a file"),
+        }
+    }
+
+    /// CLOSE answers at once and the descriptor is closed soon after, in
+    /// the background; so are those still open when the session ends.
+    #[tokio::test]
+    async fn closes_happen_in_the_background() {
+        let dir = Scratch::new("close");
+        std::fs::write(dir.0.join("f"), b"x").expect("write");
+        let permits = Arc::new(Semaphore::new(MAX_JOBS));
+        let mut fs = Fs::new(dir.0.clone(), Jobs::new(permits.clone()));
+        let first = fs
+            .open(1, "f".into(), OpenFlags::READ, FileAttributes::empty())
+            .await
+            .expect("open")
+            .handle;
+        let fd = weak_fd(&fs, &first);
+        fs.close(2, first).await.expect("close");
+        let second = fs
+            .open(1, "f".into(), OpenFlags::READ, FileAttributes::empty())
+            .await
+            .expect("open")
+            .handle;
+        let fd2 = weak_fd(&fs, &second);
+        fs.close_all();
+        tokio::time::timeout(LIMIT, async {
+            while fd.strong_count() + fd2.strong_count() > 0
+                || permits.available_permits() < MAX_JOBS
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("closed in the background");
     }
 
     #[tokio::test]

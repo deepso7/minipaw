@@ -303,8 +303,10 @@ impl Conn {
             Err(std::io::Error::other("the server is stopping"))
         } else {
             match run {
+                // Home as configured, not checked here: a stat could hang
+                // on a stuck filesystem, and absolute paths work anyway.
                 Run::Sftp => Ok(Program::Sftp(sftp::Fs::new(
-                    shared.account.cwd().to_owned(),
+                    shared.account.home.clone(),
                     sftp::Jobs::new(shared.sftp_jobs.clone()),
                 ))),
                 Run::Exec(cmd) if cmd.as_bytes().contains(&0) => {
@@ -740,7 +742,10 @@ impl Supervisor {
                 Err(_) => Exit::Status(255),
             };
             log::info!("ssh {}: {} ended: {exit:?}", self.label, self.what);
-            self.report(exit).await;
+            if !self.report(exit).await {
+                let why = self.ending().await;
+                self.close_after(why).await;
+            }
         } else {
             let why = self.ending().await;
             process.end().await;
@@ -770,8 +775,8 @@ impl Supervisor {
             }
             served => served,
         };
-        // Its files are closed before the client hears of the end.
-        drop(fs);
+        // Its files are closed in the background: close(2) may hang.
+        fs.close_all();
         self.input.close();
         match served {
             Some(served) => {
@@ -783,7 +788,10 @@ impl Supervisor {
                     }
                 };
                 log::info!("ssh {}: {} ended: {exit:?}", self.label, self.what);
-                self.report(exit).await;
+                if !self.report(exit).await {
+                    let why = self.ending().await;
+                    self.close_after(why).await;
+                }
             }
             None => {
                 let why = self.ending().await;
@@ -793,8 +801,9 @@ impl Supervisor {
     }
 
     /// The normal end: exit status, EOF and close, each cut short by a
-    /// teardown.
-    async fn report(&self, exit: Exit) {
+    /// teardown; `false` if one was, so the caller finishes as a teardown
+    /// does, closing the channel if the server tore it down.
+    async fn report(&self, exit: Exit) -> bool {
         let report = async {
             let sent = match exit {
                 Exit::Status(code) => self.handle.exit_status_request(self.id, code).await,
@@ -810,8 +819,8 @@ impl Supervisor {
             }
         };
         tokio::select! {
-            () = report => {}
-            () = self.teardown.cancelled() => {}
+            () = report => true,
+            () = self.teardown.cancelled() => false,
         }
     }
 
