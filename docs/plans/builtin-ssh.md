@@ -352,10 +352,13 @@ Keys are loaded once at startup.
 
 **Path policy**, like sshd's StrictModes:
 
-- `canonicalize` the path, then walk the canonical path from `/` one
-  component at a time with `openat(dirfd, name, O_DIRECTORY | O_NOFOLLOW |
-  O_CLOEXEC)`. Because the path was resolved first, a symlink swapped in
-  after resolution fails rather than being followed.
+- Resolve the path one component at a time. Each symlink followed must sit
+  in a directory that passes the checks below, with every directory above
+  it, since whoever can write that directory could point the link anywhere.
+  Then walk the resolved path from `/` one component at a time with
+  `openat(dirfd, name, O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`. Because the
+  path was resolved first, a symlink swapped in after resolution fails
+  rather than being followed.
 - Each directory, checked with `fstat`, must be owned by root or the
   serving user and not group- or world-writable (so a sticky `/tmp` is
   refused).

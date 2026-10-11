@@ -3,9 +3,12 @@
 //!
 //! Key files are checked as sshd's StrictModes would: the file and every
 //! directory above it must be owned by root or the serving user and not be
-//! writable by anyone else, and nothing on the way may be a symlink.
+//! writable by anyone else. Symlinks on the given path are followed only
+//! out of directories that pass the same checks, since whoever can write
+//! such a directory could point the link anywhere.
 
-use std::ffi::OsStr;
+use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read as _};
 use std::os::fd::OwnedFd;
@@ -18,6 +21,9 @@ use rustix::io::Errno;
 
 /// The most an authorized keys file may hold.
 const MAX_FILE: u64 = 1024 * 1024;
+
+/// The most symlinks resolving one path may follow, as Linux allows.
+const MAX_LINKS: usize = 40;
 
 /// The key types that can log in. RSA is left out: russh accepts `ssh-rsa`
 /// (SHA-1) signatures whatever it is told to prefer.
@@ -134,9 +140,53 @@ fn is_key_type(token: &str) -> bool {
 fn read(path: &Path, uid: u32) -> io::Result<Vec<u8>> {
     // Resolve it first, then walk the result without following anything:
     // a symlink swapped in meanwhile fails rather than being followed.
-    let path = path.canonicalize()?;
+    let path = resolve(path, Path::new("/"), uid)?;
     let root = open_root()?;
     read_under(root, Path::new("/"), &path, uid)
+}
+
+/// `path` made absolute and free of symlinks, one component at a time. The
+/// directory holding each symlink followed, and every directory above it
+/// up to `top`, must pass the checks: whoever can write it could point the
+/// link anywhere.
+fn resolve(path: &Path, top: &Path, uid: u32) -> io::Result<PathBuf> {
+    let mut todo: VecDeque<OsString> = VecDeque::new();
+    let push_front = |todo: &mut VecDeque<OsString>, path: &Path| {
+        for part in path.components().rev() {
+            todo.push_front(part.as_os_str().to_owned());
+        }
+    };
+    if path.is_relative() {
+        push_front(&mut todo, path);
+        push_front(&mut todo, &std::env::current_dir()?);
+    } else {
+        push_front(&mut todo, path);
+    }
+    let mut done = PathBuf::from("/");
+    let mut links = 0;
+    while let Some(part) = todo.pop_front() {
+        match Path::new(&part).components().next() {
+            Some(Component::RootDir) => done = PathBuf::from("/"),
+            Some(Component::ParentDir) => {
+                done.pop();
+            }
+            Some(Component::Normal(name)) => {
+                let next = done.join(name);
+                if !std::fs::symlink_metadata(&next)?.is_symlink() {
+                    done = next;
+                    continue;
+                }
+                links += 1;
+                if links > MAX_LINKS {
+                    return Err(denied("it goes through too many symlinks".into()));
+                }
+                walk(open_dir(top)?, top, &done, uid)?;
+                push_front(&mut todo, &std::fs::read_link(&next)?);
+            }
+            _ => {}
+        }
+    }
+    Ok(done)
 }
 
 /// [`read`] for `path`, which is canonical and under `top`, whose handle is
@@ -156,15 +206,7 @@ fn read_under(top_fd: OwnedFd, top: &Path, path: &Path, uid: u32) -> io::Result<
     let Some(name) = parts.pop() else {
         return Err(denied("it is not a file".into()));
     };
-    let mut fd = top_fd;
-    let mut walked = top.to_owned();
-    check(&fd, uid, &format!("directory {}", walked.display()), true)?;
-    for part in parts {
-        walked.push(part);
-        let subject = format!("directory {}", walked.display());
-        fd = open_at(&fd, part, OFlags::DIRECTORY, &subject)?;
-        check(&fd, uid, &subject, true)?;
-    }
+    let fd = walk(top_fd, top, &parts.iter().collect::<PathBuf>(), uid)?;
     let file = open_at(&fd, name, OFlags::NONBLOCK, "the file")?;
     check(&file, uid, "the file", false)?;
     let mut text = Vec::new();
@@ -175,9 +217,37 @@ fn read_under(top_fd: OwnedFd, top: &Path, path: &Path, uid: u32) -> io::Result<
     Ok(text)
 }
 
+/// Opens the directory `rest` under `top`, whose handle is `top_fd`,
+/// checking `top` and every directory on the way, `rest` included.
+fn walk(top_fd: OwnedFd, top: &Path, rest: &Path, uid: u32) -> io::Result<OwnedFd> {
+    let rest = if rest.is_absolute() {
+        rest.strip_prefix(top)
+            .map_err(|_| denied(format!("{} is not under {}", rest.display(), top.display())))?
+    } else {
+        rest
+    };
+    let mut fd = top_fd;
+    let mut walked = top.to_owned();
+    check(&fd, uid, &format!("directory {}", walked.display()), true)?;
+    for part in rest.components() {
+        let Component::Normal(part) = part else {
+            continue;
+        };
+        walked.push(part);
+        let subject = format!("directory {}", walked.display());
+        fd = open_at(&fd, part, OFlags::DIRECTORY, &subject)?;
+        check(&fd, uid, &subject, true)?;
+    }
+    Ok(fd)
+}
+
 fn open_root() -> io::Result<OwnedFd> {
+    open_dir(Path::new("/"))
+}
+
+fn open_dir(dir: &Path) -> io::Result<OwnedFd> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    Ok(rustix::fs::open("/", flags, Mode::empty())?)
+    Ok(rustix::fs::open(dir, flags, Mode::empty())?)
 }
 
 /// Opens `name` in `dir`, without following a symlink.
@@ -431,6 +501,43 @@ mod tests {
     /// as it may wherever this checkout lives.
     fn refused_above(e: &str) -> bool {
         e.contains("writable by group or others") || e.contains("owned by neither root nor")
+    }
+
+    /// A symlink is followed only out of a directory that passes the
+    /// checks, wherever it points.
+    #[test]
+    fn a_symlink_in_a_writable_directory_is_refused() {
+        let dir = Dir::new("auth-link-dir");
+        let good = dir.write("good", ED25519, 0o600);
+        let open = dir.0.join("open");
+        std::fs::create_dir(&open).expect("mkdir");
+        let link = open.join("keys");
+        std::os::unix::fs::symlink(&good, &link).expect("symlink");
+        let safe = dir.0.join("safe");
+        std::fs::create_dir(&safe).expect("mkdir");
+        chmod(&safe, 0o700);
+        std::os::unix::fs::symlink(&good, safe.join("keys")).expect("symlink");
+        // A relative link and `..` resolve too.
+        std::os::unix::fs::symlink("../good", safe.join("up")).expect("symlink");
+
+        chmod(&open, 0o777);
+        let e = resolve(&link, &dir.0, uid()).expect_err("refused");
+        assert!(e.to_string().contains("open is writable by group"), "{e}");
+        chmod(&open, 0o700);
+        assert_eq!(resolve(&link, &dir.0, uid()).expect("resolve"), good);
+        assert_eq!(
+            resolve(&safe.join("keys"), &dir.0, uid()).expect("resolve"),
+            good
+        );
+        assert_eq!(
+            resolve(&safe.join("up"), &dir.0, uid()).expect("resolve"),
+            good
+        );
+
+        // Loops end.
+        std::os::unix::fs::symlink(safe.join("loop"), safe.join("loop")).expect("symlink");
+        let e = resolve(&safe.join("loop"), &dir.0, uid()).expect_err("loop");
+        assert!(e.to_string().contains("too many symlinks"), "{e}");
     }
 
     #[test]

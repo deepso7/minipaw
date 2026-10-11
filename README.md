@@ -144,7 +144,8 @@ minipaw mpAQ…
   (`command=`, `from=`, `restrict`, …) or `cert-authority` is an error, so
   nothing is quietly loosened. The file and every directory above it must
   be owned by you or root and not be writable by anyone else, as sshd's
-  StrictModes requires.
+  StrictModes requires; so must the directory holding any symlink on the
+  way, and the directories above it.
 - **`--no-auth`** accepts anyone who reaches the server: **the ticket is the
   only credential**, and whoever has it gets a shell as you. serve says so
   on every start. `SSH_PEER_ID` in the shell is the dialer's peer id, which
