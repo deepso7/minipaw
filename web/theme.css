@@ -26,12 +26,11 @@ h6 {
   letter-spacing: -0.02em;
 }
 
-/* Wordmark: the brand title beside the paw, in a pixel face. */
-@font-face {
-  font-family: "Pixelify Sans";
-  font-weight: 600;
-  font-display: swap;
-  src: url("/fonts/pixelify-sans-600.woff2") format("woff2");
+/* The display role carries the pixel face only so Blume preloads it (see
+   blume.config.ts). Headings stay in Paper Mono; the wordmark and landing
+   headings use the face through --blume-font-display-src. */
+:root {
+  --blume-font-display: var(--blume-font-body);
 }
 
 /* The header caps the mark at 20px; 26px puts each sprite pixel on 2 screen pixels. */
@@ -39,7 +38,8 @@ h6 {
   height: 26px !important;
 }
 
+/* Wordmark: the brand title beside the paw, in the pixel face. */
 a:has(.minipaw-logo) > .truncate {
-  font-family: "Pixelify Sans", var(--blume-font-body);
+  font-family: var(--blume-font-display-src);
   font-size: 1.25rem;
 }

@@ -2,7 +2,7 @@ import { defineConfig } from "blume";
 import { cloudflare } from "blume/deploy";
 import { filesystem, githubReleases } from "blume/sources";
 
-// https://paper.design/mono (OFL, see fonts/PaperMono-OFL.txt), for every role.
+// https://paper.design/mono (OFL, see fonts/PaperMono-OFL.txt), for body and mono.
 const paperMono = {
   name: "Paper Mono",
   variants: [{ src: "./fonts/PaperMono-Variable.woff2" }],
@@ -49,7 +49,13 @@ export default defineConfig({
       dark: "oklch(20.3% 0.008 297.1)",
     },
     fonts: {
-      display: paperMono,
+      // The pixel face for the wordmark and landing headings. It sits in the
+      // display role only so Blume preloads it; theme.css points headings
+      // back at Paper Mono.
+      display: {
+        name: "Pixelify Sans",
+        variants: [{ src: "./fonts/pixelify-sans-600.woff2", weight: 600 }],
+      },
       body: paperMono,
       mono: paperMono,
     },
