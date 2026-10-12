@@ -2,16 +2,52 @@
 import PageLayout from "blume/components/layout/PageLayout.astro";
 import data from "blume:data";
 
+import Command from "../components/command.astro";
+
 const { config } = data;
 
 const install = "curl -fsSL https://paw.minip2p.com/install.sh | sh";
-const ticket = "mpAQDEiiVb-s5zPPFvR0SjX0lVJgAkCAESINgMwzfDtX";
+// A real one is this long: the listener's peer ID and a 16-byte token.
+const ticket = "mpAQDEiiVb-s5zPPFvR0SjX0lVJgAkCAESINgMwzfDtX-D_vKZ0slyfVb4K-lw-ijkyHNLfPt1UkM2";
 
+// Each recipe is two steps: A runs `a`, and B pastes the ticket A printed into
+// `b`. A second command on either side is an alternative to the first.
 const recipes = [
-  { a: "minipaw", b: "minipaw <ticket>", title: "Chat" },
-  { a: "minipaw > report.pdf", b: "minipaw <ticket> < report.pdf", title: "Send a file" },
-  { a: "tar cz dir/ | minipaw", b: "minipaw <ticket> | tar xz", title: "Any pipe" },
-  { a: "minipaw serve", b: "minipaw ssh me@<ticket>", title: "SSH, no open ports" },
+  {
+    a: {
+      alt: { cmd: "minipaw serve --ssh", label: "No sshd? Use the built-in server" },
+      cmd: "minipaw serve",
+      note: "Prints a ticket that stays the same across restarts, so save it once.",
+      title: "On the machine to reach",
+    },
+    b: {
+      alt: { cmd: "minipaw cp notes.txt you@<ticket>:", label: "Or copy files, as with scp" },
+      cmd: "minipaw ssh you@<ticket>",
+      note: "The built-in server lets in the keys in ~/.ssh/authorized_keys on the machine to reach.",
+      title: "From anywhere",
+    },
+    id: "ssh",
+    tab: "SSH",
+    user: true,
+  },
+  {
+    a: { cmd: "minipaw", note: "Prints a ticket and waits.", title: "On machine A" },
+    b: { cmd: "minipaw <ticket>", note: "Then type on either side.", title: "On machine B" },
+    id: "chat",
+    tab: "Chat",
+  },
+  {
+    a: { cmd: "minipaw > cat.jpg", note: "Saves what arrives as cat.jpg.", title: "On the receiving machine" },
+    b: { cmd: "minipaw <ticket> < cat.jpg", note: "Sends this machine's cat.jpg.", title: "On the sending machine" },
+    id: "file",
+    tab: "Send a file",
+  },
+  {
+    a: { cmd: "tar cz pics | minipaw", note: "Packs up the pics folder and sends it.", title: "On the sending machine" },
+    b: { cmd: "minipaw <ticket> | tar xz", note: "Unpacks it in the current directory.", title: "On the receiving machine" },
+    id: "folder",
+    tab: "Send a folder",
+  },
 ];
 
 const features = [
@@ -24,27 +60,30 @@ const features = [
     title: "End-to-end encrypted",
   },
   {
-    body: "The ticket is the whole address: it carries the listener's public key and a random token. Share it like a password.",
+    body: "The ticket is the whole address: the listener's public key, a random token, and its relay if that isn't the default. Whoever holds it can connect, so share it like a password.",
     title: "No accounts",
   },
   {
-    body: "A relay cutting a circuit, a path upgrade, a network blip: both sides pick up from the last byte the other received, for up to 60 seconds.",
+    body: "A relay cutting a circuit, a path upgrade, a network blip: both sides pick up from the last byte the other received, for up to 60 seconds, as long as both keep running.",
     title: "Resumes after drops",
   },
   {
     body: "The receiver acknowledges bytes only once they reach its stdout, so a slow reader slows the sender instead of filling memory.",
-    title: "Backpressure",
+    title: "Handles slow readers",
   },
   {
-    body: "minipaw serve --ssh answers with a built-in SSH server, scp and sftp included, letting in the keys from your authorized_keys.",
-    title: "SSH without sshd",
+    body: "minipaw serve keeps its key, so its ticket survives restarts, and minipaw ticket prints it without listening. --identity does the same for a plain listener.",
+    title: "Stable tickets",
   },
 ];
 
 const steps = [
   { body: "One side reserves a slot on a relay and prints a ticket.", title: "Listen" },
   { body: "The other side pastes the ticket and connects through the relay.", title: "Dial" },
-  { body: "Hole punching upgrades the link to direct QUIC when it can.", title: "Go direct" },
+  {
+    body: "Hole punching upgrades the link to direct QUIC when it can. When it can't, traffic stays on the relay, still end-to-end encrypted.",
+    title: "Go direct",
+  },
 ];
 ---
 
@@ -68,6 +107,7 @@ const steps = [
   page={{ title: "minipaw: pipe bytes, paw to paw", description: config.description }}
 >
   <div class="landing">
+    <p aria-live="polite" class="sr-only" id="copy-status"></p>
     <section class="mx-auto grid max-w-5xl items-center gap-12 px-6 pt-16 pb-20 md:grid-cols-[1fr_auto] md:pt-24">
       <div>
         <p class="text-sm text-muted-foreground">Tiny paws. Direct connections.</p>
@@ -86,6 +126,12 @@ const steps = [
             type="button">copy</button
           >
         </div>
+
+        <p class="mt-3 max-w-xl text-xs leading-relaxed text-muted-foreground">
+          Run it on both machines. Linux and macOS, x64 or arm64; it installs to ~/.local/bin and
+          says so if that isn't on your PATH. Elsewhere, <code>cargo install minipaw-cli</code>.{" "}
+          <a class="underline underline-offset-4 hover:text-foreground" href="/docs/installation">Installation docs</a>
+        </p>
 
         <div class="mt-6 flex flex-wrap items-center gap-x-6 gap-y-3 text-sm">
           <a class="rounded-blume bg-accent px-4 py-2 font-semibold text-accent-foreground" href="/docs">Read the docs</a>
@@ -108,8 +154,9 @@ const steps = [
           <div class="term-bar"><span>machine A</span></div>
           <pre><span class="dim">$</span> minipaw
 <span class="dim"># 🐾 listening; connect with:</span>
-minipaw {ticket}…
-hello</pre>
+minipaw {ticket}
+<span class="dim">· connected to 12D3KooW…tLdf (via relay)</span>
+<span class="dim">peer›</span> hello</pre>
         </div>
         <div class="trail" aria-hidden="true">
           <img alt="" src="/icon.svg" width="16" height="16" />
@@ -118,7 +165,7 @@ hello</pre>
         </div>
         <div class="term">
           <div class="term-bar"><span>machine B</span></div>
-          <pre><span class="dim">$</span> echo hello | minipaw {ticket}…</pre>
+          <pre><span class="dim">$</span> echo hello | minipaw {ticket}</pre>
         </div>
       </div>
     </section>
@@ -126,17 +173,69 @@ hello</pre>
     <section class="mx-auto max-w-5xl px-6 pb-20">
       <h2 class="pixel text-3xl">one listens, one pastes</h2>
       <p class="mt-2 text-sm text-muted-foreground">
-        The listener prints a ticket. Whatever goes into one side comes out of the other.
+        Install minipaw on both machines. One prints a ticket, the other pastes it.
       </p>
-      <div class="mt-8 grid gap-4 sm:grid-cols-2">
+
+      <div class="recipes mt-8">
+        <div class="flex flex-wrap gap-2" role="radiogroup" aria-label="What to do">
+          {
+            recipes.map((recipe, i) => (
+              <label class="tab">
+                <input checked={i === 0} class="sr-only" name="recipe" type="radio" value={recipe.id} />
+                {recipe.tab}
+              </label>
+            ))
+          }
+        </div>
+
         {
-          recipes.map((recipe) => (
-            <div class="rounded-blume border border-border p-5">
-              <h3 class="text-sm font-semibold">{recipe.title}</h3>
-              <pre class="mt-3 overflow-x-auto rounded-blume bg-code p-3 text-[13px] leading-relaxed"><span class="dim">A$</span> {recipe.a}{"\n"}<span class="dim">B$</span> {recipe.b}</pre>
+          recipes.map((recipe, i) => (
+            <div class="panel mt-3 grid gap-8 rounded-blume border border-border p-5 md:grid-cols-2" data-panel={recipe.id} hidden={i > 0}>
+              <div class="grid content-start gap-3">
+                <h3 class="step"><span class="num">1</span>{recipe.a.title}</h3>
+                <Command cmd={recipe.a.cmd} />
+                {recipe.a.alt && <Command {...recipe.a.alt} />}
+                <p class="text-xs leading-relaxed text-muted-foreground">{recipe.a.note}</p>
+              </div>
+              <div class="grid content-start gap-3">
+                <h3 class="step"><span class="num">2</span>{recipe.b.title}</h3>
+                <div class={`grid gap-2 ${recipe.user ? "sm:grid-cols-[1fr_9rem]" : ""}`}>
+                  <input
+                    aria-label="Ticket from step 1"
+                    autocomplete="off"
+                    class="field"
+                    name="ticket"
+                    placeholder="Paste the ticket from step 1"
+                    spellcheck="false"
+                    type="text"
+                  />
+                  {recipe.user && (
+                    <input
+                      aria-label="Your user name on the machine to reach"
+                      autocapitalize="off"
+                      autocomplete="off"
+                      class="field"
+                      name="user"
+                      placeholder="user (optional)"
+                      spellcheck="false"
+                      type="text"
+                    />
+                  )}
+                </div>
+                <Command cmd={recipe.b.cmd} />
+                {recipe.b.alt && <Command {...recipe.b.alt} />}
+                <p class="fill-status text-xs leading-relaxed text-muted-foreground" aria-live="polite" data-note={recipe.b.note}>
+                  {recipe.b.note}
+                </p>
+              </div>
             </div>
           ))
         }
+
+        <p class="mt-3 text-xs text-muted-foreground">
+          The ticket works like a password: whoever has it can connect. What you paste here stays on
+          this page.
+        </p>
       </div>
     </section>
 
@@ -172,7 +271,7 @@ hello</pre>
       </ol>
       <p class="mt-6 text-sm text-muted-foreground">
         Built on <a class="text-accent underline underline-offset-4" href="https://github.com/deepso7/minip2p">minip2p</a>,
-        a small libp2p implementation in Rust. <a class="text-accent underline underline-offset-4" href="/docs">Read more in the docs</a>.
+        a small libp2p implementation in Rust. <a class="text-accent underline underline-offset-4" href="/docs/how-it-works">Read how it works</a>.
       </p>
     </section>
   </div>
@@ -204,6 +303,52 @@ hello</pre>
   }
   .dim {
     color: var(--blume-muted-foreground);
+  }
+  .tab {
+    cursor: pointer;
+    border: 1px solid var(--blume-border);
+    border-radius: var(--blume-radius);
+    padding: 0.375rem 0.875rem;
+    font-size: 0.875rem;
+    color: var(--blume-muted-foreground);
+  }
+  .tab:hover {
+    color: var(--blume-foreground);
+  }
+  .tab:has(input:checked) {
+    border-color: var(--blume-accent);
+    color: var(--blume-foreground);
+  }
+  .tab:has(input:focus-visible),
+  .field:focus-visible {
+    outline: 2px solid var(--blume-accent);
+    outline-offset: 1px;
+  }
+  .step {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.875rem;
+    font-weight: 600;
+  }
+  .num {
+    display: grid;
+    place-items: center;
+    width: 1.25rem;
+    height: 1.25rem;
+    border-radius: 999px;
+    background: var(--blume-accent);
+    font-size: 0.75rem;
+    color: var(--blume-accent-foreground);
+  }
+  .field {
+    min-width: 0;
+    border: 1px solid var(--blume-border);
+    border-radius: var(--blume-radius);
+    background: transparent;
+    padding: 0.5rem 0.75rem;
+    font-size: 13px;
+    color: var(--blume-foreground);
   }
   .term {
     overflow: hidden;
@@ -248,17 +393,20 @@ hello</pre>
 </style>
 
 <script>
-  // Delegated from document: Blume's client router swaps the page's DOM on
-  // navigation but runs this module once, so a listener on the button itself
-  // would be lost after leaving the page and coming back.
+  // Listeners are delegated from document: Blume's client router swaps the
+  // page's DOM on navigation but runs this module once, so a listener on an
+  // element would be lost after leaving the page and coming back.
+
   document.addEventListener("click", async (event) => {
     const { target } = event;
     if (!(target instanceof Element)) {return;}
     const button = target.closest<HTMLButtonElement>("button.copy");
     if (!button) {return;}
+    const status = document.querySelector("#copy-status");
     try {
       await navigator.clipboard.writeText(button.dataset.copy ?? "");
       button.textContent = "copied";
+      if (status) {status.textContent = "Copied";}
     } catch {
       // No clipboard access (denied, or not a secure context): select the
       // command so a manual copy is one keystroke away.
@@ -266,6 +414,75 @@ hello</pre>
       if (code) {window.getSelection()?.selectAllChildren(code);}
       button.textContent = "press ⌘/Ctrl+C";
     }
-    setTimeout(() => (button.textContent = "copy"), 2500);
+    setTimeout(() => {
+      button.textContent = "copy";
+      if (status) {status.textContent = "";}
+    }, 2500);
+  });
+
+  // Step 2's fields fill `<ticket>` and `you@` into B's commands. Every tab
+  // has its own fields, kept in step so switching tabs keeps the ticket. A
+  // ticket is `mp` and URL-safe base64, so one is found inside a pasted line
+  // such as `minipaw mpAQ…` or `# ssh: minipaw ssh user@mpAQ…`.
+  const TICKET = /\bmp[\w-]{20,}/u;
+  const USER = /^[\w.-]+$/u;
+  // Each template's markup with its placeholders, to put back when the
+  // ticket is cleared.
+  const placeholders = new WeakMap<Element, string>();
+
+  // What step 2 says under the commands: its note, or what's wrong with the input.
+  const status = (raw: string, ticket: string | undefined, name: string, user: string) => {
+    if (raw && !ticket) {return "That isn't a ticket. Tickets start with mp; paste the line step 1 printed.";}
+    if (name && !user) {return "A user name is letters, digits, dots, dashes and underscores.";}
+    return null;
+  };
+
+  const render = (ticket: string | undefined, user: string) => {
+    for (const code of document.querySelectorAll<HTMLElement>("code[data-template]")) {
+      const button = code.parentElement?.querySelector<HTMLButtonElement>("button.copy");
+      if (!placeholders.has(code)) {placeholders.set(code, code.innerHTML);}
+      if (!ticket) {
+        code.innerHTML = placeholders.get(code) ?? "";
+        if (button) {button.hidden = true;}
+        continue;
+      }
+      const cmd = (code.dataset.template ?? "").replace("<ticket>", ticket).replace(/\byou@/u, user);
+      code.textContent = cmd;
+      if (button) {
+        button.dataset.copy = cmd;
+        button.setAttribute("aria-label", `Copy: ${cmd}`);
+        button.hidden = false;
+      }
+    }
+  };
+
+  const fill = (field: HTMLInputElement) => {
+    for (const other of document.querySelectorAll<HTMLInputElement>(`.recipes input[name="${field.name}"]`)) {
+      other.value = field.value;
+    }
+    const raw = document.querySelector<HTMLInputElement>('.recipes input[name="ticket"]')?.value.trim() ?? "";
+    const name = document.querySelector<HTMLInputElement>('.recipes input[name="user"]')?.value.trim() ?? "";
+    const ticket = TICKET.exec(raw)?.[0];
+    // No user: plain `minipaw ssh <ticket>`, and ssh uses B's own user name.
+    const user = USER.test(name) ? `${name}@` : "";
+    const problem = status(raw, ticket, name, user);
+    for (const line of document.querySelectorAll<HTMLElement>(".recipes .fill-status")) {
+      line.textContent = problem ?? line.dataset.note ?? "";
+    }
+    render(ticket, user);
+  };
+
+  document.addEventListener("input", (event) => {
+    const { target } = event;
+    if (target instanceof HTMLInputElement && target.closest(".recipes") && target.type === "text") {fill(target);}
+  });
+
+  // The tabs are radio buttons, for arrow-key moves between them for free.
+  document.addEventListener("change", (event) => {
+    const { target } = event;
+    if (!(target instanceof HTMLInputElement) || target.name !== "recipe") {return;}
+    for (const panel of document.querySelectorAll<HTMLElement>(".recipes .panel")) {
+      panel.hidden = panel.dataset.panel !== target.value;
+    }
   });
 </script>
