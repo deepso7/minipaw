@@ -1,7 +1,6 @@
 import { defineMeta } from "blume";
 
 export default defineMeta({
-  title: "Docs",
   pages: [
     "installation",
     "usage",
@@ -13,4 +12,5 @@ export default defineMeta({
     "relay",
     "library",
   ],
+  title: "Docs",
 });

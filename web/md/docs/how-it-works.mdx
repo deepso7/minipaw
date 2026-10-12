@@ -6,10 +6,9 @@ description: How minipaw connects two machines, a relay first and then a hole-pu
 <Steps>
   <Step title="Listen">
     The listener reserves a slot on a [Circuit Relay
-    v2](https://github.com/libp2p/specs/blob/master/relay/circuit-v2.md)
-    server (by default `relay.minip2p.com`) and prints a
-    [ticket](/docs/tickets) with its peer ID, a random token, and the relay
-    if it isn't the default.
+    v2](https://github.com/libp2p/specs/blob/master/relay/circuit-v2.md) server
+    (by default `relay.minip2p.com`) and prints a [ticket](/docs/tickets) with
+    its peer ID, a random token, and the relay if it isn't the default.
   </Step>
   <Step title="Dial">
     The other side connects through the relay with the ticket.

@@ -6,10 +6,17 @@
     "dev": "blume dev",
     "build": "blume build",
     "doctor": "blume doctor",
-    "paw": "node scripts/paw.mjs"
+    "paw": "node scripts/paw.mjs",
+    "check": "ultracite check",
+    "fix": "ultracite fix"
   },
   "dependencies": {
     "blume": "^2.2.2"
+  },
+  "devDependencies": {
+    "oxfmt": "^0.71.0",
+    "oxlint": "^1.87.0",
+    "ultracite": "8.0.0"
   },
   "packageManager": "pnpm@12.11.2"
 }

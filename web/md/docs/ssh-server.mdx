@@ -90,11 +90,12 @@ drop the old one with `ssh-keygen -R minipaw-<peer id>` (the name ssh shows).
 ## Limits
 
 - Each session buffers at most 8 MiB of input its program has not read yet.
-  A sender that gets further ahead than that, such as `cat big.iso | ssh …
-  slow-program`, has its session closed with `minipaw: input exceeded 8 MiB
-  buffer, closing` rather than being slowed down. Interactive shells, git and
-  ordinary pipes stay far below it. The same goes for SFTP requests sent
-  ahead of their replies; scp and sftp keep about 2 MiB in flight.
+  A sender that gets further ahead than that, such as
+  `cat big.iso | ssh … slow-program`, has its session closed with
+  `minipaw: input exceeded 8 MiB buffer, closing` rather than being slowed
+  down. Interactive shells, git and ordinary pipes stay far below it. The
+  same goes for SFTP requests sent ahead of their replies; scp and sftp keep
+  about 2 MiB in flight.
 - An SFTP session has at most 256 files and directories open at once, a read
   returns at most 255 KiB, and a request longer than 257 KiB ends the
   session.
@@ -102,7 +103,7 @@ drop the old one with `ssh-keygen -R minipaw-<peer id>` (the name ssh shows).
 - When a session is cut short (the client closes it or goes away, or serve
   stops), its program gets a hangup: SIGHUP (and SIGTERM without a PTY), then
   SIGKILL to its process group 2 s later. A program that exits by itself gets
-  none of this, so background children it left behind (`sleep 1000
-  >/dev/null 2>&1 &`) keep running, as under sshd. So can anything that left
-  the session's process groups (`setsid`, `nohup … &` in its own job-control
-  group). A second Ctrl-C, which stops serve at once, skips this cleanup.
+  none of this, so background children it left behind
+  (`sleep 1000 >/dev/null 2>&1 &`) keep running, as under sshd. So can
+  anything that left the session's process groups (`setsid`, `nohup … &` in
+  its own job-control group). A second Ctrl-C, which stops serve at once, skips this cleanup.

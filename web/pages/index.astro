@@ -8,43 +8,43 @@ const install = "curl -fsSL https://paw.minip2p.com/install.sh | sh";
 const ticket = "mpAQDEiiVb-s5zPPFvR0SjX0lVJgAkCAESINgMwzfDtX";
 
 const recipes = [
-  { title: "Chat", a: "minipaw", b: "minipaw <ticket>" },
-  { title: "Send a file", a: "minipaw > report.pdf", b: "minipaw <ticket> < report.pdf" },
-  { title: "Any pipe", a: "tar cz dir/ | minipaw", b: "minipaw <ticket> | tar xz" },
-  { title: "SSH, no open ports", a: "minipaw serve", b: "minipaw ssh me@<ticket>" },
+  { a: "minipaw", b: "minipaw <ticket>", title: "Chat" },
+  { a: "minipaw > report.pdf", b: "minipaw <ticket> < report.pdf", title: "Send a file" },
+  { a: "tar cz dir/ | minipaw", b: "minipaw <ticket> | tar xz", title: "Any pipe" },
+  { a: "minipaw serve", b: "minipaw ssh me@<ticket>", title: "SSH, no open ports" },
 ];
 
 const features = [
   {
-    title: "Gets through NATs",
     body: "Starts through a relay, then hole-punches a direct QUIC path when the networks allow, and moves the session over mid-transfer without losing a byte.",
+    title: "Gets through NATs",
   },
   {
-    title: "End-to-end encrypted",
     body: "QUIC with TLS 1.3 when direct, a Noise session through the relay. The relay only ever sees ciphertext, and both sides are authenticated by peer ID.",
+    title: "End-to-end encrypted",
   },
   {
-    title: "No accounts",
     body: "The ticket is the whole address: it carries the listener's public key and a random token. Share it like a password.",
+    title: "No accounts",
   },
   {
-    title: "Resumes after drops",
     body: "A relay cutting a circuit, a path upgrade, a network blip: both sides pick up from the last byte the other received, for up to 60 seconds.",
+    title: "Resumes after drops",
   },
   {
-    title: "Backpressure",
     body: "The receiver acknowledges bytes only once they reach its stdout, so a slow reader slows the sender instead of filling memory.",
+    title: "Backpressure",
   },
   {
-    title: "SSH without sshd",
     body: "minipaw serve --ssh answers with a built-in SSH server, scp and sftp included, letting in the keys from your authorized_keys.",
+    title: "SSH without sshd",
   },
 ];
 
 const steps = [
-  { title: "Listen", body: "One side reserves a slot on a relay and prints a ticket." },
-  { title: "Dial", body: "The other side pastes the ticket and connects through the relay." },
-  { title: "Go direct", body: "Hole punching upgrades the link to direct QUIC when it can." },
+  { body: "One side reserves a slot on a relay and prints a ticket.", title: "Listen" },
+  { body: "The other side pastes the ticket and connects through the relay.", title: "Dial" },
+  { body: "Hole punching upgrades the link to direct QUIC when it can.", title: "Go direct" },
 ];
 ---
 
@@ -249,8 +249,10 @@ hello</pre>
   // navigation but runs this module once, so a listener on the button itself
   // would be lost after leaving the page and coming back.
   document.addEventListener("click", async (event) => {
-    const button = (event.target as Element | null)?.closest<HTMLButtonElement>("button.copy");
-    if (!button) return;
+    const { target } = event;
+    if (!(target instanceof Element)) {return;}
+    const button = target.closest<HTMLButtonElement>("button.copy");
+    if (!button) {return;}
     try {
       await navigator.clipboard.writeText(button.dataset.copy ?? "");
       button.textContent = "copied";
@@ -258,7 +260,7 @@ hello</pre>
       // No clipboard access (denied, or not a secure context): select the
       // command so a manual copy is one keystroke away.
       const code = button.parentElement?.querySelector("code");
-      if (code) window.getSelection()?.selectAllChildren(code);
+      if (code) {window.getSelection()?.selectAllChildren(code);}
       button.textContent = "press ⌘/Ctrl+C";
     }
     setTimeout(() => (button.textContent = "copy"), 2500);
