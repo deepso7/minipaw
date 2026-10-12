@@ -8,6 +8,9 @@
 set -eu
 
 repo="deepso7/minipaw"
+# Bound connects: curl then moves on from an unreachable mirror IP within
+# seconds, instead of hanging until the OS gives up (~30s per attempt).
+fetch="-fsSL --connect-timeout 10 --retry 2"
 
 case "$(uname -s)" in
   Linux) os="linux" ;;
@@ -29,7 +32,7 @@ if [ -n "${MINIPAW_VERSION:-}" ]; then
   tag="v${MINIPAW_VERSION#v}"
 else
   # Resolve latest once, so the tarball and SHA256SUMS come from one release.
-  latest="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$repo/releases/latest")"
+  latest="$(curl $fetch -I -o /dev/null -w '%{url_effective}' "https://github.com/$repo/releases/latest")"
   tag="${latest##*/}"
 fi
 base="https://github.com/$repo/releases/download/$tag"
@@ -41,8 +44,8 @@ new=""
 trap 'rm -rf "$tmp"; [ -z "$new" ] || rm -f "$new"' EXIT
 
 echo "Downloading minipaw $tag for $os-$arch..."
-curl -fsSL -o "$tmp/$file" "$base/$file"
-curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
+curl $fetch -o "$tmp/$file" "$base/$file"
+curl $fetch -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
 
 # Check the tarball against the release's checksums.
 if command -v sha256sum >/dev/null 2>&1; then
