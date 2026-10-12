@@ -424,29 +424,57 @@ minipaw {ticket}
   // has its own fields, kept in step so switching tabs keeps the ticket. A
   // ticket is `mp` and URL-safe base64, so one is found inside a pasted line
   // such as `minipaw mpAQ…` or `# ssh: minipaw ssh user@mpAQ…`.
-  const TICKET = /\bmp[\w-]{20,}/u;
+  const CANDIDATE = /\bmp[\w-]+/gu;
+
+  // Whether `text` parses as a ticket, as crates/minipaw/src/ticket.rs reads
+  // one: base64url of [version 1][flags][token; 16][peer id len][peer id],
+  // then [relay len][relay] when flags is odd, and nothing after. So a
+  // truncated paste fails here rather than in the CLI.
+  const isTicket = (text: string) => {
+    let bytes: Uint8Array;
+    try {
+      const binary = atob(text.slice(2).replaceAll("-", "+").replaceAll("_", "/"));
+      bytes = Uint8Array.from(binary, (char) => char.codePointAt(0) ?? 0);
+    } catch {
+      return false;
+    }
+    if (bytes.length < 19 || bytes[0] !== 1) {return false;}
+    let at = 18;
+    // Steps over one length-prefixed field; false when it runs off the end.
+    const field = () => {
+      const len = bytes[at] ?? 0;
+      at += 1 + len;
+      return len > 0 && at <= bytes.length;
+    };
+    if (!field()) {return false;}
+    if (bytes[1] % 2 === 1 && !field()) {return false;}
+    return at === bytes.length;
+  };
   const USER = /^[\w.-]+$/u;
   // Each template's markup with its placeholders, to put back when the
   // ticket is cleared.
   const placeholders = new WeakMap<Element, string>();
 
   // What step 2 says under the commands: its note, or what's wrong with the input.
-  const status = (raw: string, ticket: string | undefined, name: string, user: string) => {
-    if (raw && !ticket) {return "That isn't a ticket. Tickets start with mp; paste the line step 1 printed.";}
-    if (name && !user) {return "A user name is letters, digits, dots, dashes and underscores.";}
+  const status = (raw: string, ticket: string | undefined, user: string | undefined) => {
+    if (raw && !ticket) {return "That isn't a whole ticket. Paste the full line step 1 printed.";}
+    if (user === undefined) {return "A user name is letters, digits, dots, dashes and underscores.";}
     return null;
   };
 
-  const render = (ticket: string | undefined, user: string) => {
+  // `user` is undefined while the user field holds an invalid name; the
+  // commands that take one then stay uncopyable too.
+  const render = (ticket: string | undefined, user: string | undefined) => {
     for (const code of document.querySelectorAll<HTMLElement>("code[data-template]")) {
       const button = code.parentElement?.querySelector<HTMLButtonElement>("button.copy");
       if (!placeholders.has(code)) {placeholders.set(code, code.innerHTML);}
-      if (!ticket) {
+      const template = code.dataset.template ?? "";
+      if (!ticket || (user === undefined && template.includes("you@"))) {
         code.innerHTML = placeholders.get(code) ?? "";
         if (button) {button.hidden = true;}
         continue;
       }
-      const cmd = (code.dataset.template ?? "").replace("<ticket>", ticket).replace(/\byou@/u, user);
+      const cmd = template.replace("<ticket>", ticket).replace(/\byou@/u, user ?? "");
       code.textContent = cmd;
       if (button) {
         button.dataset.copy = cmd;
@@ -462,10 +490,11 @@ minipaw {ticket}
     }
     const raw = document.querySelector<HTMLInputElement>('.recipes input[name="ticket"]')?.value.trim() ?? "";
     const name = document.querySelector<HTMLInputElement>('.recipes input[name="user"]')?.value.trim() ?? "";
-    const ticket = TICKET.exec(raw)?.[0];
+    const ticket = raw.match(CANDIDATE)?.find(isTicket);
     // No user: plain `minipaw ssh <ticket>`, and ssh uses B's own user name.
-    const user = USER.test(name) ? `${name}@` : "";
-    const problem = status(raw, ticket, name, user);
+    let user: string | undefined = "";
+    if (name) {user = USER.test(name) ? `${name}@` : undefined;}
+    const problem = status(raw, ticket, user);
     for (const line of document.querySelectorAll<HTMLElement>(".recipes .fill-status")) {
       line.textContent = problem ?? line.dataset.note ?? "";
     }
