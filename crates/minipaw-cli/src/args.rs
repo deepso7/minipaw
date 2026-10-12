@@ -338,6 +338,9 @@ fn config_with(args: &Args, env: impl Fn(&str) -> Option<OsString>) -> Result<Co
             if ticket.relay().is_none() {
                 config.relay = relay(None)?;
             }
+            // Test hook: how long the stream may stay silent before the
+            // dialer drops it.
+            config.test_dead_after = seconds(&env, "MINIPAW_TEST_DEAD_AFTER")?;
             // Test hook: a listener address to dial alongside the relay,
             // for benchmarks and paths hole punching cannot find.
             if let Some(raw) = var("MINIPAW_DIRECT") {
@@ -369,6 +372,8 @@ fn listener_hooks(
     config.test_drop_welcome = env("MINIPAW_TEST_DROP_WELCOME").is_some();
     // Test hook: how long the listener waits for a client to resume.
     config.test_resume_timeout = seconds(&env, "MINIPAW_TEST_RESUME_TIMEOUT")?;
+    // Test hook: how long a new peer has to get a session.
+    config.test_admission_timeout = seconds(&env, "MINIPAW_TEST_ADMISSION_TIMEOUT")?;
     Ok(())
 }
 
@@ -826,6 +831,7 @@ mod tests {
             ("MINIPAW_TEST_DROP_LINK_AFTER", "1000"),
             ("MINIPAW_TEST_DROP_WELCOME", "1"),
             ("MINIPAW_TEST_RESUME_TIMEOUT", "0.5"),
+            ("MINIPAW_TEST_ADMISSION_TIMEOUT", "3"),
         ];
         let config = config_with(&listen, env(&vars)).expect("config");
         assert!(config.force_relay);
@@ -833,6 +839,7 @@ mod tests {
         assert_eq!(config.test_drop_link_after, Some(1000));
         assert!(config.test_drop_welcome);
         assert_eq!(config.test_resume_timeout, Some(Duration::from_millis(500)));
+        assert_eq!(config.test_admission_timeout, Some(Duration::from_secs(3)));
         assert_eq!(
             config_with(&listen, env(&[("MINIPAW_TEST_RESUME_TIMEOUT", "x")])).unwrap_err(),
             "invalid MINIPAW_TEST_RESUME_TIMEOUT 'x': expected seconds"
@@ -849,6 +856,8 @@ mod tests {
         )
         .expect("config");
         assert!(config.direct.is_some());
+        let config = config_with(&dial, env(&[("MINIPAW_TEST_DEAD_AFTER", "8")])).expect("config");
+        assert_eq!(config.test_dead_after, Some(Duration::from_secs(8)));
         // The dialer uses MINIPAW_RELAY for a ticket without a relay.
         let config = config_with(&dial, env(&[("MINIPAW_RELAY", RELAY)])).expect("config");
         assert!(config.relay.is_some());

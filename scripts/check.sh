@@ -4,6 +4,10 @@
 #   scripts/check.sh            # every check
 #   scripts/check.sh <name>...  # just these (see `scripts/check.sh list`)
 #
+# SHARD=<i>/<n> runs every n-th of them, starting with the i-th, so CI can
+# split them across jobs. NO_BUILD=1 uses the binaries already in
+# target/release instead of building them.
+#
 # Starts its own relays unless RELAY is set (see scripts/lib.sh). Each check
 # prints PASS or FAIL with a reason; the script exits nonzero if any failed.
 # Set SHOW_LOGS=1 to print both sides' stderr for failures.
@@ -12,9 +16,11 @@ cd "$(dirname "$0")/.."
 . scripts/lib.sh
 
 BIN=${BIN:-target/release/minipaw}
-cargo build -q --release -p minipaw-cli --bin minipaw || exit 2
-cargo build -q --release -p minipaw --example squat || exit 2
 SQUAT=target/release/examples/squat
+if [ -z "${NO_BUILD:-}" ]; then
+  cargo build -q --release -p minipaw-cli --bin minipaw || exit 2
+  cargo build -q --release -p minipaw --example squat || exit 2
+fi
 
 T=$(mktemp -d)
 cleanup() {
@@ -107,8 +113,10 @@ check_resume() {
 # server forgets its link after 1 MB without closing it; the client must
 # notice the silence, reconnect, and finish the session where it left off.
 # Relay only, as in the real case; a path upgrade would also recover it.
+# The client gives up on the silence after 8 s rather than the usual 20.
 check_heartbeat() {
-  MINIPAW_FORCE_RELAY=1 MINIPAW_TEST_DROP_LINK_AFTER=1000000 transfer 3000000 1000000 || return
+  MINIPAW_FORCE_RELAY=1 MINIPAW_TEST_DROP_LINK_AFTER=1000000 MINIPAW_TEST_DEAD_AFTER=8 \
+    transfer 3000000 1000000 || return
   grep -q "test hook: dropping the link" "$T/server.err" ||
     { fail "the server never dropped its link"; return; }
   grep -q "no word from the server" "$T/client.err" ||
@@ -638,15 +646,15 @@ check_serve_restart() {
 }
 
 # The server gives up on a session whose client went silent (the link
-# dropped, the resume timeout shortened by test hooks), so the client
-# resuming later is refused.
+# dropped, the resume timeout and the client's patience shortened by test
+# hooks), so the client resuming later is refused.
 check_serve_late_resume() {
   start_target echo || { fail "no target"; return; }
   MINIPAW_TEST_DROP_LINK_AFTER=300000 MINIPAW_TEST_RESUME_TIMEOUT=1 \
     start_serve "$T/serve.err" --forward "$TARGET_PORT" || { fail "no ticket"; return; }
   head -c 1000000 /dev/urandom >"$T/up"
   feed "$T/c.in" "$T/up" "$T/up"
-  client c "$T/c.in"
+  MINIPAW_TEST_DEAD_AFTER=8 client c "$T/c.in"
   expect_exit c "$CLIENT_PID" 1 60 || return
   grep -q 'test hook: dropping the link' "$T/serve.err" || { fail "the link was never dropped"; return; }
   grep -q '^# \[1\] ended: client disconnected and did not come back' "$T/serve.err" ||
@@ -765,11 +773,13 @@ check_serve_stop_connecting() {
 }
 
 # One peer that keeps opening streams without a Hello is disconnected at
-# its admission deadline (15 s), however many fresh streams it opens, while
-# a real client gets in meanwhile.
+# its admission deadline (6 s here, by a test hook; 15 s normally), however
+# many fresh streams it opens, more than the server keeps pending, while a
+# real client gets in meanwhile.
 check_serve_auth_deadline() {
   start_target echo || { fail "no target"; return; }
-  start_serve "$T/serve.err" --forward "$TARGET_PORT" || { fail "no ticket"; return; }
+  MINIPAW_TEST_ADMISSION_TIMEOUT=6 start_serve "$T/serve.err" --forward "$TARGET_PORT" ||
+    { fail "no ticket"; return; }
   local peer
   peer=$(sed -n 's#^\# bound /ip4/0\.0\.0\.0/udp/[0-9]*/quic-v1/p2p/\(.*\)#\1#p' "$T/serve.err" | head -1)
   "$SQUAT" --churn "$DIRECT/p2p/$peer" 40 2>"$T/squat.err" &
@@ -786,8 +796,8 @@ check_serve_auth_deadline() {
   local after opened
   after=$(sed -n 's/^squat: disconnected after \([0-9.]*\)s, .*/\1/p' "$T/squat.err")
   opened=$(sed -n 's/^squat: disconnected after .*, \([0-9]*\) streams opened/\1/p' "$T/squat.err")
-  holds "$after >= 13 && $after <= 20" || { fail "disconnected after ${after}s"; return; }
-  [ "$opened" -ge 40 ] || { fail "only $opened streams opened"; return; }
+  holds "$after >= 5 && $after <= 11" || { fail "disconnected after ${after}s"; return; }
+  [ "$opened" -ge 20 ] || { fail "only $opened streams opened"; return; }
   pass "squatter out after ${after}s and $opened streams; client served"
 }
 
@@ -822,17 +832,19 @@ check_serve_flood() {
 
 # A peer whose session outlived its admission deadline, and that opens a
 # stream without a Hello before the session ends, is still disconnected
-# once it is left with no session: it is admitted afresh.
+# once it is left with no session: it is admitted afresh. The admission
+# deadline is 4 s here, by a test hook.
 check_serve_leave() {
   start_target echo || { fail "no target"; return; }
-  start_serve "$T/serve.err" --forward "$TARGET_PORT" || { fail "no ticket"; return; }
+  MINIPAW_TEST_ADMISSION_TIMEOUT=4 start_serve "$T/serve.err" --forward "$TARGET_PORT" ||
+    { fail "no ticket"; return; }
   local code=0
-  "$SQUAT" --leave "$(serve_addr "$T/serve.err")" "$TICKET" 17 40 2>"$T/squat.err" || code=$?
+  "$SQUAT" --leave "$(serve_addr "$T/serve.err")" "$TICKET" 6 20 2>"$T/squat.err" || code=$?
   [ "$code" = 0 ] || { fail "squat: $(tail -1 "$T/squat.err")"; return; }
   grep -q '^# \[1\] ended' "$T/serve.err" || { fail "the session was not reported ended"; return; }
   local after
   after=$(sed -n 's/^squat: disconnected \([0-9.]*\)s after its session/\1/p' "$T/squat.err")
-  holds "$after >= 10 && $after <= 20" || { fail "disconnected ${after}s after its session"; return; }
+  holds "$after >= 3 && $after <= 9" || { fail "disconnected ${after}s after its session"; return; }
   pass "disconnected ${after}s after its session ended"
 }
 
@@ -1114,7 +1126,19 @@ if [ "${1:-}" = list ]; then
   echo $ALL
   exit 0
 fi
-for CHECK in ${@:-$ALL}; do
+# shellcheck disable=SC2206 # ALL is a word list
+CHECKS=(${@:-$ALL})
+if [ -n "${SHARD:-}" ]; then
+  i=${SHARD%/*} n=${SHARD#*/}
+  [[ $i =~ ^[0-9]+$ && $n =~ ^[0-9]+$ ]] && [ "$i" -ge 1 ] && [ "$i" -le "$n" ] ||
+    { echo "SHARD must be <i>/<n> with 1 <= i <= n, not '$SHARD'" >&2; exit 2; }
+  picked=()
+  for k in "${!CHECKS[@]}"; do
+    [ $((k % n)) = $((i - 1)) ] && picked+=("${CHECKS[k]}")
+  done
+  CHECKS=(${picked[@]+"${picked[@]}"})
+fi
+for CHECK in "${CHECKS[@]}"; do
   if ! declare -F "check_$CHECK" >/dev/null; then
     echo "unknown check '$CHECK' (try: scripts/check.sh list)" >&2
     exit 2

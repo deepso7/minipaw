@@ -326,8 +326,11 @@ A few environment variables exist for testing only:
 `MINIPAW_TEST_DROP_LINK_AFTER=<bytes>` makes the server go silent on its
 stream once, after that many bytes, `MINIPAW_TEST_DROP_WELCOME=1` makes it
 drop its first `Welcome`, `MINIPAW_TEST_RESUME_TIMEOUT=<secs>` shortens how
-long it waits for a client to resume, and `MINIPAW_TEST_CONNECT_DELAY=<secs>`
-makes `serve` wait that long before each connection to its target.
+long it waits for a client to resume, `MINIPAW_TEST_ADMISSION_TIMEOUT=<secs>`
+shortens how long it gives a new peer to get a session,
+`MINIPAW_TEST_DEAD_AFTER=<secs>` shortens how long the client waits on a
+silent stream, and `MINIPAW_TEST_CONNECT_DELAY=<secs>` makes `serve` wait
+that long before each connection to its target.
 
 ## License
 

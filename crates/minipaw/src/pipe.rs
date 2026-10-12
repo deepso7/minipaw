@@ -58,6 +58,9 @@ pub struct Link {
     pub reader: FrameReader,
     /// When the peer last sent anything on this stream.
     heard: Instant,
+    /// How long the stream may stay silent: [`DEAD_AFTER`] unless a test
+    /// hook says.
+    dead_after: Duration,
     /// When we last queued a frame on it.
     sent: Cell<Instant>,
     /// The end of a frame the stream took only part of. It goes out before
@@ -77,10 +80,16 @@ impl Link {
             stream,
             reader: FrameReader::default(),
             heard: now,
+            dead_after: DEAD_AFTER,
             sent: Cell::new(now),
             unsent: RefCell::new(Bytes::new()),
             blocked_until: Cell::new(None),
         }
+    }
+
+    /// The link, counting as dead after `dead_after` of silence instead.
+    pub fn with_dead_after(self, dead_after: Duration) -> Self {
+        Link { dead_after, ..self }
     }
 
     /// Takes data the peer sent on this stream.
@@ -91,7 +100,7 @@ impl Link {
 
     /// When the link counts as dead unless the peer is heard from.
     pub fn dead_at(&self) -> Instant {
-        self.heard + DEAD_AFTER
+        self.heard + self.dead_after
     }
 
     fn ping_at(&self) -> Instant {

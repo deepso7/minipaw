@@ -62,6 +62,15 @@ pub struct Config {
     /// client come back after the session ended.
     #[doc(hidden)]
     pub test_resume_timeout: Option<Duration>,
+    /// Test hook: how long a dialer's stream may stay silent before it
+    /// counts as dead, instead of the usual 20 s, so a test sees a dropped
+    /// link noticed sooner.
+    #[doc(hidden)]
+    pub test_dead_after: Option<Duration>,
+    /// Test hook: how long a listener gives a new peer to get a session
+    /// before disconnecting it, instead of the usual 15 s.
+    #[doc(hidden)]
+    pub test_admission_timeout: Option<Duration>,
 }
 
 /// The default [`Config::max_sessions`].
@@ -78,6 +87,8 @@ impl Default for Config {
             test_drop_link_after: None,
             test_drop_welcome: false,
             test_resume_timeout: None,
+            test_dead_after: None,
+            test_admission_timeout: None,
         }
     }
 }
