@@ -9,6 +9,10 @@ crate, the library behind the `minipaw` command. It's blocking, with no async
 runtime: you build a `Session` with `minipaw::listen` or `minipaw::dial`, and
 `Session::run` drives it on the calling thread until it ends.
 
+```sh
+cargo add minipaw
+```
+
 ```rust
 use minipaw::{Config, Event, Io};
 

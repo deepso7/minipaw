@@ -20,10 +20,17 @@ implementation in Rust.
 ## Install
 
 ```sh
-cargo install --git https://github.com/deepso7/minipaw minipaw-cli
+curl -fsSL https://paw.minip2p.com/install.sh | sh
 ```
 
-This installs the `minipaw` binary.
+This downloads the `minipaw` binary for Linux or macOS (x64 or arm64) from
+the [latest release](https://github.com/deepso7/minipaw/releases/latest)
+into `~/.local/bin`. Set `MINIPAW_VERSION` for another version and
+`MINIPAW_INSTALL` for another directory. Or build it with cargo:
+
+```sh
+cargo install minipaw-cli
+```
 
 ## Use
 
