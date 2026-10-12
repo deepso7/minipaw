@@ -427,10 +427,10 @@ minipaw {ticket}
   const CANDIDATE = /\bmp[\w-]+/gu;
 
   // Whether `field` is a peer ID, as libp2p reads one: a multihash that is
-  // either the public key inline (identity, code 0x00) or its sha2-256
-  // (code 0x12, 32 bytes).
+  // either the public key inline (identity, code 0x00, at most 42 bytes) or
+  // its sha2-256 (code 0x12, 32 bytes).
   const isPeerId = (field: Uint8Array) =>
-    (field[0] === 0x00 && field[1] === field.length - 2) ||
+    (field[0] === 0x00 && field[1] === field.length - 2 && field.length <= 44) ||
     (field[0] === 0x12 && field[1] === 32 && field.length === 34);
 
   // Whether `text` parses as a ticket, as crates/minipaw/src/ticket.rs reads
@@ -439,9 +439,14 @@ minipaw {ticket}
   // truncated paste fails here rather than in the CLI. The relay, which only
   // a listener on a non-default relay embeds, is checked for length only.
   const isTicket = (text: string) => {
+    const body = text.slice(2);
     let bytes: Uint8Array;
     try {
-      const binary = atob(text.slice(2).replaceAll("-", "+").replaceAll("_", "/"));
+      const binary = atob(body.replaceAll("-", "+").replaceAll("_", "/"));
+      // atob ignores stray bits in the last character, which the CLI's
+      // decoder refuses; re-encoding catches a typo there.
+      const canonical = btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+      if (canonical !== body) {return false;}
       bytes = Uint8Array.from(binary, (char) => char.codePointAt(0) ?? 0);
     } catch {
       return false;
