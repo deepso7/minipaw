@@ -93,8 +93,10 @@ jobs:
         run: |
           [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::not a release tag: $TAG"; exit 1; }
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # v1.2.3-rc.1 and the like are prereleases, never latest.
+            prerelease=$([[ $TAG == *-* ]] && echo --prerelease || true)
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --title "$TAG" --generate-notes --latest=false
+              --title "$TAG" --generate-notes --latest=false $prerelease
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
@@ -132,6 +134,10 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked -p minipaw-cli --target ${{ matrix.target }}
+        env:
+          # ring's C, against musl's headers; cc would otherwise look for
+          # aarch64-linux-musl-gcc and fall back to the glibc gcc.
+          CC_aarch64_unknown_linux_musl: musl-gcc
       - name: Package
         run: |
           mkdir out
@@ -149,6 +155,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Two runs for one tag must not mix one's tarballs with the other's
+    # SHA256SUMS.
+    concurrency:
+      group: release-upload-${{ needs.prepare.outputs.tag }}
+      cancel-in-progress: false
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.prepare.outputs.tag }}
@@ -164,7 +175,8 @@ jobs:
           cat SHA256SUMS
           gh release upload "$TAG" minipaw-*.tar.gz SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
           # Only now, so install.sh's releases/latest always has binaries,
-          # and not when rebuilding an older release.
+          # and not for a prerelease or when rebuilding an older release.
+          [[ $TAG == *-* ]] && exit 0
           newest=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
             --limit 100 --json tagName --jq '.[].tagName' | sort -V | tail -n 1)
           if [ "$newest" = "$TAG" ]; then
