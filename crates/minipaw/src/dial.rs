@@ -330,6 +330,7 @@ impl Client {
                     ConnectOutcome::Connected { .. } => self.open(),
                     ConnectOutcome::Failed(failure) => self.retry(&format!("connect: {failure}")),
                     ConnectOutcome::Cancelled => self.retry("connect cancelled"),
+                    _ => self.retry("connect: unknown outcome"),
                 }
             }
             EndpointEvent::StreamReady {
