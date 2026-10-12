@@ -89,6 +89,7 @@ pub fn path_name(path: &Path) -> &'static str {
         Path::DirectDialed => "direct",
         Path::DirectPunched => "direct (hole-punched)",
         Path::Relayed { .. } => "relayed",
+        _ => "unknown",
     }
 }
 
@@ -141,7 +142,8 @@ fn flush(endpoint: &mut Endpoint) {
     for _ in 0..16 {
         match endpoint.wait(Duration::ZERO) {
             Ok(EndpointWaitOutcome::Deadline) | Err(_) => break,
-            Ok(EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted) => {}
+            // Events, `Interrupted`, and any outcome added later.
+            Ok(_) => {}
         }
     }
 }
@@ -180,8 +182,9 @@ pub fn linger_and_close(mut endpoint: Endpoint, link: Option<Link>) {
                 Ok(EndpointWaitOutcome::Event(EndpointEvent::ConnectionClosed {
                     conn_id, ..
                 })) if conn_id == link.conn => break,
-                Ok(EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted) => {}
                 Ok(EndpointWaitOutcome::Deadline) | Err(_) => break,
+                // Other events, `Interrupted`, and any outcome added later.
+                Ok(_) => {}
             }
         }
     }
@@ -495,8 +498,9 @@ fn abort(
                         Link::new(peer_id, conn_id, stream_id),
                     );
                 }
-                Ok(EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted) => {}
                 Ok(EndpointWaitOutcome::Deadline) | Err(_) => break,
+                // Other events, `Interrupted`, and any outcome added later.
+                Ok(_) => {}
             }
         }
     }

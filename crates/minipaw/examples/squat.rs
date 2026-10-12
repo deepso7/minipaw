@@ -81,8 +81,13 @@ fn main() -> Result<ExitCode> {
     while Instant::now() < end {
         let up = endpoint.connection_id(&peer).is_some();
         if up && opened < streams && Instant::now() >= next_open {
-            endpoint.open_stream(&peer, PROTOCOL)?;
-            opened += 1;
+            match endpoint.open_stream(&peer, PROTOCOL) {
+                Ok(_) => opened += 1,
+                // The server can close the connection before we read its
+                // `ConnectionClosed`, which is what ends the churn.
+                Err(_) if churn => {}
+                Err(e) => return Err(e.into()),
+            }
             if churn {
                 next_open = Instant::now() + CHURN_EVERY;
             }
