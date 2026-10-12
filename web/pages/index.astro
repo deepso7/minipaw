@@ -15,20 +15,18 @@ const ticket = "mpAQDEiiVb-s5zPPFvR0SjX0lVJgAkCAESINgMwzfDtX-D_vKZ0slyfVb4K-lw-i
 const recipes = [
   {
     a: {
-      alt: { cmd: "minipaw serve --ssh", label: "No sshd? Use the built-in server" },
-      cmd: "minipaw serve",
-      note: "Prints a ticket that stays the same across restarts, so save it once.",
+      cmd: "minipaw serve --ssh",
+      note: "A built-in SSH server, so no sshd needed (Linux and macOS). It lets in the ed25519 and ECDSA keys in ~/.ssh/authorized_keys, and its ticket stays the same across restarts, so save it once.",
       title: "On the machine to reach",
     },
     b: {
-      alt: { cmd: "minipaw cp notes.txt you@<ticket>:", label: "Or copy files, as with scp" },
-      cmd: "minipaw ssh you@<ticket>",
-      note: "The built-in server lets in the keys in ~/.ssh/authorized_keys on the machine to reach.",
+      alt: { cmd: "minipaw cp notes.txt <ticket>:", label: "Or copy files, as with scp" },
+      cmd: "minipaw ssh <ticket>",
+      note: "Runs your own ssh and scp. You log in as whoever started serve.",
       title: "From anywhere",
     },
     id: "ssh",
     tab: "SSH",
-    user: true,
   },
   {
     a: { cmd: "minipaw", note: "Prints a ticket and waits.", title: "On machine A" },
@@ -199,29 +197,15 @@ minipaw {ticket}
               </div>
               <div class="grid content-start gap-3">
                 <h3 class="step"><span class="num">2</span>{recipe.b.title}</h3>
-                <div class={`grid gap-2 ${recipe.user ? "sm:grid-cols-[1fr_9rem]" : ""}`}>
-                  <input
-                    aria-label="Ticket from step 1"
-                    autocomplete="off"
-                    class="field"
-                    name="ticket"
-                    placeholder="Paste the ticket from step 1"
-                    spellcheck="false"
-                    type="text"
-                  />
-                  {recipe.user && (
-                    <input
-                      aria-label="Your user name on the machine to reach"
-                      autocapitalize="off"
-                      autocomplete="off"
-                      class="field"
-                      name="user"
-                      placeholder="user (optional)"
-                      spellcheck="false"
-                      type="text"
-                    />
-                  )}
-                </div>
+                <input
+                  aria-label="Ticket from step 1"
+                  autocomplete="off"
+                  class="field"
+                  name="ticket"
+                  placeholder="Paste the ticket from step 1"
+                  spellcheck="false"
+                  type="text"
+                />
                 <Command cmd={recipe.b.cmd} />
                 {recipe.b.alt && <Command {...recipe.b.alt} />}
                 <p class="fill-status text-xs leading-relaxed text-muted-foreground" aria-live="polite" data-note={recipe.b.note}>
@@ -413,6 +397,7 @@ minipaw {ticket}
       const code = button.parentElement?.querySelector("code");
       if (code) {window.getSelection()?.selectAllChildren(code);}
       button.textContent = "press ⌘/Ctrl+C";
+      if (status) {status.textContent = "Couldn't copy. The command is selected; press ⌘/Ctrl+C.";}
     }
     setTimeout(() => {
       button.textContent = "copy";
@@ -420,8 +405,8 @@ minipaw {ticket}
     }, 2500);
   });
 
-  // Step 2's fields fill `<ticket>` and `you@` into B's commands. Every tab
-  // has its own fields, kept in step so switching tabs keeps the ticket. A
+  // Step 2's field fills `<ticket>` into B's commands. Every tab has its own
+  // field, kept in step so switching tabs keeps the ticket. A
   // ticket is `mp` and URL-safe base64, so one is found inside a pasted line
   // such as `minipaw mpAQ…` or `# ssh: minipaw ssh user@mpAQ…`.
   const CANDIDATE = /\bmp[\w-]+/gu;
@@ -465,32 +450,20 @@ minipaw {ticket}
     if (bytes[1] % 2 === 1 && !field()) {return false;}
     return at === bytes.length;
   };
-  // Not starting with a dash, which ssh would read as an option.
-  const USER = /^\w[\w.-]*$/u;
   // Each template's markup with its placeholders, to put back when the
   // ticket is cleared.
   const placeholders = new WeakMap<Element, string>();
 
-  // What step 2 says under the commands: its note, or what's wrong with the input.
-  const status = (raw: string, ticket: string | undefined, user: string | undefined) => {
-    if (raw && !ticket) {return "That isn't a whole ticket. Paste the full line step 1 printed.";}
-    if (user === undefined) {return "A user name is letters, digits, dots, dashes and underscores, and doesn't start with a dash.";}
-    return null;
-  };
-
-  // `user` is undefined while the user field holds an invalid name; the
-  // commands that take one then stay uncopyable too.
-  const render = (ticket: string | undefined, user: string | undefined) => {
+  const render = (ticket: string | undefined) => {
     for (const code of document.querySelectorAll<HTMLElement>("code[data-template]")) {
       const button = code.parentElement?.querySelector<HTMLButtonElement>("button.copy");
       if (!placeholders.has(code)) {placeholders.set(code, code.innerHTML);}
-      const template = code.dataset.template ?? "";
-      if (!ticket || (user === undefined && template.includes("you@"))) {
+      if (!ticket) {
         code.innerHTML = placeholders.get(code) ?? "";
         if (button) {button.hidden = true;}
         continue;
       }
-      const cmd = template.replace("<ticket>", ticket).replace(/\byou@/u, user ?? "");
+      const cmd = (code.dataset.template ?? "").replace("<ticket>", ticket);
       code.textContent = cmd;
       if (button) {
         button.dataset.copy = cmd;
@@ -501,20 +474,16 @@ minipaw {ticket}
   };
 
   const fill = (field: HTMLInputElement) => {
-    for (const other of document.querySelectorAll<HTMLInputElement>(`.recipes input[name="${field.name}"]`)) {
+    for (const other of document.querySelectorAll<HTMLInputElement>('.recipes input[name="ticket"]')) {
       other.value = field.value;
     }
-    const raw = document.querySelector<HTMLInputElement>('.recipes input[name="ticket"]')?.value.trim() ?? "";
-    const name = document.querySelector<HTMLInputElement>('.recipes input[name="user"]')?.value.trim() ?? "";
+    const raw = field.value.trim();
     const ticket = raw.match(CANDIDATE)?.find(isTicket);
-    // No user: plain `minipaw ssh <ticket>`, and ssh uses B's own user name.
-    let user: string | undefined = "";
-    if (name) {user = USER.test(name) ? `${name}@` : undefined;}
-    const problem = status(raw, ticket, user);
+    // Under the commands: step 2's note, or why the paste isn't a ticket.
     for (const line of document.querySelectorAll<HTMLElement>(".recipes .fill-status")) {
-      line.textContent = problem ?? line.dataset.note ?? "";
+      line.textContent = raw && !ticket ? "That isn't a whole ticket. Paste the full line step 1 printed." : (line.dataset.note ?? "");
     }
-    render(ticket, user);
+    render(ticket);
   };
 
   document.addEventListener("input", (event) => {

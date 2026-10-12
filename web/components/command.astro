@@ -12,13 +12,12 @@ const { cmd, label } = Astro.props;
 // up even when their labels wrap to different heights.
 const template = cmd.includes("<ticket>");
 
-// Marks the parts B fills in: `<ticket>`, and `you`, the account on A.
+// Marks the part B fills in.
 const html = cmd
   .replaceAll("&", "&amp;")
   .replaceAll("<", "&lt;")
   .replaceAll(">", "&gt;")
-  .replace("&lt;ticket&gt;", '<span class="ph">&lt;ticket&gt;</span>')
-  .replace(/\byou@/u, '<span class="ph">you</span>@');
+  .replace("&lt;ticket&gt;", '<span class="ph">&lt;ticket&gt;</span>');
 ---
 
 <div class="flex flex-col">
