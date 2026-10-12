@@ -1,0 +1,102 @@
+---
+title: Rust library
+description: The minipaw crate is a blocking Rust library you can embed. Listen, dial or serve, give it any reader and writer, and get events and progress back.
+---
+
+The networking lives in the
+[`minipaw`](https://github.com/deepso7/minipaw/tree/main/crates/minipaw)
+crate, the library behind the `minipaw` command. It's blocking, with no async
+runtime: you build a `Session` with `minipaw::listen` or `minipaw::dial`, and
+`Session::run` drives it on the calling thread until it ends.
+
+```rust
+use minipaw::{Config, Event, Io};
+
+fn main() -> Result<(), minipaw::Error> {
+    let outcome = minipaw::listen(Config::default(), Io::stdio())
+        .on_event(|event| {
+            if let Event::Listening { ticket } = event {
+                eprintln!("connect with: {ticket}");
+            }
+        })
+        .run()?;
+    eprintln!("finished: {outcome:?}");
+    Ok(())
+}
+```
+
+- `on_event` registers a callback for status changes (`Event`). It runs
+  synchronously on the session's thread, so it must not block.
+- `handle()` returns a `Handle` you can clone and send to other threads:
+  `stop()` ends the session (the peer is told), and `progress()` returns a
+  cheap snapshot of the byte counters, meant for polling.
+- `run()` returns an `Outcome` when both directions finished, or an `Error`
+  saying why not.
+
+## Dial
+
+`Ticket` parses from and displays as the `mp…` string:
+
+```rust
+use minipaw::{Config, Event, Io, Ticket};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let ticket: Ticket = std::env::args().nth(1).ok_or("usage: dial <ticket>")?.parse()?;
+    minipaw::dial(ticket, Config::default(), Io::stdio())
+        .on_event(|event| {
+            if let Event::Upgraded = event {
+                eprintln!("now direct");
+            }
+        })
+        .run()?;
+    Ok(())
+}
+```
+
+## Serve
+
+`minipaw::serve` keeps listening and serves every dialer with the ticket, up
+to `Config::max_sessions` (16) at once. Its `accept` callback makes each
+session's local end, such as a fresh connection to a port being forwarded:
+
+```rust
+use std::net::{SocketAddr, TcpStream};
+use std::time::Duration;
+
+use minipaw::{Config, Event, Io, ServeEvent};
+
+fn main() -> Result<(), minipaw::Error> {
+    let target: SocketAddr = "127.0.0.1:22".parse().expect("address");
+    minipaw::serve(Config::default(), move |_peer| {
+        let stream = TcpStream::connect_timeout(&target, Duration::from_secs(5))?;
+        stream.set_nodelay(true)?;
+        Io::tcp(stream)
+    })
+    .on_event(|event| {
+        if let ServeEvent::Server(Event::Listening { ticket }) = event {
+            eprintln!("connect with: {ticket}");
+        }
+    })
+    .run()
+}
+```
+
+## Input and output
+
+`Io::stdio()` uses the process's stdin and stdout, and `Io::tcp` a
+`TcpStream`. For anything else, pass any `Read + Send` and `Write + Send` to
+`Io::new`. Each runs on its own helper thread, so both may block.
+
+## Identity and relay
+
+The key and token are fresh every run unless `Config::identity` holds an
+`Identity`: `Identity::load_or_create(path)` keeps one in a private file, and
+`Identity::ticket(relay)` gives the ticket a listener with it prints.
+
+`Config::default()` uses the hosted relay `DEFAULT_RELAY`. Set `Config::relay`
+(see `parse_relay`) to use [your own](/docs/relay), or `Config::force_relay` to
+skip hole punching.
+
+The [crate's README](https://github.com/deepso7/minipaw/blob/main/crates/minipaw/README.md)
+covers stopping, cleanup of reader and writer threads, events and logging in
+full.

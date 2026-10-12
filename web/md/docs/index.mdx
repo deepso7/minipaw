@@ -1,0 +1,42 @@
+---
+title: Introduction
+description: minipaw pipes stdin/stdout between two machines, peer to peer. Like netcat, but it gets through NATs, needs no accounts, and every byte is end-to-end encrypted.
+---
+
+One side listens and prints a ticket; the other pastes it. Whatever goes into
+one side comes out of the other.
+
+```console
+$ minipaw                                  # machine A
+# 🐾 listening; connect with:
+minipaw mpAQDEiiVb-s5zPPFvR0SjX0lVJgAkCAESINgMwzfDtX-D_vKZ0slyfVb4K-lw-ijkyHNLfPt1UkM2
+
+$ echo hello | minipaw mpAQDEiiVb-s5zPPF…  # machine B
+```
+
+- **Gets through NATs.** Both sides meet through a relay, then hole punching
+  upgrades the connection to a direct path when the networks allow.
+- **No accounts.** The ticket is the whole address. There's nothing to sign
+  up for and no control plane.
+- **End-to-end encrypted.** The relay only ever sees ciphertext, and both
+  sides are authenticated by their peer IDs.
+
+minipaw is an alternative to [tailcat](https://github.com/tailscale/tailcat)
+built on [minip2p](https://github.com/deepso7/minip2p), a small libp2p
+implementation in Rust. The networking is also a [Rust library](/docs/library)
+you can embed.
+
+<CardGroup cols={2}>
+  <Card title="Installation" href="/docs/installation" icon="download">
+    Build and install the `minipaw` binary.
+  </Card>
+  <Card title="Usage" href="/docs/usage" icon="terminal">
+    Chat, send files, and pipe anything between machines.
+  </Card>
+  <Card title="SSH over minipaw" href="/docs/ssh" icon="key">
+    Reach a machine's sshd, or a built-in SSH server, by ticket.
+  </Card>
+  <Card title="How it works" href="/docs/how-it-works" icon="network">
+    Tickets, relays, hole punching, and resumable sessions.
+  </Card>
+</CardGroup>

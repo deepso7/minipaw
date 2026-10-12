@@ -1,0 +1,69 @@
+---
+title: Usage
+description: Chat, send a file, or pipe any command between two machines. One side listens and prints a ticket, and the other connects with it.
+---
+
+One side listens and prints a ticket; the other pastes it. The session ends
+when both sides have sent everything, or when either side hits Ctrl-C.
+
+## Chat
+
+Run minipaw in a terminal on both machines and type on either side:
+
+```sh
+minipaw                       # A: prints a ticket
+minipaw <ticket>              # B: connects
+```
+
+## Send a file
+
+```sh
+minipaw > report.pdf          # A: receive
+minipaw <ticket> < report.pdf # B: send
+```
+
+Either side can listen. Sending from the listener works just as well:
+
+```sh
+minipaw < big.iso             # A: send; prints a ticket
+minipaw <ticket> > big.iso    # B: receive
+```
+
+## Any pipe
+
+Anything that reads stdin or writes stdout works:
+
+```sh
+tar cz dir/ | minipaw         # A
+minipaw <ticket> | tar xz     # B
+```
+
+## Output and status
+
+Status goes to stderr, so redirecting stdout captures only the data. How it's
+shown depends on where the streams point; see [Terminal UI](/docs/terminal-ui).
+
+| Flag | Effect |
+| --- | --- |
+| `-v`, `--verbose` | Log connection progress to stderr. |
+| `-q`, `--quiet` | Print nothing on stderr but a fatal error. |
+| `--plain` | Plain `#` status lines instead of the terminal UI. |
+| `--relay <MULTIADDR>` | Listen through another relay. See [Your own relay](/docs/relay). |
+| `--identity <PATH>` | Listen with the same ticket every run. See [Tickets](/docs/tickets). |
+
+`minipaw parse <ticket>` shows what a ticket contains.
+
+## Exit status
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Both directions finished and were confirmed. |
+| `1` | Any error, including the other side hitting one. |
+| `130` | Ctrl-C. |
+
+## Environment
+
+| Variable | Effect |
+| --- | --- |
+| `MINIPAW_RELAY` | Relay to use when `--relay` isn't given. Empty means the built-in relay. |
+| `MINIPAW_HOME` | Where `minipaw ticket` and `minipaw serve` keep `serve.key`. Defaults to `$XDG_CONFIG_HOME/minipaw`, else `~/.config/minipaw`. |

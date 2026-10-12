@@ -1,0 +1,44 @@
+---
+title: Tickets
+description: What an mp… ticket contains, why it's a secret, and how to keep the same ticket across runs with a saved identity.
+---
+
+A ticket is how the other side finds and authenticates the listener. It holds:
+
+- the listener's **peer ID**, which is its public key,
+- a random 16-byte **token**,
+- the **relay**, if it isn't the default.
+
+Anyone with the ticket can connect, so share it like a password. A plain
+`minipaw` listener serves one client per run; [`minipaw serve`](/docs/ssh)
+serves many.
+
+`minipaw parse <ticket>` shows what a ticket contains.
+
+## A stable ticket
+
+A ticket is new every run unless the listener keeps its key. `--identity`
+saves the key to a file:
+
+```sh
+minipaw --identity my.key
+```
+
+The first run creates `my.key` (mode `0600`); every later run prints the same
+ticket. The file and its directory must be private to you.
+
+`minipaw ticket` prints that stable ticket without listening. It uses the
+identity in `~/.config/minipaw/serve.key` by default (set `MINIPAW_HOME` or
+pass `--identity PATH` to use another), creating it if it's missing:
+
+```sh
+minipaw ticket
+minipaw ticket --identity my.key --relay /dns/relay.example.com/udp/19876/quic-v1/p2p/12D3KooW…
+```
+
+Pass the listener's `--relay` too, since the relay is part of the ticket.
+
+:::warning
+Anyone with a stable ticket can connect whenever you listen. Delete the
+identity file to rotate it; the old ticket stops working.
+:::

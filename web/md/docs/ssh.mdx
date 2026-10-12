@@ -1,0 +1,72 @@
+---
+title: SSH over minipaw
+description: minipaw serve keeps listening with a stable ticket and forwards every session to a local port, so you can ssh, scp, git and rsync by ticket.
+---
+
+`minipaw serve` keeps listening with a stable ticket and forwards every
+session to a local TCP port, several at once (16 by default,
+`--max-sessions N`). It defaults to sshd on `127.0.0.1:22`. `--forward
+HOST:PORT` or `--forward PORT` picks another, and `--ssh` answers with a
+[built-in SSH server](/docs/ssh-server) instead.
+
+```console
+$ minipaw serve                             # on the machine to reach
+# identity: /home/me/.config/minipaw/serve.key (new)
+# forwarding to 127.0.0.1:22
+# 🐾 listening; connect with:
+minipaw mpAQ…
+# ssh: minipaw ssh user@mpAQ…
+# [1] 12D3KooW…ab12 connected (direct)
+# [1] ended: 1.2 MiB sent, 40.0 KiB received in 3:02
+```
+
+## Connect
+
+On the other machine, the ticket stands in for the host:
+
+```sh
+minipaw ssh me@mpAQ…                   # a shell
+minipaw ssh -p 2222 me@mpAQ… uptime    # any ssh options, a command
+minipaw cp -r photos me@mpAQ…:backup/  # scp; remote paths are TICKET:PATH
+```
+
+These run the system's `ssh` and `scp` with every other argument as is.
+`cp` takes no other remote paths alongside the ticket's. The ticket is
+swapped for a host named `minipaw-<peer id>`, with a ProxyCommand of
+`minipaw -q <ticket>` (`-q` keeps it silent, since ssh shares its stderr).
+The host key is remembered in `known_hosts` under that name, which ssh
+lowercases, so the first connection asks you to trust it, as ssh does for
+any new host.
+
+## Other tools
+
+For other tools that run ssh, such as git or rsync, put the ProxyCommand in
+`~/.ssh/config`:
+
+```ssh-config ~/.ssh/config
+Host home
+  User me
+  HostKeyAlias minipaw-12D3KooW…
+  ProxyCommand minipaw -q mpAQ…
+```
+
+Then `ssh home`, `scp file home:` and `git clone home:repo` all go through
+minipaw.
+
+## Running serve
+
+- serve prints `#` lines on stderr, never a terminal UI, so it runs as is
+  under systemd or nohup. Ctrl-C stops it (exit 0).
+- The identity lives in `~/.config/minipaw/serve.key` (`--identity PATH`),
+  so the ticket survives restarts. `minipaw serve --new` rotates it, and the
+  old ticket stops working.
+- Sessions don't survive a serve restart: a connected ssh is cut off and
+  just reconnects.
+- Without hole punching, sessions go through the relay. That's slower, and a
+  relay with limits cuts its circuits every so often. Sessions resume across
+  each cut, but the relay also rate limits new circuits, so a long, large
+  relayed transfer can fail.
+
+:::warning
+The ticket is a secret: anyone holding it can reach the forwarded port.
+:::

@@ -1,0 +1,14 @@
+{
+  "name": "web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "blume dev",
+    "build": "blume build",
+    "doctor": "blume doctor",
+    "paw": "node scripts/paw.mjs"
+  },
+  "dependencies": {
+    "blume": "^2.2.2"
+  }
+}
