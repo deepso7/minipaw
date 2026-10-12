@@ -20,7 +20,7 @@ const recipes = [
       alt: { cmd: "minipaw serve --ssh", label: "Or let in only the keys in ~/.ssh/authorized_keys" },
       cmd: "minipaw serve --ssh --no-auth",
       docs: { href: "/docs/ssh-server", label: "Built-in SSH server docs" },
-      note: "A built-in SSH server, so no sshd needed (Linux and macOS). Its ticket stays the same across restarts, so save it once.",
+      note: "A built-in SSH server, so no sshd needed (Linux and macOS).",
       title: "On the machine to reach",
       warning:
         "Anyone with the ticket gets a shell as you, and it keeps working across restarts until serve --new replaces it. Stop serve with Ctrl-C when you're done.",
