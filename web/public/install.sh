@@ -49,7 +49,12 @@ else
   echo "minipaw: need sha256sum or shasum to verify the download" >&2
   exit 1
 fi
-(cd "$tmp" && grep " $file\$" SHA256SUMS | $sum -c - >/dev/null) || {
+line="$(grep " $file\$" "$tmp/SHA256SUMS" || true)"
+if [ -z "$line" ]; then
+  echo "minipaw: no checksum listed for $file" >&2
+  exit 1
+fi
+(cd "$tmp" && printf '%s\n' "$line" | $sum -c - >/dev/null) || {
   echo "minipaw: checksum mismatch for $file" >&2
   exit 1
 }
