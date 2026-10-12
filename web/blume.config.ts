@@ -1,4 +1,5 @@
 import { defineConfig } from "blume";
+import { cloudflare } from "blume/deploy";
 import { filesystem, githubReleases } from "blume/sources";
 
 // https://paper.design/mono (OFL, see fonts/PaperMono-OFL.txt), for every role.
@@ -12,9 +13,7 @@ export default defineConfig({
   description:
     "Pipe stdin/stdout between two machines, peer to peer. Like netcat, but it gets through NATs, needs no accounts, and every byte is end-to-end encrypted.",
   logo: "/logo.svg",
-  deployment: {
-    site: "https://paw.minip2p.com",
-  },
+  deployment: cloudflare({ output: "static", site: "https://paw.minip2p.com" }),
   github: {
     owner: "deepso7",
     repo: "minipaw",
