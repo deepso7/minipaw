@@ -5,6 +5,8 @@
   "observability": {
     "enabled": true,
   },
+  // Branch builds deploy with `wrangler preview`, which needs this block.
+  "previews": {},
   "assets": {
     "directory": "./dist",
     "not_found_handling": "404-page",

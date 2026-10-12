@@ -43,6 +43,24 @@ export default defineConfig({
       { href: "https://github.com/deepso7/minipaw", label: "GitHub" },
     ],
   },
+  seo: {
+    og: {
+      // Paper Mono only: the card tracks headlines at a fixed -0.05em, which
+      // runs the pixel face's words together.
+      fonts: [{ name: paperMono.name, src: paperMono.variants[0].src }],
+      // The paw with hex fills (`pnpm paw`); the card's SVG renderer paints
+      // oklch() black.
+      logo: "./og/paw.svg",
+      // The dark theme, from theme.css.
+      palette: {
+        accent: "oklch(82.2% 0.076 31.9)",
+        background: "oklch(20.3% 0.008 297.1)",
+        border: "oklch(28.1% 0.011 300.9)",
+        foreground: "oklch(94.2% 0.004 301.4)",
+        muted: "oklch(67.7% 0.014 310.5)",
+      },
+    },
+  },
   // Colors beyond accent and background live in theme.css.
   theme: {
     accent: {
