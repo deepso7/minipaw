@@ -43,3 +43,17 @@ a:has(.minipaw-logo) > .truncate {
   font-family: var(--blume-font-display-src);
   font-size: 1.25rem;
 }
+
+/* Thin, theme-colored scrollbars for the page and everything in it, as Blume
+   already gives code blocks, instead of the platform's light grey. The dark
+   border token is too close to the background to read as a thumb, so dark
+   derives one from the muted foreground, as Blume does. Inherited, so the
+   landing's command rows pick it up too. */
+:root {
+  scrollbar-color: var(--blume-border) transparent;
+  scrollbar-width: thin;
+}
+
+:root[data-theme="dark"] {
+  scrollbar-color: color-mix(in oklab, var(--blume-muted-foreground) 55%, transparent) transparent;
+}
