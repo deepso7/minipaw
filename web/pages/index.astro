@@ -426,10 +426,18 @@ minipaw {ticket}
   // such as `minipaw mpAQ…` or `# ssh: minipaw ssh user@mpAQ…`.
   const CANDIDATE = /\bmp[\w-]+/gu;
 
+  // Whether `field` is a peer ID, as libp2p reads one: a multihash that is
+  // either the public key inline (identity, code 0x00) or its sha2-256
+  // (code 0x12, 32 bytes).
+  const isPeerId = (field: Uint8Array) =>
+    (field[0] === 0x00 && field[1] === field.length - 2) ||
+    (field[0] === 0x12 && field[1] === 32 && field.length === 34);
+
   // Whether `text` parses as a ticket, as crates/minipaw/src/ticket.rs reads
   // one: base64url of [version 1][flags][token; 16][peer id len][peer id],
   // then [relay len][relay] when flags is odd, and nothing after. So a
-  // truncated paste fails here rather than in the CLI.
+  // truncated paste fails here rather than in the CLI. The relay, which only
+  // a listener on a non-default relay embeds, is checked for length only.
   const isTicket = (text: string) => {
     let bytes: Uint8Array;
     try {
@@ -440,17 +448,20 @@ minipaw {ticket}
     }
     if (bytes.length < 19 || bytes[0] !== 1) {return false;}
     let at = 18;
-    // Steps over one length-prefixed field; false when it runs off the end.
+    // Takes one length-prefixed field; undefined when it runs off the end.
     const field = () => {
       const len = bytes[at] ?? 0;
-      at += 1 + len;
-      return len > 0 && at <= bytes.length;
+      const start = at + 1;
+      at = start + len;
+      return len > 0 && at <= bytes.length ? bytes.subarray(start, at) : undefined;
     };
-    if (!field()) {return false;}
+    const peer = field();
+    if (!peer || !isPeerId(peer)) {return false;}
     if (bytes[1] % 2 === 1 && !field()) {return false;}
     return at === bytes.length;
   };
-  const USER = /^[\w.-]+$/u;
+  // Not starting with a dash, which ssh would read as an option.
+  const USER = /^\w[\w.-]*$/u;
   // Each template's markup with its placeholders, to put back when the
   // ticket is cleared.
   const placeholders = new WeakMap<Element, string>();
@@ -458,7 +469,7 @@ minipaw {ticket}
   // What step 2 says under the commands: its note, or what's wrong with the input.
   const status = (raw: string, ticket: string | undefined, user: string | undefined) => {
     if (raw && !ticket) {return "That isn't a whole ticket. Paste the full line step 1 printed.";}
-    if (user === undefined) {return "A user name is letters, digits, dots, dashes and underscores.";}
+    if (user === undefined) {return "A user name is letters, digits, dots, dashes and underscores, and doesn't start with a dash.";}
     return null;
   };
 
