@@ -59,8 +59,6 @@ export default defineConfig({
         foreground: "oklch(94.2% 0.004 301.4)",
         muted: "oklch(67.7% 0.014 310.5)",
       },
-      // The landing tagline; the paw mark doesn't spell out the name.
-      titles: { "/": "pipe bytes, paw to paw" },
     },
   },
   // Colors beyond accent and background live in theme.css.
