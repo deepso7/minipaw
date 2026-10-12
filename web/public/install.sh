@@ -37,7 +37,8 @@ file="minipaw-$os-$arch.tar.gz"
 
 dir="${MINIPAW_INSTALL:-$HOME/.local/bin}"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+new=""
+trap 'rm -rf "$tmp"; [ -z "$new" ] || rm -f "$new"' EXIT
 
 echo "Downloading minipaw $tag for $os-$arch..."
 curl -fsSL -o "$tmp/$file" "$base/$file"
@@ -63,14 +64,18 @@ fi
 }
 
 tar -xzf "$tmp/$file" -C "$tmp"
-chmod 755 "$tmp/minipaw"
-# Check it runs before replacing an existing install.
-version="$("$tmp/minipaw" --version)" || {
+# Check it runs before replacing an existing install, from the install
+# directory, since the temporary one may be mounted noexec.
+mkdir -p "$dir"
+new="$dir/.minipaw.new"
+mv "$tmp/minipaw" "$new"
+chmod 755 "$new"
+version="$("$new" --version)" || {
   echo "minipaw: the downloaded binary does not run on this machine" >&2
   exit 1
 }
-mkdir -p "$dir"
-mv "$tmp/minipaw" "$dir/minipaw"
+mv "$new" "$dir/minipaw"
+new=""
 
 echo "Installed $version to $dir/minipaw"
 case ":$PATH:" in
