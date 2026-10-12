@@ -1,10 +1,26 @@
 ---
 title: Installation
-description: Build and install the minipaw command-line tool from source with cargo, then check that the minipaw binary is on your PATH.
+description: Install the minipaw command-line tool with the install script or with cargo, then check that the minipaw binary is on your PATH.
 ---
 
 ```sh
-cargo install --git https://github.com/deepso7/minipaw minipaw-cli
+curl -fsSL https://paw.minip2p.com/install.sh | sh
+```
+
+The script downloads the `minipaw` binary for Linux or macOS (x64 or arm64)
+from the [latest release](https://github.com/deepso7/minipaw/releases/latest),
+checks it against the release's checksums, and installs it into
+`~/.local/bin`. Two environment variables change that:
+
+- `MINIPAW_VERSION` installs another version, e.g. `MINIPAW_VERSION=0.1.0`.
+- `MINIPAW_INSTALL` installs into another directory.
+
+## With cargo
+
+On other platforms, or to build from source:
+
+```sh
+cargo install minipaw-cli
 ```
 
 This installs the `minipaw` binary. Check it with `minipaw --help`.
