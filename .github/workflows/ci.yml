@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Runs everything, macOS end-to-end checks included, on any branch.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -56,12 +58,15 @@ jobs:
         with:
           command: check advisories
 
+  # Unit tests, and the release binaries the end-to-end checks share.
   test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      E2E: ${{ matrix.os == 'ubuntu-latest' || github.event_name != 'pull_request' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -70,7 +75,45 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo test --workspace
+      - name: Build for the end-to-end checks
+        if: env.E2E == 'true'
+        run: |
+          cargo build --release -p minipaw-cli --bin minipaw
+          cargo build --release -p minipaw --example squat
+      - if: env.E2E == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-${{ matrix.os }}
+          path: |
+            target/release/minipaw
+            target/release/examples/squat
+          if-no-files-found: error
+          retention-days: 1
+
+  # The end-to-end checks, split four ways since most of their time is
+  # spent waiting. macOS runners cannot hole-punch, so there every check
+  # goes through the relay and they take longest: pull requests skip them.
+  e2e:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest"]') }}
+        shard: [1, 2, 3, 4]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: e2e-${{ matrix.os }}
+          path: target/release
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/minipaw target/release/examples/squat
       - name: End-to-end checks
         run: scripts/check.sh
         env:
+          NO_BUILD: "1"
+          SHARD: ${{ matrix.shard }}/4
           SHOW_LOGS: "1"
