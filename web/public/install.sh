@@ -67,7 +67,7 @@ tar -xzf "$tmp/$file" -C "$tmp"
 # Check it runs before replacing an existing install, from the install
 # directory, since the temporary one may be mounted noexec.
 mkdir -p "$dir"
-new="$dir/.minipaw.new"
+new="$dir/.minipaw.new.$$"
 mv "$tmp/minipaw" "$new"
 chmod 755 "$new"
 version="$("$new" --version)" || {
