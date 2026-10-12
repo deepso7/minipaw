@@ -133,6 +133,9 @@ pub struct ServerCore<H> {
     /// How long a session that lost its stream waits for the client:
     /// [`RESUME_TIMEOUT`] unless [`Config::test_resume_timeout`] says.
     resume_timeout: Duration,
+    /// How long a new peer has to get a session: [`ADMISSION_TIMEOUT`]
+    /// unless [`Config::test_admission_timeout`] says.
+    admission_timeout: Duration,
 }
 
 /// A peer's time to authenticate.
@@ -145,8 +148,8 @@ struct Admission {
 }
 
 impl Admission {
-    fn new(now: Instant) -> Self {
-        let deadline = now + ADMISSION_TIMEOUT;
+    fn new(now: Instant, timeout: Duration) -> Self {
+        let deadline = now + timeout;
         Admission {
             deadline,
             by: deadline,
@@ -257,6 +260,7 @@ impl<H: Host> ServerCore<H> {
             drop_link_after: config.test_drop_link_after,
             drop_welcome: config.test_drop_welcome,
             resume_timeout: config.test_resume_timeout.unwrap_or(RESUME_TIMEOUT),
+            admission_timeout: config.test_admission_timeout.unwrap_or(ADMISSION_TIMEOUT),
         }
     }
 
@@ -371,7 +375,7 @@ impl<H: Host> ServerCore<H> {
             EndpointEvent::ConnectionEstablished { peer_id, .. } if peer_id != self.relay => {
                 self.admission
                     .entry(peer_id)
-                    .or_insert_with(|| Admission::new(Instant::now()));
+                    .or_insert_with(|| Admission::new(Instant::now(), self.admission_timeout));
             }
             EndpointEvent::StreamReady {
                 peer_id,
@@ -825,7 +829,7 @@ impl<H: Host> ServerCore<H> {
             let now = Instant::now();
             self.admission
                 .entry(peer)
-                .or_insert_with(|| Admission::new(now))
+                .or_insert_with(|| Admission::new(now, self.admission_timeout))
                 .refused(now);
         }
     }
@@ -836,7 +840,7 @@ impl<H: Host> ServerCore<H> {
         if *peer != self.relay && !self.has_session(peer) {
             self.admission
                 .entry(peer.clone())
-                .or_insert_with(|| Admission::new(Instant::now()));
+                .or_insert_with(|| Admission::new(Instant::now(), self.admission_timeout));
         }
     }
 
@@ -1304,7 +1308,7 @@ mod tests {
     #[test]
     fn refusals_hasten_a_disconnect_but_never_extend_it_far() {
         let t0 = Instant::now();
-        let mut admission = Admission::new(t0);
+        let mut admission = Admission::new(t0, ADMISSION_TIMEOUT);
         assert_eq!(admission.by, t0 + ADMISSION_TIMEOUT);
 
         // Refused early: gone shortly after, not at the deadline.

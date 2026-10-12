@@ -74,6 +74,9 @@ struct Client {
     /// Test hook ([`Config::direct`]): a server address to dial alongside the
     /// relay, for benchmarks and paths hole punching cannot find.
     direct: Option<PeerAddr>,
+    /// Test hook ([`Config::test_dead_after`]): how long a stream may stay
+    /// silent before we drop it.
+    dead_after: Option<Duration>,
 }
 
 /// Runs a dialer's session to `ticket`'s listener through `relay`.
@@ -114,6 +117,7 @@ pub fn run(
         shared,
         events,
         direct,
+        dead_after: config.test_dead_after,
     };
 
     let exit = client.drive();
@@ -343,7 +347,10 @@ impl Client {
                     if conn == conn_id && stream == stream_id)
                 && peer_id == *self.peer() =>
             {
-                let link = Link::new(peer_id, conn_id, stream_id);
+                let mut link = Link::new(peer_id, conn_id, stream_id);
+                if let Some(after) = self.dead_after {
+                    link = link.with_dead_after(after);
+                }
                 // Once welcomed, the server holds our session: one that
                 // does not (it restarted, or ended the session) must refuse
                 // rather than start a fresh one.
