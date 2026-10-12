@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use minip2p::{Bytes, ConnectionId, Endpoint, Error, PeerId, StreamId, TransportError, WaitHandle};
+use minip2p::{Bytes, ConnectionId, Endpoint, Error, PeerId, StreamId, WaitHandle};
 
 use crate::window::{Inbound, Outbound};
 use crate::wire::{Frame, FrameReader, MAX_DATA};
@@ -30,9 +30,6 @@ const INPUT_QUEUE: usize = 8;
 /// A non-urgent ack waits this long after the first unacked write, so it
 /// covers more of them.
 const ACK_DELAY: Duration = Duration::from_millis(10);
-/// A stream that refused a write at a resource limit, which arms no
-/// `StreamWritable`, is retried after this pause.
-const BACKPRESSURE_RETRY: Duration = Duration::from_millis(5);
 /// A stream that answered `Full` waits for its `StreamWritable`; this bounds
 /// the wait, should the event never come.
 const WRITABLE_FALLBACK: Duration = Duration::from_millis(250);
@@ -66,7 +63,7 @@ pub struct Link {
     /// The end of a frame the stream took only part of. It goes out before
     /// anything else, or the peer would read a torn frame.
     unsent: RefCell<Bytes>,
-    /// The stream refused a write: sends wait until then, or until its
+    /// The stream answered `Full`: sends wait until then, or until its
     /// `StreamWritable`.
     blocked_until: Cell<Option<Instant>>,
 }
@@ -124,21 +121,12 @@ impl Link {
         self.blocked_until.set(None);
     }
 
-    /// Holds sends on the stream for `wait`, or until its `StreamWritable`.
-    fn block(&self, wait: Duration) -> SendError {
-        self.blocked_until.set(Some(Instant::now() + wait));
+    /// Holds sends on the stream until its `StreamWritable`, or for
+    /// [`WRITABLE_FALLBACK`] at most.
+    fn block(&self) -> SendError {
+        self.blocked_until
+            .set(Some(Instant::now() + WRITABLE_FALLBACK));
         SendError::Full
-    }
-
-    /// A refused write is backpressure if the stream hit a resource limit
-    /// (a partly taken write is `Error::Full`, handled by the caller);
-    /// anything else means the stream is dead.
-    fn refused(&self, error: &Error) -> SendError {
-        if let Error::Transport(TransportError::ResourceExhausted { .. }) = error {
-            self.block(BACKPRESSURE_RETRY)
-        } else {
-            SendError::Dead(error.to_string())
-        }
     }
 
     /// Queues `frame` after any held tail. `Full` means none of it was
@@ -151,13 +139,13 @@ impl Link {
         match endpoint.send_stream(&self.peer, self.conn, self.stream, data) {
             Ok(()) => {}
             Err(Error::Full { unsent, .. }) => {
-                let full = self.block(WRITABLE_FALLBACK);
+                let full = self.block();
                 if unsent.len() == len {
                     return Err(full);
                 }
                 *self.unsent.borrow_mut() = unsent;
             }
-            Err(e) => return Err(self.refused(&e)),
+            Err(e) => return Err(SendError::Dead(e.to_string())),
         }
         self.sent.set(Instant::now());
         Ok(())
@@ -173,9 +161,9 @@ impl Link {
             Ok(()) => Ok(()),
             Err(Error::Full { unsent, .. }) => {
                 *self.unsent.borrow_mut() = unsent;
-                Err(self.block(WRITABLE_FALLBACK))
+                Err(self.block())
             }
-            Err(e) => Err(self.refused(&e)),
+            Err(e) => Err(SendError::Dead(e.to_string())),
         }
     }
 
