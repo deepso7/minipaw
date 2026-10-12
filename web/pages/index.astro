@@ -16,7 +16,10 @@ const recipes = [
   {
     a: {
       cmd: "minipaw serve --ssh",
-      note: "A built-in SSH server, so no sshd needed (Linux and macOS). It lets in the ed25519 and ECDSA keys in ~/.ssh/authorized_keys, and its ticket stays the same across restarts, so save it once.",
+      docs: { href: "/docs/ssh-server", label: "Built-in SSH server docs" },
+      // serve --ssh won't start without a key to let in.
+      label: "First add the other machine's ed25519 or ECDSA public key to ~/.ssh/authorized_keys here",
+      note: "A built-in SSH server, so no sshd needed (Linux and macOS). Its ticket stays the same across restarts, so save it once.",
       title: "On the machine to reach",
     },
     b: {
@@ -191,9 +194,16 @@ minipaw {ticket}
             <div class="panel mt-3 grid gap-8 rounded-blume border border-border p-5 md:grid-cols-2" data-panel={recipe.id} hidden={i > 0}>
               <div class="grid content-start gap-3">
                 <h3 class="step"><span class="num">1</span>{recipe.a.title}</h3>
-                <Command cmd={recipe.a.cmd} />
+                <Command cmd={recipe.a.cmd} label={recipe.a.label} />
                 {recipe.a.alt && <Command {...recipe.a.alt} />}
-                <p class="text-xs leading-relaxed text-muted-foreground">{recipe.a.note}</p>
+                <p class="text-xs leading-relaxed text-muted-foreground">
+                  {recipe.a.note}{" "}
+                  {recipe.a.docs && (
+                    <a class="underline underline-offset-4 hover:text-foreground" href={recipe.a.docs.href}>
+                      {recipe.a.docs.label}
+                    </a>
+                  )}
+                </p>
               </div>
               <div class="grid content-start gap-3">
                 <h3 class="step"><span class="num">2</span>{recipe.b.title}</h3>
