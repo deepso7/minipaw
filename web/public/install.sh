@@ -26,17 +26,20 @@ case "$(uname -m)" in
 esac
 
 if [ -n "${MINIPAW_VERSION:-}" ]; then
-  base="https://github.com/$repo/releases/download/v${MINIPAW_VERSION#v}"
+  tag="v${MINIPAW_VERSION#v}"
 else
-  base="https://github.com/$repo/releases/latest/download"
+  # Resolve latest once, so the tarball and SHA256SUMS come from one release.
+  latest="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$repo/releases/latest")"
+  tag="${latest##*/}"
 fi
+base="https://github.com/$repo/releases/download/$tag"
 file="minipaw-$os-$arch.tar.gz"
 
 dir="${MINIPAW_INSTALL:-$HOME/.local/bin}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-echo "Downloading minipaw for $os-$arch..."
+echo "Downloading minipaw $tag for $os-$arch..."
 curl -fsSL -o "$tmp/$file" "$base/$file"
 curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
 
@@ -60,11 +63,16 @@ fi
 }
 
 tar -xzf "$tmp/$file" -C "$tmp"
+chmod 755 "$tmp/minipaw"
+# Check it runs before replacing an existing install.
+version="$("$tmp/minipaw" --version)" || {
+  echo "minipaw: the downloaded binary does not run on this machine" >&2
+  exit 1
+}
 mkdir -p "$dir"
 mv "$tmp/minipaw" "$dir/minipaw"
-chmod 755 "$dir/minipaw"
 
-echo "Installed $("$dir/minipaw" --version) to $dir/minipaw"
+echo "Installed $version to $dir/minipaw"
 case ":$PATH:" in
   *":$dir:"*) ;;
   *) echo "Add $dir to your PATH to run minipaw, for example:"

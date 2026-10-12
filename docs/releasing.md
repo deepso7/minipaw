@@ -23,6 +23,10 @@ The two crates share a version group: a change to the library bumps both. A
 change only to the CLI bumps only the CLI, and the library catches up at its
 next release.
 
+The release PR is opened with `GITHUB_TOKEN`, so CI doesn't run on it; it
+only changes versions and changelogs, and CI runs on `main` once it merges.
+If `main` ever requires checks, give release-plz a GitHub App token instead.
+
 To rebuild the binaries for a release, run the workflow by hand (Actions →
 Release → Run workflow) with its tag.
 
