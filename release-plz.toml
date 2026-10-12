@@ -1,0 +1,27 @@
+# Releases are cut by merging the PR release-plz keeps open on main; see
+# docs/releasing.md. The SDK and the CLI share one version.
+
+[workspace]
+# Release only when the release PR merges, not on every push.
+release_always = false
+# release.yml marks the release latest once its binaries are attached, so
+# `releases/latest/download` (install.sh) never points at a release without
+# them.
+git_release_latest = false
+
+[[package]]
+name = "minipaw-cli"
+version_group = "minipaw"
+# One changelog for both crates, at the root; it is also the release notes
+# the site's changelog page shows.
+changelog_path = "CHANGELOG.md"
+changelog_include = ["minipaw"]
+git_tag_name = "v{{ version }}"
+
+[[package]]
+name = "minipaw"
+version_group = "minipaw"
+changelog_update = false
+# The CLI's tag and release cover both crates.
+git_tag_enable = false
+git_release_enable = false

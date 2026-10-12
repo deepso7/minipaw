@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "../../README.md"
+keywords = ["p2p", "netcat", "quic", "ssh", "hole-punching"]
+categories = ["command-line-utilities", "network-programming"]
 
 [[bin]]
 name = "minipaw"

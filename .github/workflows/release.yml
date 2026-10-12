@@ -1,0 +1,172 @@
+name: Release
+
+# On main, release-plz keeps a release PR open (version bump and changelog).
+# Merging it publishes both crates to crates.io, tags vX.Y.Z and creates the
+# GitHub release, and the jobs below attach the binaries to it. Tags pushed
+# with GITHUB_TOKEN don't start other workflows, so the binaries are built
+# here rather than on a tag push. Run it by hand to (re)build the binaries
+# for a tag; the release and tag are created from the chosen commit if
+# missing. See docs/releasing.md.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.1.0
+        required: true
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-pr:
+    name: Release PR
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5.141
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    name: Publish crates
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      # crates.io trusted publishing.
+      id-token: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - id: release-plz
+        uses: release-plz/action@v0.5.141
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - id: tag
+        env:
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          tag=$(jq -r '.[] | select(.package_name == "minipaw-cli") | .tag' <<<"${RELEASES:-[]}")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  prepare:
+    name: Prepare release
+    needs: release
+    if: >-
+      !cancelled() && (github.event_name == 'workflow_dispatch' || needs.release.outputs.tag != '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag || needs.release.outputs.tag }}
+    steps:
+      - id: tag
+        run: |
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::not a release tag: $TAG"; exit 1; }
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "$TAG" --generate-notes --latest=false
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  binaries:
+    name: Build ${{ matrix.platform }}
+    needs: prepare
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux-x64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - platform: linux-arm64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - platform: darwin-x64
+            target: x86_64-apple-darwin
+            runner: macos-latest
+          - platform: darwin-arm64
+            target: aarch64-apple-darwin
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked -p minipaw-cli --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir out
+          tar -czf out/minipaw-${{ matrix.platform }}.tar.gz -C target/${{ matrix.target }}/release minipaw
+      - uses: actions/upload-artifact@v7
+        with:
+          name: minipaw-${{ matrix.platform }}
+          path: out
+          if-no-files-found: error
+
+  upload:
+    name: Attach binaries
+    needs: [prepare, binaries]
+    if: ${{ !cancelled() && needs.binaries.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: minipaw-*
+          path: dist
+          merge-multiple: true
+      - run: |
+          cd dist
+          sha256sum minipaw-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$TAG" minipaw-*.tar.gz SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+          # Only now, so install.sh's releases/latest always has binaries,
+          # and not when rebuilding an older release.
+          newest=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+            --limit 100 --json tagName --jq '.[].tagName' | sort -V | tail -n 1)
+          if [ "$newest" = "$TAG" ]; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest
+          fi
