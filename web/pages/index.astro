@@ -15,12 +15,15 @@ const ticket = "mpAQDEiiVb-s5zPPFvR0SjX0lVJgAkCAESINgMwzfDtX-D_vKZ0slyfVb4K-lw-i
 const recipes = [
   {
     a: {
-      cmd: "minipaw serve --ssh",
+      // The quickest start: --no-auth needs no key set up first. Plain --ssh,
+      // which lets in only authorized_keys, is the alternative.
+      alt: { cmd: "minipaw serve --ssh", label: "Or let in only the keys in ~/.ssh/authorized_keys" },
+      cmd: "minipaw serve --ssh --no-auth",
       docs: { href: "/docs/ssh-server", label: "Built-in SSH server docs" },
-      // serve --ssh won't start without a key to let in.
-      label: "First add the other machine's ed25519 or ECDSA public key to ~/.ssh/authorized_keys here",
       note: "A built-in SSH server, so no sshd needed (Linux and macOS). Its ticket stays the same across restarts, so save it once.",
       title: "On the machine to reach",
+      warning:
+        "Anyone with the ticket gets a shell as you, and it keeps working across restarts until serve --new replaces it. Stop serve with Ctrl-C when you're done.",
     },
     b: {
       alt: { cmd: "minipaw cp notes.txt <ticket>:", label: "Or copy files, as with scp" },
@@ -194,7 +197,12 @@ minipaw {ticket}
             <div class="panel mt-3 grid gap-8 rounded-blume border border-border p-5 md:grid-cols-2" data-panel={recipe.id} hidden={i > 0}>
               <div class="grid content-start gap-3">
                 <h3 class="step"><span class="num">1</span>{recipe.a.title}</h3>
-                <Command cmd={recipe.a.cmd} label={recipe.a.label} />
+                <Command cmd={recipe.a.cmd} />
+                {recipe.a.warning && (
+                  <p class="warn" role="note">
+                    <strong>No auth.</strong> {recipe.a.warning}
+                  </p>
+                )}
                 {recipe.a.alt && <Command {...recipe.a.alt} />}
                 <p class="text-xs leading-relaxed text-muted-foreground">
                   {recipe.a.note}{" "}
@@ -317,6 +325,14 @@ minipaw {ticket}
   .field:focus-visible {
     outline: 2px solid var(--blume-accent);
     outline-offset: 1px;
+  }
+  .warn {
+    border-left: 2px solid var(--blume-code-warning-border);
+    border-radius: var(--blume-radius);
+    background: var(--blume-code-warning);
+    padding: 0.5rem 0.75rem;
+    font-size: 0.75rem;
+    line-height: 1.6;
   }
   .step {
     display: flex;
