@@ -37,10 +37,13 @@ export default defineConfig({
   },
   logo: "/logo.svg",
   navigation: {
-    actions: [
-      { href: "/docs", label: "Docs" },
-      { href: "/changelog", label: "Changelog" },
-      { href: "https://github.com/deepso7/minipaw", label: "GitHub" },
+    actions: [{ href: "https://github.com/deepso7/minipaw", label: "GitHub" }],
+    // Tabs, not header actions: a tab owns its section, so the release
+    // entries under /changelog stay out of the docs sidebar while the
+    // changelog index, feed and search still list them.
+    tabs: [
+      { label: "Docs", path: "/docs" },
+      { label: "Changelog", path: "/changelog" },
     ],
   },
   seo: {

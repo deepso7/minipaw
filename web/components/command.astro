@@ -1,0 +1,87 @@
+---
+// One shell command with a copy button. A command holding `<ticket>` is a
+// template: the page's ticket form fills it in, and until then it has no
+// copy button, since `<ticket>` pasted as is is a shell redirect.
+interface Props {
+  cmd: string;
+  label?: string;
+}
+
+const { cmd, label } = Astro.props;
+// The label grows to fill the column, so commands side by side in a grid line
+// up even when their labels wrap to different heights.
+const template = cmd.includes("<ticket>");
+
+// Marks the part B fills in.
+const html = cmd
+  .replaceAll("&", "&amp;")
+  .replaceAll("<", "&lt;")
+  .replaceAll(">", "&gt;")
+  .replace("&lt;ticket&gt;", '<span class="ph">&lt;ticket&gt;</span>');
+---
+
+<div class="flex flex-col">
+  {label && <p class="mb-1.5 flex-1 text-xs leading-relaxed text-muted-foreground">{label}</p>}
+  <div class="cmd">
+    <span class="dim select-none" aria-hidden="true">$</span>
+    <code data-template={template ? cmd : undefined} set:html={html} />
+    <button
+      aria-label={`Copy: ${cmd}`}
+      class="copy"
+      data-copy={template ? undefined : cmd}
+      hidden={template}
+      type="button">copy</button
+    >
+  </div>
+</div>
+
+<style>
+  .dim {
+    color: var(--blume-muted-foreground);
+  }
+  :global(.ph) {
+    color: var(--blume-accent);
+  }
+  .cmd {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    /* The copy button's height, so lines with and without one match. */
+    min-height: 2.375rem;
+    border-radius: var(--blume-radius);
+    background: var(--blume-code-background);
+    padding: 0.375rem 0.375rem 0.375rem 0.75rem;
+    font-size: 13px;
+    line-height: 1.7;
+  }
+  .cmd code {
+    min-width: 0;
+    flex: 1;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  .cmd:has(.copy[hidden]) {
+    padding-right: 0.75rem;
+  }
+  .copy {
+    flex-shrink: 0;
+    border-radius: var(--blume-radius);
+    padding: 0.25rem 0.5rem;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    color: var(--blume-muted-foreground);
+  }
+  .copy:hover {
+    background: var(--blume-muted);
+    color: var(--blume-foreground);
+  }
+  .copy:focus-visible {
+    outline: 2px solid var(--blume-accent);
+    outline-offset: 1px;
+  }
+  @media (pointer: coarse) {
+    .copy {
+      padding: 0.5rem 0.75rem;
+    }
+  }
+</style>
