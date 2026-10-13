@@ -216,7 +216,7 @@ minipaw <span class="ticket">{ticket}</span>
           <h2 class="pixel">one listens, one pastes</h2>
           <p class="sub">
             Install minipaw on both machines. One prints a ticket, the other pastes it.{" "}
-            <span class="keyhint">Keys 1 to 4 switch recipes.</span>
+            <span class="keyhint">Once you're in them, keys 1 to 4 switch recipes.</span>
           </p>
 
           <div class="recipes">
@@ -980,14 +980,21 @@ minipaw <span class="ticket">{ticket}</span>
     }
   });
 
-  // Keys 1 to 4 pick a recipe, unless they're being typed into a field.
+  // Keys 1 to 4 pick a recipe while focus is in the recipes (so a stray
+  // keystroke or speech input elsewhere on the page never switches one), but
+  // not while typing a ticket. Focus moves to the picked tab, since the pane
+  // that held it may have just been hidden.
   document.addEventListener("keydown", (event) => {
     if (event.metaKey || event.ctrlKey || event.altKey || event.repeat) {return;}
     const { target } = event;
-    if (target instanceof HTMLElement && target.closest("input, textarea, select, [contenteditable]")) {return;}
+    if (!(target instanceof HTMLElement) || !target.closest(".recipes")) {return;}
+    if (target.matches('input[type="text"], textarea, select, [contenteditable]')) {return;}
     const radios = document.querySelectorAll<HTMLInputElement>('.recipes input[name="recipe"]');
     const radio = radios[Number(event.key) - 1];
-    if (!radio || radio.checked) {return;}
+    if (!radio) {return;}
+    event.preventDefault();
+    radio.focus();
+    if (radio.checked) {return;}
     radio.checked = true;
     radio.dispatchEvent(new Event("change", { bubbles: true }));
   });
