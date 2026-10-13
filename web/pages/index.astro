@@ -1011,18 +1011,23 @@ minipaw <span class="ticket">{ticket}</span>
   // The status line counts up like a real session for its first few seconds
   // (elapsed time, and bytes sent at a steady 2 MiB/s), then holds still, so
   // it's never a distraction. It's decoration (aria-hidden), and doesn't move
-  // at all under reduced motion.
-  if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  // at all under reduced motion. It starts on astro:page-load, which the
+  // client router fires on the first load and after every navigation, so
+  // coming back to this page from the docs counts again.
+  let statusTimer: ReturnType<typeof setInterval> | undefined;
+  document.addEventListener("astro:page-load", () => {
+    clearInterval(statusTimer);
+    if (!document.querySelector("[data-elapsed]")) {return;}
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) {return;}
     let tick = 0;
-    const timer = setInterval(() => {
+    statusTimer = setInterval(() => {
       tick += 1;
-      if (tick >= 4) {clearInterval(timer);}
+      if (tick >= 4) {clearInterval(statusTimer);}
       const elapsed = document.querySelector("[data-elapsed]");
       const sent = document.querySelector("[data-sent]");
       if (!elapsed || !sent) {return;}
-      const seconds = 12 + tick;
-      elapsed.textContent = `0:${seconds}`;
+      elapsed.textContent = `0:${12 + tick}`;
       sent.textContent = `${(1.2 + tick * 2).toFixed(1)} MiB`;
     }, 1000);
-  }
+  });
 </script>
