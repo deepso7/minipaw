@@ -323,6 +323,9 @@ minipaw <span class="ticket">{ticket}</span>
 </PageLayout>
 
 <style>
+  /* Every animation here stops within 5 seconds, so none needs a pause
+     control, and none runs under reduced motion. */
+
   /* Two inks beyond Blume's tokens: the toe-bean accent is Blume's accent, and
      mint marks the direct path, as green does in the CLI. */
   .landing {
@@ -500,7 +503,7 @@ minipaw <span class="ticket">{ticket}</span>
     height: 1.1em;
     vertical-align: -0.2em;
     background: var(--blume-foreground);
-    animation: blink 1s steps(1) infinite;
+    animation: blink 1s steps(1) 4;
   }
   @keyframes blink {
     50% {
@@ -609,7 +612,7 @@ minipaw <span class="ticket">{ticket}</span>
   }
   .packet {
     fill: var(--blume-accent);
-    animation: packet 2.4s linear infinite;
+    animation: packet 2.4s linear 2;
   }
   .packet.late {
     animation-delay: -1.2s;
@@ -754,7 +757,7 @@ minipaw <span class="ticket">{ticket}</span>
   }
   .status .live {
     color: var(--paw-ok);
-    animation: blink 1.6s steps(1) infinite;
+    animation: blink 1.6s steps(1) 3;
   }
   .status .sent {
     margin-left: auto;
@@ -999,17 +1002,21 @@ minipaw <span class="ticket">{ticket}</span>
     radio.dispatchEvent(new Event("change", { bubbles: true }));
   });
 
-  // The status line counts up like a real session: elapsed time, and bytes
-  // sent at a steady 2 MiB/s. It's decoration (aria-hidden), and still under
-  // reduced motion, where only the text changes.
-  const started = Date.now();
-  setInterval(() => {
-    const elapsed = document.querySelector("[data-elapsed]");
-    const sent = document.querySelector("[data-sent]");
-    if (!elapsed || !sent) {return;}
-    const seconds = 12 + Math.floor((Date.now() - started) / 1000);
-    elapsed.textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
-    const mib = 1.2 + (seconds - 12) * 2;
-    sent.textContent = mib < 1024 ? `${mib.toFixed(1)} MiB` : `${(mib / 1024).toFixed(1)} GiB`;
-  }, 1000);
+  // The status line counts up like a real session for its first few seconds
+  // (elapsed time, and bytes sent at a steady 2 MiB/s), then holds still, so
+  // it's never a distraction. It's decoration (aria-hidden), and doesn't move
+  // at all under reduced motion.
+  if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    let tick = 0;
+    const timer = setInterval(() => {
+      tick += 1;
+      if (tick >= 4) {clearInterval(timer);}
+      const elapsed = document.querySelector("[data-elapsed]");
+      const sent = document.querySelector("[data-sent]");
+      if (!elapsed || !sent) {return;}
+      const seconds = 12 + tick;
+      elapsed.textContent = `0:${seconds}`;
+      sent.textContent = `${(1.2 + tick * 2).toFixed(1)} MiB`;
+    }, 1000);
+  }
 </script>
