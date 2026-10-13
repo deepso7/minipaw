@@ -377,6 +377,9 @@ minipaw <span class="ticket">{ticket}</span>
     grid-template-columns: 200px minmax(0, 1fr);
     max-width: 1240px;
     margin: 0 auto;
+    /* The right rail's crosshairs sit half outside it; when the rail meets
+       the window edge, they mustn't make the page scroll sideways. */
+    overflow-x: clip;
   }
   .index {
     position: sticky;
@@ -661,9 +664,11 @@ minipaw <span class="ticket">{ticket}</span>
       display: inline;
     }
   }
+  /* minmax(0, …) so a filled-in ticket scrolls inside its command row
+     instead of widening the pane. */
   .panel {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     margin-bottom: 0.75rem;
     border: 1px solid var(--rule);
   }
@@ -672,6 +677,7 @@ minipaw <span class="ticket">{ticket}</span>
   }
   .pane {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     align-content: start;
     gap: 0.625rem;
     padding: 1.125rem 1.25rem 1.375rem;
@@ -823,7 +829,7 @@ minipaw <span class="ticket">{ticket}</span>
       display: none;
     }
     .panel {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
     }
     .pane + .pane {
       border-top: 1px solid var(--rule);
