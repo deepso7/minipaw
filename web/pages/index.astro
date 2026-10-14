@@ -3,6 +3,7 @@ import PageLayout from "blume/components/layout/PageLayout.astro";
 import data from "blume:data";
 
 import Command from "../components/command.astro";
+import SiteSidebar from "../components/site-sidebar.astro";
 
 const { config } = data;
 
@@ -122,34 +123,12 @@ const sections = [
       <!-- On wide screens this sidebar is the page's only navigation, as
            Blume's header is hidden; narrower ones keep that header instead. -->
       <aside class="index">
-        <a class="brand" href="/">
-          <img alt="" class="sprite" height="22" src="/logo.svg" width="27" />
-          minipaw
-        </a>
-        <nav aria-label="Site" class="site">
-          <a aria-current="page" href="/">Home</a>
-          <a href="/docs">Docs</a>
-          <a href="/changelog">Changelog</a>
-          <a href="https://github.com/deepso7/minipaw">GitHub</a>
-        </nav>
-        <nav aria-label="On this page" class="toc">
-          {sections.map((section) => <a href={section.href}>{section.label}</a>)}
-        </nav>
-        <div class="tools">
-          {
-            config.search.enabled && (
-              <button class="tool" data-paw-search type="button">
-                Search <kbd>⌘K</kbd>
-              </button>
-            )
-          }
-          <button class="tool" data-blume-theme-toggle type="button">
-            <span class="when-dark">Light mode</span><span class="when-light">Dark mode</span>
-          </button>
-          <p class="dim fine">
-            MIT or Apache-2.0<br />Built on <a href="https://github.com/deepso7/minip2p">minip2p</a>
-          </p>
-        </div>
+        <SiteSidebar currentRoute="/">
+          <p class="blume-nav-heading">On this page</p>
+          <nav aria-label="On this page" class="paw-nav-list">
+            {sections.map((section) => <a class="paw-nav-link" href={section.href}>{section.label}</a>)}
+          </nav>
+        </SiteSidebar>
       </aside>
 
       <div class="content">
@@ -400,8 +379,10 @@ minipaw <span class="ticket">{ticket}</span>
      one dashed-rail column, and the two are centred together. */
   .shell {
     display: grid;
+    /* The same frame as the docs (theme.css), so the sidebar stays put
+       moving between them. */
     grid-template-columns: 232px minmax(0, 1fr);
-    max-width: 1240px;
+    max-width: 1440px;
     margin: 0 auto;
     /* The right rail's crosshairs sit half outside it; when the rail meets
        the window edge, they mustn't make the page scroll sideways. */
@@ -429,82 +410,9 @@ minipaw <span class="ticket">{ticket}</span>
     position: sticky;
     top: 0;
     align-self: start;
-    display: flex;
-    flex-direction: column;
-    gap: 2rem;
     height: 100dvh;
     overflow-y: auto;
     padding: 1.75rem 1.5rem 1.5rem;
-  }
-  .landing .brand {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    font-family: var(--blume-font-display-src);
-    font-size: 1.25rem;
-    font-weight: 600;
-    text-decoration: none;
-  }
-  .index nav {
-    display: grid;
-    gap: 0.125rem;
-  }
-  .index nav a {
-    border-left: 1px solid transparent;
-    padding: 0.125rem 0 0.125rem 0.75rem;
-    color: var(--blume-muted-foreground);
-    text-decoration: none;
-  }
-  .index nav a:hover,
-  .index nav a[aria-current="page"] {
-    color: var(--blume-foreground);
-  }
-  .index nav a[aria-current="page"] {
-    border-left-color: var(--blume-foreground);
-  }
-  .index .toc {
-    border-top: 1px solid var(--rule);
-    padding-top: 1.25rem;
-    font-size: 12px;
-  }
-  .tools {
-    display: grid;
-    justify-items: start;
-    gap: 0.25rem;
-    margin-top: auto;
-  }
-  .tool {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.125rem 0;
-    color: var(--blume-muted-foreground);
-  }
-  .tool:hover {
-    color: var(--blume-foreground);
-  }
-  .tool:focus-visible,
-  .index a:focus-visible {
-    outline: 2px solid var(--blume-accent);
-    outline-offset: 2px;
-  }
-  .tool kbd {
-    border: 1px solid var(--rule);
-    padding: 0 0.3rem;
-    font: inherit;
-    font-size: 11px;
-  }
-  .when-light {
-    display: none;
-  }
-  :global(:root:not([data-theme="dark"])) .when-dark {
-    display: none;
-  }
-  :global(:root:not([data-theme="dark"])) .when-light {
-    display: inline;
-  }
-  .tools .fine {
-    margin: 0.75rem 0 0;
   }
   .content {
     min-width: 0;
@@ -996,20 +904,6 @@ minipaw <span class="ticket">{ticket}</span>
       if (status) {status.textContent = "";}
     }, 2500);
   });
-
-  // The sidebar's search button opens Blume's search, whose button lives in
-  // the header this page hides on wide screens.
-  // Guarded, as the docs sidebar (components/docs-sidebar.astro) registers
-  // the same listener.
-  const root = document.documentElement;
-  if (root.dataset.pawSearchReady === undefined) {
-    root.dataset.pawSearchReady = "";
-    document.addEventListener("click", (event) => {
-      const { target } = event;
-      if (!(target instanceof Element) || !target.closest("[data-paw-search]")) {return;}
-      document.querySelector<HTMLButtonElement>("[data-blume-search-open]")?.click();
-    });
-  }
 
   // Step 2's field fills `<ticket>` into B's commands. Every tab has its own
   // field, kept in step so switching tabs keeps the ticket. A

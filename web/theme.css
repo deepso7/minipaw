@@ -85,10 +85,18 @@ a:has(.minipaw-logo) > .truncate {
     visibility: visible;
   }
 
+  /* The landing page's frame (pages/index.astro): a 1440px group centred in
+     the window, a 232px sidebar, and a dashed line beside it, so the
+     sidebar doesn't move between Home and Docs. */
+  [data-blume-doc-grid]:has([data-blume-nav-drawer]:not(.lg\:hidden) [data-paw-sidebar]) {
+    max-width: 1440px;
+    grid-template-columns: 232px minmax(0, 1fr);
+  }
+
   [data-blume-nav-drawer]:has([data-paw-sidebar]) {
     top: 0;
     height: 100dvh;
-    border-inline-end: 1px solid var(--blume-border);
+    border-inline-end: 1px dashed var(--blume-border);
     padding: 1.75rem 1.5rem 1.5rem;
   }
 
@@ -102,6 +110,10 @@ a:has(.minipaw-logo) > .truncate {
 
 /* The right rail lines up with the page title once the header is gone. */
 @media (min-width: 80rem) {
+  [data-blume-doc-grid]:has([data-blume-nav-drawer]:not(.lg\:hidden) [data-paw-sidebar]) {
+    grid-template-columns: 232px minmax(0, 1fr) 17.5rem;
+  }
+
   body:has([data-blume-nav-drawer]:not(.lg\:hidden) [data-paw-sidebar])
     [data-blume-doc-grid]
     > aside.xl\:block {
