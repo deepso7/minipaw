@@ -119,25 +119,52 @@ const sections = [
   <div class="landing">
     <p aria-live="polite" class="sr-only" id="copy-status"></p>
     <div class="shell">
+      <!-- On wide screens this sidebar is the page's only navigation, as
+           Blume's header is hidden; narrower ones keep that header instead. -->
       <aside class="index">
-        <p class="dim">On this page</p>
-        <nav aria-label="On this page">
+        <a class="brand" href="/">
+          <img alt="" class="sprite" height="22" src="/logo.svg" width="27" />
+          minipaw
+        </a>
+        <nav aria-label="Site" class="site">
+          <a aria-current="page" href="/">Home</a>
+          <a href="/docs">Docs</a>
+          <a href="/changelog">Changelog</a>
+          <a href="https://github.com/deepso7/minipaw">GitHub</a>
+        </nav>
+        <nav aria-label="On this page" class="toc">
           {sections.map((section) => <a href={section.href}>{section.label}</a>)}
         </nav>
-        <p class="dim fine">
-          MIT or Apache-2.0<br />Built on <a href="https://github.com/deepso7/minip2p">minip2p</a>
-        </p>
+        <div class="tools">
+          {
+            config.search.enabled && (
+              <button class="tool" data-paw-search type="button">
+                Search <kbd>⌘K</kbd>
+              </button>
+            )
+          }
+          <button class="tool" data-blume-theme-toggle type="button">
+            <span class="when-dark">Light mode</span><span class="when-light">Dark mode</span>
+          </button>
+          <p class="dim fine">
+            MIT or Apache-2.0<br />Built on <a href="https://github.com/deepso7/minip2p">minip2p</a>
+          </p>
+        </div>
       </aside>
 
+      <div class="content">
       <div class="rail">
         <section class="block" id="install">
           <span class="tag" aria-hidden="true">[ machine a ]</span>
           <div class="hero">
             <div>
-              <h1 class="pixel">pipe bytes,<br />paw to paw</h1>
+              <h1>
+                Pipe bytes, paw to paw.{" "}
+                <span class="dim">Through NATs, with no accounts, encrypted end to end.</span>
+              </h1>
               <p class="lede">
-                Pipe stdin/stdout between two machines. minipaw gets through NATs, needs no
-                accounts, and encrypts every byte end to end.
+                minipaw pipes stdin/stdout between two machines, like netcat. One side prints a
+                ticket, the other pastes it.
               </p>
 
               <div class="term">
@@ -173,7 +200,7 @@ minipaw <span class="ticket">{ticket}</span>
 
         <section class="block" id="path">
           <span class="tag" aria-hidden="true">[ section a–b ]</span>
-          <h2 class="pixel">the path</h2>
+          <h2>the path</h2>
           <p class="sub">
             Every session starts on a relay, then moves to a direct path when the hole punch
             lands. Bytes keep flowing through the switch. <a href="/docs/how-it-works">Read how it works</a>
@@ -213,7 +240,7 @@ minipaw <span class="ticket">{ticket}</span>
 
         <section class="block" id="recipes">
           <span class="tag" aria-hidden="true">[ recipes ]</span>
-          <h2 class="pixel">one listens, one pastes</h2>
+          <h2>one listens, one pastes</h2>
           <p class="sub">
             Install minipaw on both machines. One prints a ticket, the other pastes it.{" "}
             <span class="keyhint">Once you're in them, keys 1 to 4 switch recipes.</span>
@@ -279,7 +306,7 @@ minipaw <span class="ticket">{ticket}</span>
 
         <section class="block" id="spec">
           <span class="tag" aria-hidden="true">[ spec sheet ]</span>
-          <h2 class="pixel">small, sturdy pipe</h2>
+          <h2>small, sturdy pipe</h2>
           <p class="sub">What the pipe does, and how.</p>
           <dl class="specs">
             {
@@ -294,7 +321,6 @@ minipaw <span class="ticket">{ticket}</span>
           </dl>
         </section>
       </div>
-    </div>
 
     <!-- The CLI's own status line, as `minipaw` draws it in a terminal. -->
     <div class="status" aria-hidden="true">
@@ -304,6 +330,8 @@ minipaw <span class="ticket">{ticket}</span>
       <span class="dim wide">·</span><span class="wide">peer 12D3KooW…tLdf</span>
       <span class="dim">·</span><span data-elapsed>0:12</span>
       <span class="sent"><span class="up">↑</span> <span class="dim">sent</span> <span data-sent>1.2 MiB</span></span>
+    </div>
+      </div>
     </div>
   </div>
 
@@ -349,11 +377,6 @@ minipaw <span class="ticket">{ticket}</span>
   .landing a:hover {
     text-decoration-color: currentcolor;
   }
-  .pixel {
-    font-family: var(--blume-font-display-src);
-    font-weight: 600;
-    letter-spacing: 0;
-  }
   .sprite {
     image-rendering: pixelated;
   }
@@ -371,67 +394,124 @@ minipaw <span class="ticket">{ticket}</span>
     line-height: 1.6;
   }
 
-  /* Layout: a sticky page index beside one dashed-rail column. */
+  /* Layout: a full-height sidebar, the site's nav on this page, beside one
+     content column. The sidebar's hairline is the column's left rail. */
   .shell {
     display: grid;
-    grid-template-columns: 200px minmax(0, 1fr);
-    max-width: 1240px;
-    margin: 0 auto;
-    /* The right rail's crosshairs sit half outside it; when the rail meets
-       the window edge, they mustn't make the page scroll sideways. */
-    overflow-x: clip;
+    grid-template-columns: 232px minmax(0, 1fr);
+  }
+  /* Blume's header gives way to the sidebar where the sidebar shows. Kept
+     in the page (not display: none) so its search dialog, which opens in the
+     top layer, still works from the sidebar's button. */
+  @media (min-width: 861px) {
+    :global(body:has(.landing) [data-blume-header]) {
+      position: fixed;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+    }
   }
   .index {
     position: sticky;
-    top: 4rem;
+    top: 0;
     align-self: start;
     display: flex;
     flex-direction: column;
-    gap: 0.75rem;
-    height: calc(100dvh - 7rem);
-    padding: 2.5rem 1.5rem 0;
+    gap: 2rem;
+    height: 100dvh;
+    border-right: 1px solid var(--rule);
+    padding: 1.75rem 1.5rem 1.5rem;
+  }
+  .landing .brand {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    font-family: var(--blume-font-display-src);
+    font-size: 1.25rem;
+    font-weight: 600;
+    text-decoration: none;
   }
   .index nav {
     display: grid;
-    gap: 0.25rem;
+    gap: 0.125rem;
   }
   .index nav a {
+    border-left: 1px solid transparent;
+    padding: 0.125rem 0 0.125rem 0.75rem;
     color: var(--blume-muted-foreground);
     text-decoration: none;
   }
-  .index nav a:hover {
+  .index nav a:hover,
+  .index nav a[aria-current="page"] {
     color: var(--blume-foreground);
   }
-  .index nav a:hover::before {
-    content: "› ";
-    color: var(--blume-accent);
+  .index nav a[aria-current="page"] {
+    border-left-color: var(--blume-foreground);
   }
-  .index .fine {
+  .index .toc {
+    border-top: 1px solid var(--rule);
+    padding-top: 1.25rem;
+    font-size: 12px;
+  }
+  .tools {
+    display: grid;
+    justify-items: start;
+    gap: 0.25rem;
     margin-top: auto;
   }
+  .tool {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.125rem 0;
+    color: var(--blume-muted-foreground);
+  }
+  .tool:hover {
+    color: var(--blume-foreground);
+  }
+  .tool:focus-visible,
+  .index a:focus-visible {
+    outline: 2px solid var(--blume-accent);
+    outline-offset: 2px;
+  }
+  .tool kbd {
+    border: 1px solid var(--rule);
+    padding: 0 0.3rem;
+    font: inherit;
+    font-size: 11px;
+  }
+  .when-light {
+    display: none;
+  }
+  :global(:root:not([data-theme="dark"])) .when-dark {
+    display: none;
+  }
+  :global(:root:not([data-theme="dark"])) .when-light {
+    display: inline;
+  }
+  .tools .fine {
+    margin: 0.75rem 0 0;
+  }
+  .content {
+    min-width: 0;
+  }
   .rail {
-    border-right: 1px dashed var(--rule);
-    border-left: 1px dashed var(--rule);
+    max-width: 1000px;
   }
   .block {
     position: relative;
-    scroll-margin-top: 4rem;
-    border-bottom: 1px dashed var(--rule);
-    padding: 3.5rem 3rem;
+    scroll-margin-top: 1rem;
+    border-bottom: 1px solid var(--rule);
+    padding: 3.5rem 3.5rem;
   }
-  /* Crosshairs where each block's rule meets the rails. */
-  .block::before,
-  .block::after {
+  /* A crosshair where each block's rule meets the sidebar's. */
+  .block::before {
     position: absolute;
     bottom: -0.7rem;
+    left: -0.32rem;
     content: "+";
     color: var(--blume-muted-foreground);
-  }
-  .block::before {
-    left: -0.32rem;
-  }
-  .block::after {
-    right: -0.32rem;
   }
   .tag {
     position: absolute;
@@ -450,8 +530,11 @@ minipaw <span class="ticket">{ticket}</span>
   }
   h1 {
     margin: 0 0 1.25rem;
-    font-size: 3rem;
-    line-height: 1.02;
+    text-wrap: balance;
+    font-size: 1.875rem;
+    font-weight: 500;
+    line-height: 1.15;
+    letter-spacing: -0.03em;
   }
   .lede {
     max-width: 34em;
@@ -565,8 +648,10 @@ minipaw <span class="ticket">{ticket}</span>
 
   h2 {
     margin: 0 0 0.5rem;
-    font-size: 1.875rem;
-    line-height: 1.1;
+    font-size: 1.375rem;
+    font-weight: 500;
+    line-height: 1.2;
+    letter-spacing: -0.02em;
   }
   .sub {
     max-width: 46em;
@@ -818,15 +903,15 @@ minipaw <span class="ticket">{ticket}</span>
     .index {
       display: none;
     }
-    .rail {
-      border: 0;
-    }
     .block {
+      scroll-margin-top: 4rem;
       padding: 3rem 1.25rem;
     }
-    .block::before,
-    .block::after {
+    .block::before {
       display: none;
+    }
+    h1 {
+      font-size: 1.5rem;
     }
     .panel {
       grid-template-columns: minmax(0, 1fr);
@@ -848,9 +933,6 @@ minipaw <span class="ticket">{ticket}</span>
     }
     .status {
       padding: 0.625rem 1.25rem;
-    }
-    h1 {
-      font-size: 2.5rem;
     }
   }
   @media (prefers-reduced-motion: reduce) {
@@ -892,6 +974,14 @@ minipaw <span class="ticket">{ticket}</span>
       button.textContent = "copy";
       if (status) {status.textContent = "";}
     }, 2500);
+  });
+
+  // The sidebar's search button opens Blume's search, whose button lives in
+  // the header this page hides on wide screens.
+  document.addEventListener("click", (event) => {
+    const { target } = event;
+    if (!(target instanceof Element) || !target.closest("[data-paw-search]")) {return;}
+    document.querySelector<HTMLButtonElement>("[data-blume-search-open]")?.click();
   });
 
   // Step 2's field fills `<ticket>` into B's commands. Every tab has its own
