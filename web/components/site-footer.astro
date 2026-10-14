@@ -1,0 +1,63 @@
+---
+// The site's footer, shared by the landing page and Blume's pages (the
+// docs and changelog, as the Footer layout slot), so the bottom of the page
+// matches everywhere. It sits in the same 1440px frame as the sidebar and
+// keeps the repository and X links Blume's own footer carried.
+const links = [
+  { href: "/docs", label: "Docs" },
+  { href: "/changelog", label: "Changelog" },
+  { href: "https://github.com/deepso7/minipaw", label: "GitHub" },
+  { href: "https://x.com/deepso7", label: "X" },
+];
+---
+
+<footer class="site-footer">
+  <div class="inner">
+    <span class="brand">
+      <img alt="" class="sprite" height="13" src="/logo.svg" width="16" />
+      minipaw is MIT or Apache-2.0
+    </span>
+    <nav aria-label="Footer" class="links">
+      {links.map((link) => <a href={link.href}>{link.label}</a>)}
+    </nav>
+  </div>
+</footer>
+
+<style>
+  .site-footer {
+    border-top: 1px dashed var(--blume-border);
+  }
+  .inner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    max-width: 1440px;
+    margin: 0 auto;
+    padding: 1.75rem 1.5rem 2.25rem;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--blume-muted-foreground);
+  }
+  .brand,
+  .links {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.25rem;
+  }
+  .brand {
+    gap: 0.5rem;
+  }
+  .sprite {
+    image-rendering: pixelated;
+  }
+  .links a:hover {
+    color: var(--blume-foreground);
+  }
+  .links a:focus-visible {
+    outline: 2px solid var(--blume-accent);
+    outline-offset: 2px;
+  }
+</style>

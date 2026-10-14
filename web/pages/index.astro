@@ -3,6 +3,7 @@ import PageLayout from "blume/components/layout/PageLayout.astro";
 import data from "blume:data";
 
 import Command from "../components/command.astro";
+import SiteFooter from "../components/site-footer.astro";
 import SiteSidebar from "../components/site-sidebar.astro";
 
 const { config } = data;
@@ -311,19 +312,7 @@ minipaw <span class="ticket">{ticket}</span>
     </div>
   </div>
 
-  <footer class="landing landing-footer" slot="footer">
-    <div class="footer-inner">
-      <span class="foot-brand">
-        <img alt="" class="sprite" height="13" src="/logo.svg" width="16" />
-        minipaw is MIT or Apache-2.0
-      </span>
-      <span class="foot-links">
-        <a href="/docs">Docs</a>
-        <a href="/changelog">Changelog</a>
-        <a href="https://github.com/deepso7/minipaw">GitHub</a>
-      </span>
-    </div>
-  </footer>
+  <SiteFooter slot="footer" />
 </PageLayout>
 
 <style>
@@ -782,30 +771,6 @@ minipaw <span class="ticket">{ticket}</span>
     color: var(--blume-accent);
   }
 
-  .landing-footer .footer-inner {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    max-width: 1240px;
-    margin: 0 auto;
-    padding: 2rem 1.5rem 2.5rem;
-    font-size: 12px;
-    color: var(--blume-muted-foreground);
-  }
-  .foot-brand,
-  .foot-links {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem 1.25rem;
-  }
-  .foot-brand {
-    gap: 0.5rem;
-  }
-  .foot-links a:hover {
-    color: var(--blume-foreground);
-  }
 
   @media (max-width: 1100px) {
     .hero {
