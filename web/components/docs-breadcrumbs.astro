@@ -1,0 +1,15 @@
+---
+// The docs' Breadcrumbs layout slot. Blume's built-in shows the page's group
+// above its title by rendering the second-to-last crumb. A group's own index
+// page (/docs, the index of Getting started) has a one-crumb trail, the group
+// itself, so it would show nothing. Give it the group as an unlinked parent,
+// since the group's link is the current page, and the label shows there too.
+// Only for /docs: a changelog release's one crumb is the release itself.
+import Breadcrumbs from "blume/components/layout/Breadcrumbs.astro";
+
+const { crumbs, ...rest } = Astro.props;
+const [only] = crumbs;
+const trail = crumbs.length === 1 && only?.route === "/docs" ? [{ label: only.label }, only] : crumbs;
+---
+
+<Breadcrumbs {...rest} crumbs={trail} />

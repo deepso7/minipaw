@@ -1,0 +1,42 @@
+---
+title: What minipaw is
+description: minipaw pipes stdin/stdout between two machines, peer to peer. Like netcat, but it gets through NATs, needs no accounts, and every byte is end-to-end encrypted.
+---
+
+minipaw is a pipe between two machines. Whatever goes into one side's stdin
+comes out of the other side's stdout, so anything that reads or writes a
+stream works over it: a chat, a file, a tar of a folder, an SSH session.
+
+## How the pieces fit
+
+- **A ticket** is the whole address. The listening side prints it, and the
+  other side pastes it. It carries the listener's public key and a random
+  token, so whoever holds it can connect: share it like a password.
+  [Tickets](/docs/tickets)
+- **A relay** gets the two sides talking first, wherever they are, and only
+  ever sees ciphertext.
+- **A direct path** replaces the relay when hole punching gets through both
+  networks, mid-session and without losing a byte. When it can't, traffic
+  stays on the relay. [How it works](/docs/how-it-works)
+
+There's no account and no control plane. minipaw is built on
+[minip2p](https://github.com/deepso7/minip2p), a small libp2p implementation
+in Rust, and its networking is also a [Rust library](/docs/library) you can
+embed.
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Installation" href="/docs/installation" icon="download">
+    Install the `minipaw` binary on both machines.
+  </Card>
+  <Card title="Usage" href="/docs/usage" icon="terminal">
+    Chat, send files, and pipe anything between machines.
+  </Card>
+  <Card title="SSH over minipaw" href="/docs/ssh" icon="key">
+    Reach a machine's sshd, or a built-in SSH server, by ticket.
+  </Card>
+  <Card title="How it works" href="/docs/how-it-works" icon="network">
+    Tickets, relays, hole punching, and resumable sessions.
+  </Card>
+</CardGroup>

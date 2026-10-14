@@ -1,18 +1,19 @@
-/* Grey · soft. Accent and background are set in blume.config.ts. */
+/* Bone ink on an instrument-panel black (dark), violet ink on cool paper
+   (light). Accent and background are set in blume.config.ts. */
 :root {
-  --blume-foreground: oklch(29.2% 0.014 310.9);
-  --blume-muted: oklch(94.6% 0.006 308.4);
-  --blume-muted-foreground: oklch(53% 0.017 312);
-  --blume-border: oklch(91.7% 0.007 312.3);
-  --blume-code-background: oklch(94.6% 0.006 308.4);
+  --blume-foreground: oklch(22.5% 0.016 302.2);
+  --blume-muted: oklch(93.8% 0.01 299.2);
+  --blume-muted-foreground: oklch(51.8% 0.026 302.5);
+  --blume-border: oklch(89.5% 0.017 301.2);
+  --blume-code-background: oklch(93.8% 0.01 299.2);
 }
 
 :root[data-theme="dark"] {
-  --blume-foreground: oklch(94.2% 0.004 301.4);
-  --blume-muted: oklch(24.2% 0.01 294.9);
-  --blume-muted-foreground: oklch(67.7% 0.014 310.5);
-  --blume-border: oklch(28.1% 0.011 300.9);
-  --blume-code-background: oklch(24.2% 0.01 294.9);
+  --blume-foreground: oklch(87.7% 0.02 87.5);
+  --blume-muted: oklch(21.4% 0.01 303.7);
+  --blume-muted-foreground: oklch(62% 0.021 309.7);
+  --blume-border: oklch(28% 0.017 300.5);
+  --blume-code-background: oklch(19.1% 0.009 308);
 }
 
 /* Blume tightens headings by -0.05em for proportional faces; a monospace
@@ -55,5 +56,68 @@ a:has(.minipaw-logo) > .truncate {
 }
 
 :root[data-theme="dark"] {
-  scrollbar-color: color-mix(in oklab, var(--blume-muted-foreground) 55%, transparent) transparent;
+  scrollbar-color: color-mix(
+      in oklab,
+      var(--blume-muted-foreground) 55%,
+      transparent
+    )
+    transparent;
+}
+
+/* Pages on Blume's layout (the docs and the changelog): from Blume's lg
+   breakpoint up, the site's sidebar (components/site-sidebar.astro) carries
+   the wordmark, site links and search, so it runs the full height and
+   Blume's header steps aside, as on the landing page. visibility: hidden
+   takes the header's controls out of the tab order while keeping it in the
+   page, so its search dialog, which opts back in, still opens. Narrow screens
+   keep the header and its drawer. */
+@media (min-width: 64rem) {
+  body:has([data-paw-sidebar]) [data-blume-header] {
+    position: fixed;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    visibility: hidden;
+  }
+
+  body:has([data-paw-sidebar]) [data-blume-header] [data-blume-search-dialog] {
+    visibility: visible;
+  }
+
+  /* The landing page's frame (pages/index.astro): a 1440px group centred in
+     the window, a 232px sidebar, and a dashed line beside it, so the
+     sidebar doesn't move between pages. */
+  [data-blume-doc-grid]:has([data-paw-sidebar]) {
+    max-width: 1440px;
+    grid-template-columns: 232px minmax(0, 1fr);
+  }
+
+  /* The changelog index is a bare page, where Blume hides the sidebar
+     column on wide screens; it gets the sidebar too. */
+  [data-blume-nav-drawer]:has([data-paw-sidebar]) {
+    display: block;
+    top: 0;
+    height: 100dvh;
+    border-inline-end: 1px dashed var(--blume-border);
+    padding: 1.75rem 1.5rem 1.5rem;
+  }
+
+  [data-blume-nav-drawer]:has([data-paw-sidebar]) [data-blume-nav-tree],
+  [data-blume-nav-drawer]:has([data-paw-sidebar]) [data-blume-nav-tree] > .lg\:block {
+    height: 100%;
+  }
+}
+
+/* With an on-this-page rail, a third column for it, lined up with the page
+   title once the header is gone. */
+@media (min-width: 80rem) {
+  [data-blume-doc-grid]:has([data-paw-sidebar]):has(> aside.xl\:block) {
+    grid-template-columns: 232px minmax(0, 1fr) 17.5rem;
+  }
+
+  [data-blume-doc-grid]:has([data-paw-sidebar]) > aside.xl\:block {
+    top: 0;
+    height: 100dvh;
+  }
 }

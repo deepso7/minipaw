@@ -1,16 +1,8 @@
 import { defineMeta } from "blume";
 
 export default defineMeta({
-  pages: [
-    "installation",
-    "usage",
-    "tickets",
-    "ssh",
-    "ssh-server",
-    "terminal-ui",
-    "how-it-works",
-    "relay",
-    "library",
-  ],
+  // Group folders (in parentheses) add sidebar sections without a URL
+  // segment, so /docs/usage stays /docs/usage.
+  pages: ["getting-started", "ssh-access", "under-the-hood"],
   title: "Docs",
 });

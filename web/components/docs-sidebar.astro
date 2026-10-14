@@ -1,0 +1,10 @@
+---
+// The docs' Sidebar layout slot: the site's sidebar around Blume's page tree.
+import NavTree from "blume/components/layout/NavTree.astro";
+
+import SiteSidebar from "./site-sidebar.astro";
+---
+
+<SiteSidebar currentRoute={Astro.props.currentRoute}>
+  <NavTree {...Astro.props} />
+</SiteSidebar>

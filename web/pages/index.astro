@@ -3,6 +3,8 @@ import PageLayout from "blume/components/layout/PageLayout.astro";
 import data from "blume:data";
 
 import Command from "../components/command.astro";
+import SiteFooter from "../components/site-footer.astro";
+import SiteSidebar from "../components/site-sidebar.astro";
 
 const { config } = data;
 
@@ -11,7 +13,8 @@ const install = "curl -fsSL https://paw.minip2p.com/install.sh | sh";
 const ticket = "mpAQDEiiVb-s5zPPFvR0SjX0lVJgAkCAESINgMwzfDtX-D_vKZ0slyfVb4K-lw-ijkyHNLfPt1UkM2";
 
 // Each recipe is two steps: A runs `a`, and B pastes the ticket A printed into
-// `b`. A second command on either side is an alternative to the first.
+// `b`. A second command on either side is an alternative to the first. The
+// tabs are numbered because keys 1 to 4 pick them.
 const recipes = [
   {
     a: {
@@ -21,7 +24,7 @@ const recipes = [
       cmd: "minipaw serve --ssh --no-auth",
       docs: { href: "/docs/ssh-server", label: "Built-in SSH server docs" },
       note: "A built-in SSH server, so no sshd needed (Linux and macOS).",
-      title: "On the machine to reach",
+      title: "on the machine to reach",
       warning:
         "Anyone with the ticket gets a shell as you, and it keeps working across restarts until serve --new replaces it. Stop serve with Ctrl-C when you're done.",
     },
@@ -29,65 +32,70 @@ const recipes = [
       alt: { cmd: "minipaw cp notes.txt <ticket>:", label: "Or copy files, as with scp" },
       cmd: "minipaw ssh <ticket>",
       note: "Runs your own ssh and scp. You log in as whoever started serve.",
-      title: "From anywhere",
+      title: "from anywhere",
     },
     id: "ssh",
-    tab: "SSH",
+    tab: "ssh",
   },
   {
-    a: { cmd: "minipaw", note: "Prints a ticket and waits.", title: "On machine A" },
-    b: { cmd: "minipaw <ticket>", note: "Then type on either side.", title: "On machine B" },
+    a: { cmd: "minipaw", note: "Prints a ticket and waits.", title: "on machine A" },
+    b: { cmd: "minipaw <ticket>", note: "Then type on either side.", title: "on machine B" },
     id: "chat",
-    tab: "Chat",
+    tab: "chat",
   },
   {
-    a: { cmd: "minipaw > cat.jpg", note: "Saves what arrives as cat.jpg.", title: "On the receiving machine" },
-    b: { cmd: "minipaw <ticket> < cat.jpg", note: "Sends this machine's cat.jpg.", title: "On the sending machine" },
+    a: { cmd: "minipaw > cat.jpg", note: "Saves what arrives as cat.jpg.", title: "on the receiving machine" },
+    b: { cmd: "minipaw <ticket> < cat.jpg", note: "Sends this machine's cat.jpg.", title: "on the sending machine" },
     id: "file",
-    tab: "Send a file",
+    tab: "send a file",
   },
   {
-    a: { cmd: "tar cz pics | minipaw", note: "Packs up the pics folder and sends it.", title: "On the sending machine" },
-    b: { cmd: "minipaw <ticket> | tar xz", note: "Unpacks it in the current directory.", title: "On the receiving machine" },
+    a: { cmd: "tar cz pics | minipaw", note: "Packs up the pics folder and sends it.", title: "on the sending machine" },
+    b: { cmd: "minipaw <ticket> | tar xz", note: "Unpacks it in the current directory.", title: "on the receiving machine" },
     id: "folder",
-    tab: "Send a folder",
+    tab: "send a folder",
   },
 ];
 
-const features = [
+// The spec sheet: what each property is, in a phrase, then why it holds.
+const specs = [
   {
     body: "Starts through a relay, then hole-punches a direct QUIC path when the networks allow, and moves the session over mid-transfer without losing a byte.",
-    title: "Gets through NATs",
+    title: "NAT traversal",
+    value: "relay, then hole punch",
   },
   {
-    body: "QUIC with TLS 1.3 when direct, a Noise session through the relay. The relay only ever sees ciphertext, and both sides are authenticated by peer ID.",
-    title: "End-to-end encrypted",
+    body: "The relay only ever sees ciphertext, and both sides are authenticated by peer ID.",
+    title: "Encryption",
+    value: "TLS 1.3 direct, Noise relayed",
   },
   {
     body: "The ticket is the whole address: the listener's public key, a random token, and its relay if that isn't the default. Whoever holds it can connect, so share it like a password.",
-    title: "No accounts",
+    title: "Accounts",
+    value: "none",
   },
   {
-    body: "A relay cutting a circuit, a path upgrade, a network blip: both sides pick up from the last byte the other received, for up to 60 seconds, as long as both keep running.",
-    title: "Resumes after drops",
+    body: "A relay cutting a circuit, a path upgrade, a network blip: both sides pick up from the last byte the other received, as long as both keep running.",
+    title: "Drops",
+    value: "resumes for 60 s",
   },
   {
     body: "The receiver acknowledges bytes only once they reach its stdout, so a slow reader slows the sender instead of filling memory.",
-    title: "Handles slow readers",
+    title: "Slow readers",
+    value: "acked at stdout",
   },
   {
     body: "minipaw serve keeps its key, so its ticket survives restarts, and minipaw ticket prints it without listening. --identity does the same for a plain listener.",
-    title: "Stable tickets",
+    title: "Tickets",
+    value: "stable with serve",
   },
 ];
 
-const steps = [
-  { body: "One side reserves a slot on a relay and prints a ticket.", title: "Listen" },
-  { body: "The other side pastes the ticket and connects through the relay.", title: "Dial" },
-  {
-    body: "Hole punching upgrades the link to direct QUIC when it can. When it can't, traffic stays on the relay, still end-to-end encrypted.",
-    title: "Go direct",
-  },
+const sections = [
+  { href: "#install", label: "Install" },
+  { href: "#path", label: "The path" },
+  { href: "#recipes", label: "Recipes" },
+  { href: "#spec", label: "Spec sheet" },
 ];
 ---
 
@@ -112,292 +120,723 @@ const steps = [
 >
   <div class="landing">
     <p aria-live="polite" class="sr-only" id="copy-status"></p>
-    <section class="mx-auto grid max-w-5xl items-center gap-12 px-6 pt-16 pb-20 md:grid-cols-[1fr_auto] md:pt-24">
-      <div>
-        <p class="text-sm text-muted-foreground">Tiny paws. Direct connections.</p>
-        <h1 class="pixel mt-3 text-5xl leading-[1.05] md:text-6xl">pipe bytes,<br />paw to paw</h1>
-        <p class="mt-6 max-w-xl text-base leading-relaxed text-muted-foreground">
-          Pipe stdin/stdout between two machines. minipaw gets through NATs, needs no accounts, and
-          encrypts every byte end to end.
-        </p>
+    <div class="shell">
+      <!-- On wide screens this sidebar is the page's only navigation, as
+           Blume's header is hidden; narrower ones keep that header instead. -->
+      <aside class="index">
+        <SiteSidebar currentRoute="/">
+          <p class="blume-nav-heading">On this page</p>
+          <nav aria-label="On this page" class="paw-nav-list">
+            {sections.map((section) => <a class="paw-nav-link" href={section.href}>{section.label}</a>)}
+          </nav>
+        </SiteSidebar>
+      </aside>
 
-        <div class="install mt-8 flex max-w-xl items-center gap-3 rounded-blume border border-border bg-code py-3 pr-2 pl-4 text-sm">
-          <span class="text-muted-foreground select-none">$</span>
-          <code class="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">{install}</code>
-          <button
-            class="copy shrink-0 rounded-blume px-3 py-1.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
-            data-copy={install}
-            type="button">copy</button
-          >
-        </div>
-
-        <p class="mt-3 max-w-xl text-xs leading-relaxed text-muted-foreground">
-          Run it on both machines. Linux and macOS, x64 or arm64; it installs to ~/.local/bin and
-          says so if that isn't on your PATH. Elsewhere, <code>cargo install minipaw-cli</code>.{" "}
-          <a class="underline underline-offset-4 hover:text-foreground" href="/docs/installation">Installation docs</a>
-        </p>
-
-        <div class="mt-6 flex flex-wrap items-center gap-x-6 gap-y-3 text-sm">
-          <a class="rounded-blume bg-accent px-4 py-2 font-semibold text-accent-foreground" href="/docs">Read the docs</a>
-          <a class="text-muted-foreground underline-offset-4 hover:text-foreground hover:underline" href="https://github.com/deepso7/minipaw">GitHub →</a>
-        </div>
-      </div>
-
-      <img
-        alt=""
-        class="sprite mx-auto hidden md:block"
-        height="228"
-        src="/paw-raised.svg"
-        width="240"
-      />
-    </section>
-
-    <section class="mx-auto max-w-5xl px-6 pb-20">
-      <div class="grid items-stretch gap-4 md:grid-cols-[1fr_auto_1fr]">
-        <div class="term">
-          <div class="term-bar"><span>machine A</span></div>
-          <pre><span class="dim">$</span> minipaw
-<span class="dim"># 🐾 listening; connect with:</span>
-minipaw {ticket}
-<span class="dim">· connected to 12D3KooW…tLdf (via relay)</span>
-<span class="dim">peer›</span> hello</pre>
-        </div>
-        <div class="trail" aria-hidden="true">
-          <img alt="" src="/icon.svg" width="16" height="16" />
-          <img alt="" src="/icon.svg" width="16" height="16" />
-          <img alt="" src="/icon.svg" width="16" height="16" />
-        </div>
-        <div class="term">
-          <div class="term-bar"><span>machine B</span></div>
-          <pre><span class="dim">$</span> echo hello | minipaw {ticket}</pre>
-        </div>
-      </div>
-    </section>
-
-    <section class="mx-auto max-w-5xl px-6 pb-20">
-      <h2 class="pixel text-3xl">one listens, one pastes</h2>
-      <p class="mt-2 text-sm text-muted-foreground">
-        Install minipaw on both machines. One prints a ticket, the other pastes it.
-      </p>
-
-      <div class="recipes mt-8">
-        <div class="flex flex-wrap gap-2" role="radiogroup" aria-label="What to do">
-          {
-            recipes.map((recipe, i) => (
-              <label class="tab">
-                <input checked={i === 0} class="sr-only" name="recipe" type="radio" value={recipe.id} />
-                {recipe.tab}
-              </label>
-            ))
-          }
-        </div>
-
-        {
-          recipes.map((recipe, i) => (
-            <div class="panel mt-3 grid gap-8 rounded-blume border border-border p-5 md:grid-cols-2" data-panel={recipe.id} hidden={i > 0}>
-              <div class="grid content-start gap-3">
-                <h3 class="step"><span class="num">1</span>{recipe.a.title}</h3>
-                <Command cmd={recipe.a.cmd} />
-                {recipe.a.warning && (
-                  <p class="warn" role="note">
-                    <strong>No auth.</strong> {recipe.a.warning}
-                  </p>
-                )}
-                {recipe.a.alt && <Command {...recipe.a.alt} />}
-                <p class="text-xs leading-relaxed text-muted-foreground">
-                  {recipe.a.note}{" "}
-                  {recipe.a.docs && (
-                    <a class="underline underline-offset-4 hover:text-foreground" href={recipe.a.docs.href}>
-                      {recipe.a.docs.label}
-                    </a>
-                  )}
-                </p>
-              </div>
-              <div class="grid content-start gap-3">
-                <h3 class="step"><span class="num">2</span>{recipe.b.title}</h3>
-                <input
-                  aria-label="Ticket from step 1"
-                  autocomplete="off"
-                  class="field"
-                  name="ticket"
-                  placeholder="Paste the ticket from step 1"
-                  spellcheck="false"
-                  type="text"
-                />
-                <Command cmd={recipe.b.cmd} />
-                {recipe.b.alt && <Command {...recipe.b.alt} />}
-                <p class="fill-status text-xs leading-relaxed text-muted-foreground" aria-live="polite" data-note={recipe.b.note}>
-                  {recipe.b.note}
-                </p>
-              </div>
-            </div>
-          ))
-        }
-
-        <p class="mt-3 text-xs text-muted-foreground">
-          The ticket works like a password: whoever has it can connect. What you paste here stays on
-          this page.
-        </p>
-      </div>
-    </section>
-
-    <section class="mx-auto max-w-5xl px-6 pb-20">
-      <h2 class="pixel text-3xl">small, sturdy pipe</h2>
-      <div class="mt-8 grid gap-x-10 gap-y-8 sm:grid-cols-2 lg:grid-cols-3">
-        {
-          features.map((feature) => (
+      <div class="content">
+      <div class="rail">
+        <section class="block" id="install">
+          <span class="tag" aria-hidden="true">[ machine a ]</span>
+          <div class="hero">
             <div>
-              <h3 class="flex items-center gap-2 text-sm font-semibold">
-                <img alt="" class="sprite" height="13" src="/logo.svg" width="16" />
-                {feature.title}
-              </h3>
-              <p class="mt-2 text-sm leading-relaxed text-muted-foreground">{feature.body}</p>
-            </div>
-          ))
-        }
-      </div>
-    </section>
+              <h1 class="pixel">pipe bytes,<br />paw to paw</h1>
+              <p class="lede">
+                Pipe stdin/stdout between two machines. minipaw gets through NATs, needs no
+                accounts, and encrypts every byte end to end.
+              </p>
 
-    <section class="mx-auto max-w-5xl px-6 pb-24">
-      <h2 class="pixel text-3xl">how it works</h2>
-      <ol class="mt-8 grid gap-4 md:grid-cols-3">
-        {
-          steps.map((step, i) => (
-            <li class="rounded-blume border border-border p-5">
-              <span class="text-xs text-accent">0{i + 1}</span>
-              <h3 class="mt-1 text-sm font-semibold">{step.title}</h3>
-              <p class="mt-2 text-sm leading-relaxed text-muted-foreground">{step.body}</p>
-            </li>
-          ))
-        }
-      </ol>
-      <p class="mt-6 text-sm text-muted-foreground">
-        Built on <a class="text-accent underline underline-offset-4" href="https://github.com/deepso7/minip2p">minip2p</a>,
-        a small libp2p implementation in Rust. <a class="text-accent underline underline-offset-4" href="/docs/how-it-works">Read how it works</a>.
-      </p>
-    </section>
+              <div class="term">
+                <p><span class="dim">you@a ~</span><br />› install it, on both machines</p>
+                <div class="install">
+                  <code>{install}</code>
+                  <button class="copy" data-copy={install} type="button">copy</button>
+                </div>
+                <p class="fine dim">
+                  Linux and macOS, x64 or arm64; it installs to ~/.local/bin and says so if that
+                  isn't on your PATH. Elsewhere, <code>cargo install minipaw-cli</code>.{" "}
+                  <a href="/docs/installation">Installation docs</a>
+                </p>
+                <pre aria-label="Example session on machine A"><span class="dim">you@a ~</span>
+› minipaw
+<span class="dim"># 🐾 listening; connect with:</span>
+minipaw <span class="ticket">{ticket}</span>
+<span class="dim"># connection from 12D3KooW…tLdf (via relay)</span>
+<span class="ok"># upgraded to a direct connection</span>
+<span class="dim">peer›</span> hello</pre>
+                <p class="dim">you@a ~<br /><span class="fg">›</span> <span class="caret"></span></p>
+              </div>
+            </div>
+
+            <div class="art" aria-hidden="true">
+              <span class="call l">['beans'] <b>ciphertext only</b></span>
+              <img alt="" class="sprite" height="285" src="/paw-raised.svg" width="300" />
+              <span class="call r one">peer id<br /><b>12D3KooW…tLdf</b></span>
+              <span class="call r two">resume window<br /><b>60 s</b></span>
+            </div>
+          </div>
+        </section>
+
+        <section class="block" id="path">
+          <span class="tag" aria-hidden="true">[ section a–b ]</span>
+          <h2 class="pixel">the path</h2>
+          <p class="sub">
+            Every session starts on a relay, then moves to a direct path when the hole punch
+            lands. Bytes keep flowing through the switch. <a href="/docs/how-it-works">Read how it works</a>
+          </p>
+          <div class="sheet-wrap">
+          <svg
+            aria-label="Machine A and machine B connect through a relay first, then directly over QUIC"
+            class="sheet"
+            fill="none"
+            role="img"
+            viewBox="0 0 900 260"
+          >
+            <rect class="line-fg" height="70" width="150" x="20" y="150" />
+            <text class="lbl" x="36" y="177">A  listener</text>
+            <text x="36" y="199">prints the ticket</text>
+            <rect class="line-fg" height="70" width="150" x="730" y="150" />
+            <text class="lbl" x="746" y="177">B  dialer</text>
+            <text x="746" y="199">pastes the ticket</text>
+
+            <rect class="line-dim dashed" height="50" width="140" x="380" y="20" />
+            <text class="lbl" x="396" y="42">relay</text>
+            <text x="396" y="60">sees ciphertext</text>
+            <path class="line-dim dashed" d="M170 160 L380 62 M520 62 L730 160" />
+            <text transform="rotate(-25 214 112)" x="214" y="112">1  via relay, Noise</text>
+
+            <path class="line-ok" d="M170 200 H730" />
+            <path class="fill-ok" d="M170 200 l9 -4.5 v9 z M730 200 l-9 -4.5 v9 z" />
+            <text class="ok" x="345" y="191">2  direct, QUIC + TLS 1.3</text>
+            <rect class="packet" height="6" width="6" x="176" y="197" />
+            <rect class="packet late" height="6" width="6" x="176" y="197" />
+
+            <path class="line-dim" d="M170 240 H730 M170 234 v12 M730 234 v12" />
+            <text text-anchor="middle" x="450" y="256">one session, no bytes lost in the switch</text>
+          </svg>
+          </div>
+        </section>
+
+        <section class="block" id="recipes">
+          <span class="tag" aria-hidden="true">[ recipes ]</span>
+          <h2 class="pixel">one listens, one pastes</h2>
+          <p class="sub">
+            Install minipaw on both machines. One prints a ticket, the other pastes it.{" "}
+            <span class="keyhint">Once you're in them, keys 1 to 4 switch recipes.</span>
+          </p>
+
+          <div class="recipes">
+            <div class="keys" role="radiogroup" aria-label="What to do">
+              {
+                recipes.map((recipe, i) => (
+                  <label class="key">
+                    <input checked={i === 0} class="sr-only" name="recipe" type="radio" value={recipe.id} />
+                    <kbd aria-hidden="true">{i + 1}</kbd>
+                    {recipe.tab}
+                  </label>
+                ))
+              }
+            </div>
+
+            {
+              recipes.map((recipe, i) => (
+                <div class="panel" data-panel={recipe.id} hidden={i > 0}>
+                  <div class="pane">
+                    <h3 class="who"><b>a</b> {recipe.a.title}</h3>
+                    <Command cmd={recipe.a.cmd} />
+                    {recipe.a.warning && (
+                      <p class="warn" role="note">
+                        <strong>No auth.</strong> {recipe.a.warning}
+                      </p>
+                    )}
+                    {recipe.a.alt && <Command {...recipe.a.alt} />}
+                    <p class="note">
+                      {recipe.a.note}{" "}
+                      {recipe.a.docs && <a href={recipe.a.docs.href}>{recipe.a.docs.label}</a>}
+                    </p>
+                  </div>
+                  <div class="pane">
+                    <h3 class="who"><b>b</b> {recipe.b.title}</h3>
+                    <input
+                      aria-label="Ticket from machine A"
+                      autocomplete="off"
+                      class="field"
+                      name="ticket"
+                      placeholder="Paste the ticket A printed"
+                      spellcheck="false"
+                      type="text"
+                    />
+                    <Command cmd={recipe.b.cmd} />
+                    {recipe.b.alt && <Command {...recipe.b.alt} />}
+                    <p class="note fill-status" aria-live="polite" data-note={recipe.b.note}>
+                      {recipe.b.note}
+                    </p>
+                  </div>
+                </div>
+              ))
+            }
+
+            <p class="fine dim">
+              The ticket works like a password: whoever has it can connect. What you paste here
+              stays on this page.
+            </p>
+          </div>
+        </section>
+
+        <section class="block" id="spec">
+          <span class="tag" aria-hidden="true">[ spec sheet ]</span>
+          <h2 class="pixel">small, sturdy pipe</h2>
+          <p class="sub">What the pipe does, and how.</p>
+          <dl class="specs">
+            {
+              specs.map((spec) => (
+                <div>
+                  <dt>{spec.title}</dt>
+                  <dd class="value">{spec.value}</dd>
+                  <dd class="body">{spec.body}</dd>
+                </div>
+              ))
+            }
+          </dl>
+        </section>
+      </div>
+
+    <!-- The CLI's own status line, as `minipaw` draws it in a terminal. -->
+    <div class="status" aria-hidden="true">
+      <span class="fg">🐾 minipaw</span>
+      <span><span class="live">●</span> <b class="ok">connected</b></span>
+      <span class="dim">·</span><span>direct<span class="wide"> (upgraded)</span></span>
+      <span class="dim wide">·</span><span class="wide">peer 12D3KooW…tLdf</span>
+      <span class="dim">·</span><span data-elapsed>0:12</span>
+      <span class="sent"><span class="up">↑</span> <span class="dim">sent</span> <span data-sent>1.2 MiB</span></span>
+    </div>
+      </div>
+    </div>
   </div>
 
-  <footer class="landing border-t border-border" slot="footer">
-    <div class="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-4 px-6 py-8 text-xs text-muted-foreground">
-      <span class="flex items-center gap-2">
-        <img alt="" class="sprite" height="13" src="/logo.svg" width="16" />
-        minipaw · MIT or Apache-2.0
-      </span>
-      <span class="flex gap-5">
-        <a class="hover:text-foreground" href="/docs">Docs</a>
-        <a class="hover:text-foreground" href="/changelog">Changelog</a>
-        <a class="hover:text-foreground" href="https://github.com/deepso7/minipaw">GitHub</a>
-      </span>
-    </div>
-  </footer>
+  <SiteFooter slot="footer" />
 </PageLayout>
 
 <style>
-  .landing .pixel {
+  /* Every animation here stops within 5 seconds, so none needs a pause
+     control, and none runs under reduced motion. */
+
+  /* Two inks beyond Blume's tokens: the toe-bean accent is Blume's accent, and
+     mint marks the direct path, as green does in the CLI. */
+  .landing {
+    --paw-ok: oklch(83% 0.09 165);
+    --paw-warn-bg: color-mix(in oklab, var(--blume-accent) 14%, transparent);
+    --rule: var(--blume-border);
+  }
+  :global(:root:not([data-theme="dark"])) .landing {
+    --paw-ok: oklch(52% 0.11 165);
+  }
+
+  .landing {
+    font-size: 13.5px;
+    line-height: 1.6;
+  }
+  .landing a {
+    text-decoration: underline;
+    text-decoration-color: var(--rule);
+    text-underline-offset: 4px;
+  }
+  .landing a:hover {
+    text-decoration-color: currentcolor;
+  }
+  .pixel {
     font-family: var(--blume-font-display-src);
     font-weight: 600;
     letter-spacing: 0;
   }
-  .sprite,
-  .trail img {
+  .sprite {
     image-rendering: pixelated;
   }
   .dim {
     color: var(--blume-muted-foreground);
   }
-  .tab {
-    cursor: pointer;
-    border: 1px solid var(--blume-border);
-    border-radius: var(--blume-radius);
-    padding: 0.375rem 0.875rem;
-    font-size: 0.875rem;
-    color: var(--blume-muted-foreground);
-  }
-  .tab:hover {
+  .fg {
     color: var(--blume-foreground);
   }
-  .tab:has(input:checked) {
-    border-color: var(--blume-accent);
-    color: var(--blume-foreground);
+  .ok {
+    color: var(--paw-ok);
   }
-  .tab:has(input:focus-visible),
-  .field:focus-visible {
-    outline: 2px solid var(--blume-accent);
-    outline-offset: 1px;
-  }
-  .warn {
-    border-left: 2px solid var(--blume-code-warning-border);
-    border-radius: var(--blume-radius);
-    background: var(--blume-code-warning);
-    padding: 0.5rem 0.75rem;
-    font-size: 0.75rem;
+  .fine {
+    font-size: 12px;
     line-height: 1.6;
   }
-  .step {
+
+  /* Layout: the sidebar, the site's nav on this page, sits right beside
+     one dashed-rail column, and the two are centred together. */
+  .shell {
+    display: grid;
+    /* The same frame as the docs (theme.css), so the sidebar stays put
+       moving between them. */
+    grid-template-columns: 232px minmax(0, 1fr);
+    max-width: 1440px;
+    margin: 0 auto;
+    /* The right rail's crosshairs sit half outside it; when the rail meets
+       the window edge, they mustn't make the page scroll sideways. */
+    overflow-x: clip;
+  }
+  /* Blume's header gives way to the sidebar where the sidebar shows.
+     visibility: hidden takes its controls out of the tab order and the
+     accessibility tree, while keeping it in the page (unlike display: none)
+     so its search dialog, which opens in the top layer and opts back in to
+     being visible, still works from the sidebar's button. */
+  @media (min-width: 861px) {
+    :global(body:has(.landing) [data-blume-header]) {
+      position: fixed;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      visibility: hidden;
+    }
+    :global(body:has(.landing) [data-blume-header] [data-blume-search-dialog]) {
+      visibility: visible;
+    }
+  }
+  .index {
+    position: sticky;
+    top: 0;
+    align-self: start;
+    height: 100dvh;
+    overflow-y: auto;
+    padding: 1.75rem 1.5rem 1.5rem;
+  }
+  .content {
+    min-width: 0;
+  }
+  /* The column, between two dashed rails; its left rail divides it from
+     the sidebar. */
+  .rail {
+    border-right: 1px dashed var(--rule);
+    border-left: 1px dashed var(--rule);
+  }
+  .block {
+    position: relative;
+    scroll-margin-top: 1rem;
+    border-bottom: 1px dashed var(--rule);
+    padding: 3.5rem 3rem;
+  }
+  /* Crosshairs where each block's rule meets the rails. */
+  .block::before,
+  .block::after {
+    position: absolute;
+    bottom: -0.7rem;
+    content: "+";
+    color: var(--blume-muted-foreground);
+  }
+  .block::before {
+    left: -0.32rem;
+  }
+  .block::after {
+    right: -0.32rem;
+  }
+  .tag {
+    position: absolute;
+    top: 1rem;
+    right: 1.25rem;
+    font-size: 11.5px;
+    color: var(--blume-muted-foreground);
+  }
+
+  /* Hero: a terminal session on machine A, and the paw, annotated. */
+  .hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 360px;
+    gap: 2rem;
+    align-items: start;
+  }
+  h1 {
+    margin: 0 0 1.25rem;
+    font-size: 3rem;
+    line-height: 1.02;
+  }
+  .lede {
+    max-width: 34em;
+    margin: 0 0 1.75rem;
+    font-size: 14px;
+  }
+  .term > * + * {
+    margin-top: 0.875rem;
+  }
+  .term p {
+    margin-bottom: 0;
+  }
+  .term pre {
+    margin-bottom: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font: inherit;
+    line-height: 1.6;
+  }
+  .ticket {
+    color: var(--blume-accent);
+  }
+  .install {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    font-size: 0.875rem;
-    font-weight: 600;
+    gap: 0.75rem;
+    max-width: 34rem;
+    border: 1px solid var(--rule);
+    background: var(--blume-code-background);
+    padding: 0.5rem 0.5rem 0.5rem 0.875rem;
   }
-  .num {
+  .install code {
+    min-width: 0;
+    flex: 1;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  .install .copy {
+    flex-shrink: 0;
+    background: var(--blume-foreground);
+    padding: 0.25rem 0.75rem;
+    font-size: 12px;
+    color: var(--blume-background);
+  }
+  .install .copy:focus-visible {
+    outline: 2px solid var(--blume-accent);
+    outline-offset: 2px;
+  }
+  .caret {
+    display: inline-block;
+    width: 0.6em;
+    height: 1.1em;
+    vertical-align: -0.2em;
+    background: var(--blume-foreground);
+    animation: blink 1s steps(1) 4;
+  }
+  @keyframes blink {
+    50% {
+      opacity: 0;
+    }
+  }
+
+  .art {
+    position: relative;
+    padding: 3rem 0 0;
+  }
+  .art .sprite {
+    display: block;
+    width: 240px;
+    height: auto;
+  }
+  /* Callouts, as on a drawing: a dashed leader to the part they name. */
+  .call {
+    position: absolute;
+    font-size: 11px;
+    line-height: 1.4;
+    white-space: nowrap;
+    color: var(--blume-muted-foreground);
+  }
+  .call b {
+    font-weight: 500;
+    color: var(--blume-foreground);
+  }
+  .call::before {
+    position: absolute;
+    top: 0.7em;
+    border-top: 1px dashed var(--blume-muted-foreground);
+    content: "";
+    width: 2.5rem;
+  }
+  .call.l {
+    top: 0.5rem;
+    left: 3.25rem;
+  }
+  .call.l::before {
+    display: none;
+  }
+  .call.r {
+    left: 286px;
+  }
+  .call.r::before {
+    right: 100%;
+    margin-right: 0.4rem;
+  }
+  .call.one {
+    top: 7.5rem;
+  }
+  .call.two {
+    top: 15rem;
+  }
+
+  h2 {
+    margin: 0 0 0.5rem;
+    font-size: 1.875rem;
+    line-height: 1.1;
+  }
+  .sub {
+    max-width: 46em;
+    margin: 0 0 1.75rem;
+    color: var(--blume-muted-foreground);
+  }
+
+  /* The path, as a section drawing. On a phone it keeps a legible size and
+     scrolls sideways. */
+  .sheet-wrap {
+    overflow-x: auto;
+  }
+  .sheet {
+    min-width: 600px;
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  .sheet text {
+    font-family: var(--blume-font-mono, inherit);
+    font-size: 11px;
+    fill: var(--blume-muted-foreground);
+  }
+  .sheet .lbl {
+    font-size: 12px;
+    fill: var(--blume-foreground);
+  }
+  .sheet text.ok {
+    fill: var(--paw-ok);
+  }
+  .line-fg {
+    stroke: var(--blume-foreground);
+  }
+  .line-dim {
+    stroke: var(--blume-muted-foreground);
+  }
+  .dashed {
+    stroke-dasharray: 4 4;
+  }
+  .line-ok {
+    stroke: var(--paw-ok);
+    stroke-width: 1.5;
+  }
+  .fill-ok {
+    fill: var(--paw-ok);
+  }
+  .packet {
+    fill: var(--blume-accent);
+    animation: packet 2.4s linear 2;
+  }
+  .packet.late {
+    animation-delay: -1.2s;
+  }
+  @keyframes packet {
+    to {
+      transform: translateX(542px);
+    }
+  }
+
+  /* Recipes, as two tmux panes. */
+  .keys {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.25rem;
+    margin-bottom: 0.875rem;
+  }
+  .key {
+    cursor: pointer;
+    color: var(--blume-muted-foreground);
+  }
+  .key kbd {
+    margin-right: 0.4rem;
+    border: 1px solid var(--rule);
+    padding: 0 0.35rem;
+    font: inherit;
+  }
+  .key:hover,
+  .key:has(input:checked) {
+    color: var(--blume-foreground);
+  }
+  .key:has(input:checked) kbd {
+    border-color: var(--blume-accent);
+    color: var(--blume-accent);
+  }
+  .key:has(input:focus-visible),
+  .field:focus-visible {
+    outline: 2px solid var(--blume-accent);
+    outline-offset: 2px;
+  }
+  .keyhint {
+    display: none;
+  }
+  @media (pointer: fine) {
+    .keyhint {
+      display: inline;
+    }
+  }
+  /* minmax(0, …) so a filled-in ticket scrolls inside its command row
+     instead of widening the pane. */
+  .panel {
     display: grid;
-    place-items: center;
-    width: 1.25rem;
-    height: 1.25rem;
-    border-radius: 999px;
-    background: var(--blume-accent);
-    font-size: 0.75rem;
-    color: var(--blume-accent-foreground);
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    margin-bottom: 0.75rem;
+    border: 1px solid var(--rule);
+  }
+  .panel[hidden] {
+    display: none;
+  }
+  .pane {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-content: start;
+    gap: 0.625rem;
+    padding: 1.125rem 1.25rem 1.375rem;
+  }
+  .pane + .pane {
+    border-left: 1px solid var(--rule);
+  }
+  .who {
+    margin: 0 0 0.25rem;
+    font-size: inherit;
+    font-weight: 400;
+    color: var(--blume-muted-foreground);
+  }
+  .who b {
+    font-weight: 500;
+    color: var(--blume-accent);
   }
   .field {
     min-width: 0;
-    border: 1px solid var(--blume-border);
-    border-radius: var(--blume-radius);
+    border: 1px dashed var(--blume-muted-foreground);
     background: transparent;
     padding: 0.5rem 0.75rem;
     font-size: 13px;
     color: var(--blume-foreground);
   }
-  .term {
-    overflow: hidden;
-    border: 1px solid var(--blume-border);
-    border-radius: var(--blume-radius);
-    background: var(--blume-code-background);
+  .warn {
+    margin: 0;
+    border-left: 2px solid var(--blume-accent);
+    background: var(--paw-warn-bg);
+    padding: 0.5rem 0.75rem;
+    font-size: 12px;
+    line-height: 1.6;
   }
-  .term-bar {
-    border-bottom: 1px solid var(--blume-border);
-    padding: 0.5rem 1rem;
-    font-size: 0.75rem;
+  .note {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.6;
     color: var(--blume-muted-foreground);
   }
-  .term pre {
+
+  /* Spec sheet: property, value, why. */
+  .specs {
     margin: 0;
-    overflow-x: auto;
-    padding: 1rem;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    font-size: 13px;
-    line-height: 1.7;
   }
-  .trail {
+  .specs > div {
+    display: grid;
+    grid-template-columns: 11rem 15rem minmax(0, 1fr);
+    gap: 1rem;
+    border-top: 1px solid var(--rule);
+    padding: 0.75rem 0;
+  }
+  .specs dt {
+    font-weight: 500;
+  }
+  .specs dd {
+    margin: 0;
+  }
+  .specs .value {
+    color: var(--blume-accent);
+  }
+  .specs .body {
+    color: var(--blume-muted-foreground);
+  }
+
+  /* The status line rides the bottom of the viewport until the footer. */
+  .status {
+    position: sticky;
+    bottom: 0;
+    z-index: 1;
     display: flex;
+    flex-wrap: nowrap;
     align-items: center;
-    justify-content: center;
-    gap: 0.75rem;
-    opacity: 0.8;
+    gap: 0.6rem;
+    border-top: 1px solid var(--rule);
+    background: var(--blume-background);
+    padding: 0.625rem 1.5rem;
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
   }
-  .trail img:nth-child(2) {
-    transform: translateY(-6px);
+  .status b {
+    font-weight: 500;
   }
-  @media (max-width: 767px) {
-    .trail {
-      flex-direction: column;
-      gap: 0.25rem;
+  .status .live {
+    color: var(--paw-ok);
+    animation: blink 1.6s steps(1) 3;
+  }
+  .status .sent {
+    margin-left: auto;
+  }
+  .status .up {
+    color: var(--blume-accent);
+  }
+
+
+  @media (max-width: 1100px) {
+    .hero {
+      grid-template-columns: minmax(0, 1fr);
     }
-    .trail img:nth-child(2) {
-      transform: translateX(6px);
+    .art {
+      display: none;
+    }
+    .specs > div {
+      grid-template-columns: 10rem minmax(0, 1fr);
+    }
+    .specs .body {
+      grid-column: 2;
+    }
+  }
+  @media (max-width: 860px) {
+    .shell {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .index {
+      display: none;
+    }
+    .rail {
+      border: 0;
+    }
+    .block {
+      scroll-margin-top: 4rem;
+      padding: 3rem 1.25rem;
+    }
+    .block::before,
+    .block::after {
+      display: none;
+    }
+    h1 {
+      font-size: 2.5rem;
+    }
+    .panel {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .pane + .pane {
+      border-top: 1px solid var(--rule);
+      border-left: 0;
+    }
+    .specs > div {
+      grid-template-columns: 1fr;
+      gap: 0.125rem;
+    }
+    .specs .body {
+      grid-column: auto;
+    }
+    .status .wide,
+    .status .sent .dim {
+      display: none;
+    }
+    .status {
+      padding: 0.625rem 1.25rem;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .caret,
+    .packet,
+    .status .live {
+      animation: none;
+    }
+    .packet.late {
+      display: none;
     }
   }
 </style>
@@ -431,7 +870,7 @@ minipaw {ticket}
     }, 2500);
   });
 
-  // Step 2's field fills `<ticket>` into B's commands. Every tab has its own
+  // B's ticket field fills `<ticket>` into B's commands. Every tab has its own
   // field, kept in step so switching tabs keeps the ticket. A
   // ticket is `mp` and URL-safe base64, so one is found inside a pasted line
   // such as `minipaw mpAQ…` or `# ssh: minipaw ssh user@mpAQ…`.
@@ -505,9 +944,9 @@ minipaw {ticket}
     }
     const raw = field.value.trim();
     const ticket = raw.match(CANDIDATE)?.find(isTicket);
-    // Under the commands: step 2's note, or why the paste isn't a ticket.
+    // Under the commands: B's note, or why the paste isn't a ticket.
     for (const line of document.querySelectorAll<HTMLElement>(".recipes .fill-status")) {
-      line.textContent = raw && !ticket ? "That isn't a whole ticket. Paste the full line step 1 printed." : (line.dataset.note ?? "");
+      line.textContent = raw && !ticket ? "That isn't a whole ticket. Paste the full line A printed." : (line.dataset.note ?? "");
     }
     render(ticket);
   };
@@ -524,5 +963,47 @@ minipaw {ticket}
     for (const panel of document.querySelectorAll<HTMLElement>(".recipes .panel")) {
       panel.hidden = panel.dataset.panel !== target.value;
     }
+  });
+
+  // Keys 1 to 4 pick a recipe while focus is in the recipes (so a stray
+  // keystroke or speech input elsewhere on the page never switches one), but
+  // not while typing a ticket. Focus moves to the picked tab, since the pane
+  // that held it may have just been hidden.
+  document.addEventListener("keydown", (event) => {
+    if (event.metaKey || event.ctrlKey || event.altKey || event.repeat) {return;}
+    const { target } = event;
+    if (!(target instanceof HTMLElement) || !target.closest(".recipes")) {return;}
+    if (target.matches('input[type="text"], textarea, select, [contenteditable]')) {return;}
+    const radios = document.querySelectorAll<HTMLInputElement>('.recipes input[name="recipe"]');
+    const radio = radios[Number(event.key) - 1];
+    if (!radio) {return;}
+    event.preventDefault();
+    radio.focus();
+    if (radio.checked) {return;}
+    radio.checked = true;
+    radio.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+
+  // The status line counts up like a real session for its first few seconds
+  // (elapsed time, and bytes sent at a steady 2 MiB/s), then holds still, so
+  // it's never a distraction. It's decoration (aria-hidden), and doesn't move
+  // at all under reduced motion. It starts on astro:page-load, which the
+  // client router fires on the first load and after every navigation, so
+  // coming back to this page from the docs counts again.
+  let statusTimer: ReturnType<typeof setInterval> | undefined;
+  document.addEventListener("astro:page-load", () => {
+    clearInterval(statusTimer);
+    if (!document.querySelector("[data-elapsed]")) {return;}
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) {return;}
+    let tick = 0;
+    statusTimer = setInterval(() => {
+      tick += 1;
+      if (tick >= 4) {clearInterval(statusTimer);}
+      const elapsed = document.querySelector("[data-elapsed]");
+      const sent = document.querySelector("[data-sent]");
+      if (!elapsed || !sent) {return;}
+      elapsed.textContent = `0:${12 + tick}`;
+      sent.textContent = `${(1.2 + tick * 2).toFixed(1)} MiB`;
+    }, 1000);
   });
 </script>
