@@ -1,19 +1,19 @@
 /* Bone ink on an instrument-panel black (dark), violet ink on cool paper
    (light). Accent and background are set in blume.config.ts. */
 :root {
-  --blume-foreground: #1d1a22;
-  --blume-muted: #ebe9f0;
-  --blume-muted-foreground: #6b6575;
-  --blume-border: #dedae6;
-  --blume-code-background: #ebe9f0;
+  --blume-foreground: oklch(22.5% 0.016 302.2);
+  --blume-muted: oklch(93.8% 0.01 299.2);
+  --blume-muted-foreground: oklch(51.8% 0.026 302.5);
+  --blume-border: oklch(89.5% 0.017 301.2);
+  --blume-code-background: oklch(93.8% 0.01 299.2);
 }
 
 :root[data-theme="dark"] {
-  --blume-foreground: #dcd6c8;
-  --blume-muted: #1a181d;
-  --blume-muted-foreground: #8a8390;
-  --blume-border: #2a2730;
-  --blume-code-background: #151317;
+  --blume-foreground: oklch(87.7% 0.02 87.5);
+  --blume-muted: oklch(21.4% 0.01 303.7);
+  --blume-muted-foreground: oklch(62% 0.021 309.7);
+  --blume-border: oklch(28% 0.017 300.5);
+  --blume-code-background: oklch(19.1% 0.009 308);
 }
 
 /* Blume tightens headings by -0.05em for proportional faces; a monospace

@@ -56,11 +56,11 @@ export default defineConfig({
       logo: "./og/paw.svg",
       // The dark theme, from theme.css.
       palette: {
-        accent: "#f09bb0",
-        background: "#0e0d10",
-        border: "#2a2730",
-        foreground: "#dcd6c8",
-        muted: "#8a8390",
+        accent: "oklch(78% 0.104 3.7)",
+        background: "oklch(16.2% 0.006 300.9)",
+        border: "oklch(28% 0.017 300.5)",
+        foreground: "oklch(87.7% 0.02 87.5)",
+        muted: "oklch(62% 0.021 309.7)",
       },
     },
   },
@@ -69,12 +69,12 @@ export default defineConfig({
     // Toe-bean pink on a near-black instrument panel (dark), or a deeper
     // pink on cool paper (light).
     accent: {
-      dark: "#f09bb0",
-      light: "#b8325b",
+      dark: "oklch(78% 0.104 3.7)",
+      light: "oklch(53.2% 0.172 7)",
     },
     background: {
-      dark: "#0e0d10",
-      light: "#f5f4f8",
+      dark: "oklch(16.2% 0.006 300.9)",
+      light: "oklch(96.9% 0.005 297.7)",
     },
     fonts: {
       body: paperMono,
