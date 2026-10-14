@@ -64,15 +64,15 @@ a:has(.minipaw-logo) > .truncate {
     transparent;
 }
 
-/* Docs pages with a sidebar: from Blume's lg breakpoint up, the sidebar
-   (components/docs-sidebar.astro) carries the wordmark, site links and
-   search, so it runs the full height and Blume's header steps aside, as on
-   the landing page. visibility: hidden takes the header's controls out of the
-   tab order while keeping it in the page, so its search dialog, which opts
-   back in, still opens. Narrow screens keep the header and its drawer. */
+/* Pages on Blume's layout (the docs and the changelog): from Blume's lg
+   breakpoint up, the site's sidebar (components/site-sidebar.astro) carries
+   the wordmark, site links and search, so it runs the full height and
+   Blume's header steps aside, as on the landing page. visibility: hidden
+   takes the header's controls out of the tab order while keeping it in the
+   page, so its search dialog, which opts back in, still opens. Narrow screens
+   keep the header and its drawer. */
 @media (min-width: 64rem) {
-  body:has([data-blume-nav-drawer]:not(.lg\:hidden) [data-paw-sidebar])
-    [data-blume-header] {
+  body:has([data-paw-sidebar]) [data-blume-header] {
     position: fixed;
     width: 1px;
     height: 1px;
@@ -87,13 +87,16 @@ a:has(.minipaw-logo) > .truncate {
 
   /* The landing page's frame (pages/index.astro): a 1440px group centred in
      the window, a 232px sidebar, and a dashed line beside it, so the
-     sidebar doesn't move between Home and Docs. */
-  [data-blume-doc-grid]:has([data-blume-nav-drawer]:not(.lg\:hidden) [data-paw-sidebar]) {
+     sidebar doesn't move between pages. */
+  [data-blume-doc-grid]:has([data-paw-sidebar]) {
     max-width: 1440px;
     grid-template-columns: 232px minmax(0, 1fr);
   }
 
+  /* The changelog index is a bare page, where Blume hides the sidebar
+     column on wide screens; it gets the sidebar too. */
   [data-blume-nav-drawer]:has([data-paw-sidebar]) {
+    display: block;
     top: 0;
     height: 100dvh;
     border-inline-end: 1px dashed var(--blume-border);
@@ -101,22 +104,19 @@ a:has(.minipaw-logo) > .truncate {
   }
 
   [data-blume-nav-drawer]:has([data-paw-sidebar]) [data-blume-nav-tree],
-  [data-blume-nav-drawer]:has([data-paw-sidebar])
-    [data-blume-nav-tree]
-    > .lg\:block {
+  [data-blume-nav-drawer]:has([data-paw-sidebar]) [data-blume-nav-tree] > .lg\:block {
     height: 100%;
   }
 }
 
-/* The right rail lines up with the page title once the header is gone. */
+/* With an on-this-page rail, a third column for it, lined up with the page
+   title once the header is gone. */
 @media (min-width: 80rem) {
-  [data-blume-doc-grid]:has([data-blume-nav-drawer]:not(.lg\:hidden) [data-paw-sidebar]) {
+  [data-blume-doc-grid]:has([data-paw-sidebar]):has(> aside.xl\:block) {
     grid-template-columns: 232px minmax(0, 1fr) 17.5rem;
   }
 
-  body:has([data-blume-nav-drawer]:not(.lg\:hidden) [data-paw-sidebar])
-    [data-blume-doc-grid]
-    > aside.xl\:block {
+  [data-blume-doc-grid]:has([data-paw-sidebar]) > aside.xl\:block {
     top: 0;
     height: 100dvh;
   }
