@@ -4,14 +4,14 @@ members = ["crates/minipaw", "crates/minipaw-cli"]
 exclude = ["spike/russh-flow"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/deepso7/minipaw"
 authors = ["Deepso"]
 
 [workspace.dependencies]
-minipaw = { path = "crates/minipaw", version = "0.1.0" }
+minipaw = { path = "crates/minipaw", version = "0.1.1" }
 base64 = "0.23"
 # The buffer type russh-sftp parses packets from; already in the tree
 # through tokio.
