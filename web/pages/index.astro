@@ -158,13 +158,10 @@ const sections = [
           <span class="tag" aria-hidden="true">[ machine a ]</span>
           <div class="hero">
             <div>
-              <h1>
-                Pipe bytes, paw to paw.{" "}
-                <span class="dim">Through NATs, with no accounts, encrypted end to end.</span>
-              </h1>
+              <h1 class="pixel">pipe bytes,<br />paw to paw</h1>
               <p class="lede">
-                minipaw pipes stdin/stdout between two machines, like netcat. One side prints a
-                ticket, the other pastes it.
+                Pipe stdin/stdout between two machines. minipaw gets through NATs, needs no
+                accounts, and encrypts every byte end to end.
               </p>
 
               <div class="term">
@@ -200,7 +197,7 @@ minipaw <span class="ticket">{ticket}</span>
 
         <section class="block" id="path">
           <span class="tag" aria-hidden="true">[ section a–b ]</span>
-          <h2>the path</h2>
+          <h2 class="pixel">the path</h2>
           <p class="sub">
             Every session starts on a relay, then moves to a direct path when the hole punch
             lands. Bytes keep flowing through the switch. <a href="/docs/how-it-works">Read how it works</a>
@@ -240,7 +237,7 @@ minipaw <span class="ticket">{ticket}</span>
 
         <section class="block" id="recipes">
           <span class="tag" aria-hidden="true">[ recipes ]</span>
-          <h2>one listens, one pastes</h2>
+          <h2 class="pixel">one listens, one pastes</h2>
           <p class="sub">
             Install minipaw on both machines. One prints a ticket, the other pastes it.{" "}
             <span class="keyhint">Once you're in them, keys 1 to 4 switch recipes.</span>
@@ -306,7 +303,7 @@ minipaw <span class="ticket">{ticket}</span>
 
         <section class="block" id="spec">
           <span class="tag" aria-hidden="true">[ spec sheet ]</span>
-          <h2>small, sturdy pipe</h2>
+          <h2 class="pixel">small, sturdy pipe</h2>
           <p class="sub">What the pipe does, and how.</p>
           <dl class="specs">
             {
@@ -377,6 +374,11 @@ minipaw <span class="ticket">{ticket}</span>
   .landing a:hover {
     text-decoration-color: currentcolor;
   }
+  .pixel {
+    font-family: var(--blume-font-display-src);
+    font-weight: 600;
+    letter-spacing: 0;
+  }
   .sprite {
     image-rendering: pixelated;
   }
@@ -399,6 +401,9 @@ minipaw <span class="ticket">{ticket}</span>
   .shell {
     display: grid;
     grid-template-columns: 232px minmax(0, 1fr);
+    /* The right rail's crosshairs sit half outside it; when the rail meets
+       the window edge, they mustn't make the page scroll sideways. */
+    overflow-x: clip;
   }
   /* Blume's header gives way to the sidebar where the sidebar shows.
      visibility: hidden takes its controls out of the tab order and the
@@ -503,16 +508,33 @@ minipaw <span class="ticket">{ticket}</span>
   .content {
     min-width: 0;
   }
-  /* The content sits centred in the space beside the sidebar. */
+  /* The content sits centred in the space beside the sidebar, between two
+     dashed rails. */
   .rail {
     max-width: 1000px;
     margin: 0 auto;
+    border-right: 1px dashed var(--rule);
+    border-left: 1px dashed var(--rule);
   }
   .block {
     position: relative;
     scroll-margin-top: 1rem;
-    border-bottom: 1px solid var(--rule);
-    padding: 3.5rem 3.5rem;
+    border-bottom: 1px dashed var(--rule);
+    padding: 3.5rem 3rem;
+  }
+  /* Crosshairs where each block's rule meets the rails. */
+  .block::before,
+  .block::after {
+    position: absolute;
+    bottom: -0.7rem;
+    content: "+";
+    color: var(--blume-muted-foreground);
+  }
+  .block::before {
+    left: -0.32rem;
+  }
+  .block::after {
+    right: -0.32rem;
   }
   .tag {
     position: absolute;
@@ -531,11 +553,8 @@ minipaw <span class="ticket">{ticket}</span>
   }
   h1 {
     margin: 0 0 1.25rem;
-    text-wrap: balance;
-    font-size: 1.875rem;
-    font-weight: 500;
-    line-height: 1.15;
-    letter-spacing: -0.03em;
+    font-size: 3rem;
+    line-height: 1.02;
   }
   .lede {
     max-width: 34em;
@@ -649,10 +668,8 @@ minipaw <span class="ticket">{ticket}</span>
 
   h2 {
     margin: 0 0 0.5rem;
-    font-size: 1.375rem;
-    font-weight: 500;
-    line-height: 1.2;
-    letter-spacing: -0.02em;
+    font-size: 1.875rem;
+    line-height: 1.1;
   }
   .sub {
     max-width: 46em;
@@ -904,12 +921,19 @@ minipaw <span class="ticket">{ticket}</span>
     .index {
       display: none;
     }
+    .rail {
+      border: 0;
+    }
     .block {
       scroll-margin-top: 4rem;
       padding: 3rem 1.25rem;
     }
+    .block::before,
+    .block::after {
+      display: none;
+    }
     h1 {
-      font-size: 1.5rem;
+      font-size: 2.5rem;
     }
     .panel {
       grid-template-columns: minmax(0, 1fr);
