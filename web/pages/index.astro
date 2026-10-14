@@ -400,9 +400,11 @@ minipaw <span class="ticket">{ticket}</span>
     display: grid;
     grid-template-columns: 232px minmax(0, 1fr);
   }
-  /* Blume's header gives way to the sidebar where the sidebar shows. Kept
-     in the page (not display: none) so its search dialog, which opens in the
-     top layer, still works from the sidebar's button. */
+  /* Blume's header gives way to the sidebar where the sidebar shows.
+     visibility: hidden takes its controls out of the tab order and the
+     accessibility tree, while keeping it in the page (unlike display: none)
+     so its search dialog, which opens in the top layer and opts back in to
+     being visible, still works from the sidebar's button. */
   @media (min-width: 861px) {
     :global(body:has(.landing) [data-blume-header]) {
       position: fixed;
@@ -410,6 +412,10 @@ minipaw <span class="ticket">{ticket}</span>
       height: 1px;
       overflow: hidden;
       clip-path: inset(50%);
+      visibility: hidden;
+    }
+    :global(body:has(.landing) [data-blume-header] [data-blume-search-dialog]) {
+      visibility: visible;
     }
   }
   .index {
@@ -420,6 +426,7 @@ minipaw <span class="ticket">{ticket}</span>
     flex-direction: column;
     gap: 2rem;
     height: 100dvh;
+    overflow-y: auto;
     border-right: 1px solid var(--rule);
     padding: 1.75rem 1.5rem 1.5rem;
   }
