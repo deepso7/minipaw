@@ -396,11 +396,13 @@ minipaw <span class="ticket">{ticket}</span>
     line-height: 1.6;
   }
 
-  /* Layout: a full-height sidebar, the site's nav on this page, beside one
-     content column. The sidebar's hairline is the column's left rail. */
+  /* Layout: the sidebar, the site's nav on this page, sits right beside
+     one dashed-rail column, and the two are centred together. */
   .shell {
     display: grid;
     grid-template-columns: 232px minmax(0, 1fr);
+    max-width: 1240px;
+    margin: 0 auto;
     /* The right rail's crosshairs sit half outside it; when the rail meets
        the window edge, they mustn't make the page scroll sideways. */
     overflow-x: clip;
@@ -432,7 +434,6 @@ minipaw <span class="ticket">{ticket}</span>
     gap: 2rem;
     height: 100dvh;
     overflow-y: auto;
-    border-right: 1px solid var(--rule);
     padding: 1.75rem 1.5rem 1.5rem;
   }
   .landing .brand {
@@ -508,11 +509,9 @@ minipaw <span class="ticket">{ticket}</span>
   .content {
     min-width: 0;
   }
-  /* The content sits centred in the space beside the sidebar, between two
-     dashed rails. */
+  /* The column, between two dashed rails; its left rail divides it from
+     the sidebar. */
   .rail {
-    max-width: 1000px;
-    margin: 0 auto;
     border-right: 1px dashed var(--rule);
     border-left: 1px dashed var(--rule);
   }
