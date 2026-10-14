@@ -905,7 +905,7 @@ minipaw <span class="ticket">{ticket}</span>
     }, 2500);
   });
 
-  // Step 2's field fills `<ticket>` into B's commands. Every tab has its own
+  // B's ticket field fills `<ticket>` into B's commands. Every tab has its own
   // field, kept in step so switching tabs keeps the ticket. A
   // ticket is `mp` and URL-safe base64, so one is found inside a pasted line
   // such as `minipaw mpAQ…` or `# ssh: minipaw ssh user@mpAQ…`.
@@ -979,9 +979,9 @@ minipaw <span class="ticket">{ticket}</span>
     }
     const raw = field.value.trim();
     const ticket = raw.match(CANDIDATE)?.find(isTicket);
-    // Under the commands: step 2's note, or why the paste isn't a ticket.
+    // Under the commands: B's note, or why the paste isn't a ticket.
     for (const line of document.querySelectorAll<HTMLElement>(".recipes .fill-status")) {
-      line.textContent = raw && !ticket ? "That isn't a whole ticket. Paste the full line step 1 printed." : (line.dataset.note ?? "");
+      line.textContent = raw && !ticket ? "That isn't a whole ticket. Paste the full line A printed." : (line.dataset.note ?? "");
     }
     render(ticket);
   };
