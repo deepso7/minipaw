@@ -3,7 +3,6 @@
 // Blume's header, so the drawer needn't repeat the sidebar's site links.
 import NavTree from "blume/components/layout/NavTree.astro";
 
-import { withIndexInGettingStarted } from "./nav";
 ---
 
-<NavTree {...Astro.props} items={withIndexInGettingStarted(Astro.props.items)} />
+<NavTree {...Astro.props} />
