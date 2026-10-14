@@ -496,22 +496,16 @@ minipaw <span class="ticket">{ticket}</span>
   .content {
     min-width: 0;
   }
+  /* The content sits centred in the space beside the sidebar. */
   .rail {
     max-width: 1000px;
+    margin: 0 auto;
   }
   .block {
     position: relative;
     scroll-margin-top: 1rem;
     border-bottom: 1px solid var(--rule);
     padding: 3.5rem 3.5rem;
-  }
-  /* A crosshair where each block's rule meets the sidebar's. */
-  .block::before {
-    position: absolute;
-    bottom: -0.7rem;
-    left: -0.32rem;
-    content: "+";
-    color: var(--blume-muted-foreground);
   }
   .tag {
     position: absolute;
@@ -906,9 +900,6 @@ minipaw <span class="ticket">{ticket}</span>
     .block {
       scroll-margin-top: 4rem;
       padding: 3rem 1.25rem;
-    }
-    .block::before {
-      display: none;
     }
     h1 {
       font-size: 1.5rem;
