@@ -999,11 +999,17 @@ minipaw <span class="ticket">{ticket}</span>
 
   // The sidebar's search button opens Blume's search, whose button lives in
   // the header this page hides on wide screens.
-  document.addEventListener("click", (event) => {
-    const { target } = event;
-    if (!(target instanceof Element) || !target.closest("[data-paw-search]")) {return;}
-    document.querySelector<HTMLButtonElement>("[data-blume-search-open]")?.click();
-  });
+  // Guarded, as the docs sidebar (components/docs-sidebar.astro) registers
+  // the same listener.
+  const root = document.documentElement;
+  if (root.dataset.pawSearchReady === undefined) {
+    root.dataset.pawSearchReady = "";
+    document.addEventListener("click", (event) => {
+      const { target } = event;
+      if (!(target instanceof Element) || !target.closest("[data-paw-search]")) {return;}
+      document.querySelector<HTMLButtonElement>("[data-blume-search-open]")?.click();
+    });
+  }
 
   // Step 2's field fills `<ticket>` into B's commands. Every tab has its own
   // field, kept in step so switching tabs keeps the ticket. A

@@ -63,3 +63,49 @@ a:has(.minipaw-logo) > .truncate {
     )
     transparent;
 }
+
+/* Docs pages with a sidebar: from Blume's lg breakpoint up, the sidebar
+   (components/docs-sidebar.astro) carries the wordmark, site links and
+   search, so it runs the full height and Blume's header steps aside, as on
+   the landing page. visibility: hidden takes the header's controls out of the
+   tab order while keeping it in the page, so its search dialog, which opts
+   back in, still opens. Narrow screens keep the header and its drawer. */
+@media (min-width: 64rem) {
+  body:has([data-blume-nav-drawer]:not(.lg\:hidden) [data-paw-sidebar])
+    [data-blume-header] {
+    position: fixed;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    visibility: hidden;
+  }
+
+  body:has([data-paw-sidebar]) [data-blume-header] [data-blume-search-dialog] {
+    visibility: visible;
+  }
+
+  [data-blume-nav-drawer]:has([data-paw-sidebar]) {
+    top: 0;
+    height: 100dvh;
+    border-inline-end: 1px solid var(--blume-border);
+    padding: 1.75rem 1.5rem 1.5rem;
+  }
+
+  [data-blume-nav-drawer]:has([data-paw-sidebar]) [data-blume-nav-tree],
+  [data-blume-nav-drawer]:has([data-paw-sidebar])
+    [data-blume-nav-tree]
+    > .lg\:block {
+    height: 100%;
+  }
+}
+
+/* The right rail lines up with the page title once the header is gone. */
+@media (min-width: 80rem) {
+  body:has([data-blume-nav-drawer]:not(.lg\:hidden) [data-paw-sidebar])
+    [data-blume-doc-grid]
+    > aside.xl\:block {
+    top: 0;
+    height: 100dvh;
+  }
+}
