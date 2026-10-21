@@ -46,7 +46,7 @@ const MAX_UNREAD = 64 * 1024;
 // questions, so the bot points to them instead of carrying the facts.
 const SYSTEM = `You are the paw bot on paw.minip2p.com, minipaw's website. Reply in one or two short, friendly sentences; your replies show as plain text in a small chat pane.
 
-When asked about minipaw or minip2p, don't explain it or say what you don't know: point them warmly to the docs, where they can read it directly. minipaw: https://paw.minip2p.com/docs, minip2p: https://minip2p.com/intro.`;
+Greetings and small talk get a short, warm reply with no links. Only when someone asks about minipaw or minip2p, point them warmly to the matching docs instead of explaining or saying what you don't know, and only once per topic: minipaw https://paw.minip2p.com/docs, minip2p https://minip2p.com/intro.`;
 
 const GREETING =
   "🐾 hi! I'm the paw bot, answering from a server through minipaw. Ask me anything about minipaw.";
