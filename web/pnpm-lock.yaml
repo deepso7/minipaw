@@ -167,8 +167,8 @@ importers:
   .:
     dependencies:
       '@minip2p/web':
-        specifier: 0.10.1
-        version: 0.10.1
+        specifier: 0.10.2
+        version: 0.10.2
       blume:
         specifier: ^2.2.2
         version: 2.2.2(@emnapi/runtime@1.11.3)(@shikijs/themes@4.5.0)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(@vercel/functions@3.9.11)(csstype@3.2.3)(prettier@3.9.10)(vite@8.3.4(@types/node@22.20.5)(jiti@2.7.0)(yaml@2.9.1))(yaml@2.9.1)
@@ -689,11 +689,11 @@ packages:
     resolution: {integrity: sha512-j37dj/h6p6pots1L7pLPPNuABEEu9WP4OYg9pW1g+nYG331j0+3canE9OagtYdytYvdSAMG+2fKU5cxep6LgjA==}
     engines: {node: '>=22.12.0'}
 
-  '@minip2p/core@0.10.1':
-    resolution: {integrity: sha512-Y4jX5YsiDi2ZmAgq62y8OHAp4zWUM9MhGkWC67t8Lq4onmSiB4iFyobX+qKp6UYB4RZB++O/qPlKnna9/XBegw==}
+  '@minip2p/core@0.10.2':
+    resolution: {integrity: sha512-HTjyrro5fiFC/DFkHvliJEPMrlNNnzQN5AVIkcIvstxF7UH4CkCGRi8d2/i3/49epjwJLFPJA5nuIap6gSJnqg==}
 
-  '@minip2p/web@0.10.1':
-    resolution: {integrity: sha512-CphskjQjl0h/3TnCW03PHv+7sc7YZHF4bqHk9xMR3go9ZHqWljxdSPLvSXmvyo0QUqX4PPV7xmcTqmQaZc8egg==}
+  '@minip2p/web@0.10.2':
+    resolution: {integrity: sha512-fU8jpDL1GLHJzV+hdn/7pbE0HJFpVhbAMjpKuW1cEpxxLiKdS1rxLrlL7N6qk5/eKQOAD133GplKyexkCWBfBQ==}
 
   '@modelcontextprotocol/sdk@1.32.1':
     resolution: {integrity: sha512-2DdE+SJDtzLEEWzY1ZjY7Q+VcPhcV1KisD3zI4u0XZyktsjHum1mwbMI+JaulUBi2OZk+KJAi2uPXzxichPkdw==}
@@ -5014,11 +5014,11 @@ snapshots:
     dependencies:
       '@chevrotain/types': 13.2.0
 
-  '@minip2p/core@0.10.1': {}
+  '@minip2p/core@0.10.2': {}
 
-  '@minip2p/web@0.10.1':
+  '@minip2p/web@0.10.2':
     dependencies:
-      '@minip2p/core': 0.10.1
+      '@minip2p/core': 0.10.2
 
   '@modelcontextprotocol/sdk@1.32.1(zod@4.6.5)':
     dependencies:

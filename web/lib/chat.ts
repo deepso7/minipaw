@@ -35,8 +35,11 @@ import {
 import type { Frame } from "./wire";
 
 const RELAY_PEER = "12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf";
-/** relay.minip2p.com, the CLI's default relay, at its WebTransport address. */
-const RELAY = `/dns/relay.minip2p.com/udp/19876/quic-v1/webtransport/certhash/uEiCz1zVTXFmli1HX4TTuBJBOypwXL5THfWR7A-RSFEhWGQ/certhash/uEiDYcp9v4gYBUbvFvgf6elgDckMxoKoJGO1_oicFJiDwiw/p2p/${RELAY_PEER}`;
+/** relay.minip2p.com, the CLI's default relay, at its WebTransport address.
+ * No certhash: the relay serves a CA-signed certificate for its domain,
+ * which the browser checks as for any HTTPS page, so renewals need no
+ * change here. */
+const RELAY = `/dns/relay.minip2p.com/udp/19876/quic-v1/webtransport/p2p/${RELAY_PEER}`;
 
 /** How long to keep trying to get a stream back, as the CLI does. */
 const RESUME_TIMEOUT = 60_000;
