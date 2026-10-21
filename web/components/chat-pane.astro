@@ -460,7 +460,15 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
 
   document.addEventListener("click", (event) => {
     const { target } = event;
-    if (!(target instanceof Element) || !target.closest("[data-chat-leave]") || !chat) {return;}
+    if (!(target instanceof Element) || !target.closest("[data-chat-leave]")) {return;}
+    if (!chat) {
+      // Still loading lib/chat.ts: drop the pending connect, so it never starts.
+      if (pane()?.dataset.phase === "active") {
+        generation += 1;
+        onState({ kind: "ended", ok: true, reason: "connection cancelled" });
+      }
+      return;
+    }
     say("leaving; waiting for the other side to finish…");
     leaving = true;
     setComposing(false);
