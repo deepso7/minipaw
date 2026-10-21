@@ -241,6 +241,9 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
   import type { Ticket } from "../lib/ticket";
 
   let chat: Chat | undefined;
+  // Bumped whenever the page lets go of its chat, so a connect still loading
+  // lib/chat.ts when the visitor navigates away never starts.
+  let generation = 0;
   // The other side's current line, which its next text continues.
   let peerLine: HTMLElement | undefined;
 
@@ -387,8 +390,11 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
     $("[data-chat-log]")?.replaceChildren();
     peerLine = undefined;
     $("[data-chat-peer]")?.replaceChildren(`· peer ${short(ticket.peerId)}`);
+    generation += 1;
+    const mine = generation;
     try {
       const { startChat } = await import("../lib/chat");
+      if (mine !== generation) {return;}
       chat = startChat(ticket, { acked: onAcked, state: onState, text: onText });
     } catch (error) {
       onState({ kind: "ended", ok: false, reason: `couldn't load the chat: ${String(error)}` });
@@ -447,6 +453,10 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
 
   // Leaving the page ends the session at once, so the other side hears now
   // rather than after its 60 s resume window.
-  document.addEventListener("astro:before-swap", () => chat?.close("closed the chat page"));
-  window.addEventListener("pagehide", () => chat?.close("closed the chat page"));
+  const abandon = () => {
+    generation += 1;
+    chat?.close("closed the chat page");
+  };
+  document.addEventListener("astro:before-swap", abandon);
+  window.addEventListener("pagehide", abandon);
 </script>

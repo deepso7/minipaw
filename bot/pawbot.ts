@@ -55,9 +55,10 @@ const textOf = (message: Anthropic.Beta.BetaMessage) =>
     .trim();
 
 /** Claude's answer to the chat so far, or a line saying why there's none. */
-const reply = async (history: Anthropic.Beta.BetaMessageParam[]) => {
+const reply = async (history: Anthropic.Beta.BetaMessageParam[], signal: AbortSignal) => {
   try {
-    const message = await client.beta.messages.create({
+    const message = await client.beta.messages.create(
+      {
       betas: ["server-side-fallback-2026-07-01"],
       // On a safety decline, rerun on Anthropic's recommended fallback model.
       fallbacks: "default",
@@ -67,13 +68,19 @@ const reply = async (history: Anthropic.Beta.BetaMessageParam[]) => {
       model: MODEL,
       output_config: { effort: "low" },
       system: SYSTEM,
-    });
+      },
+      { signal }
+    );
     if (message.stop_reason === "refusal") {
       return { ok: false, text: "I'd rather not answer that one. Ask me something else?" };
     }
     const text = textOf(message);
     return text ? { ok: true, text } : { ok: false, text: "…I lost my train of thought. Try again?" };
   } catch (error) {
+    // The visitor left mid-request; nobody is waiting for an answer.
+    if (signal.aborted) {
+      return { ok: false, text: "" };
+    }
     if (error instanceof Anthropic.RateLimitError) {
       return { ok: false, text: "Lots of paws at once right now. Try again in a minute." };
     }
@@ -97,6 +104,10 @@ const serve = (socket: net.Socket) => {
   let replies = 0;
   let busy = false;
   let partial = "";
+  // Dropping a line too long to answer, up to its next newline.
+  let skipping = false;
+  // Aborted when the visitor leaves, along with any request in flight.
+  const gone = new AbortController();
 
   const write = (text: string) => {
     if (!socket.writable) {return;}
@@ -120,7 +131,10 @@ const serve = (socket: net.Socket) => {
     }
     replies += 1;
     history.push({ content: line, role: "user" });
-    const result = await reply(history);
+    const result = await reply(history, gone.signal);
+    if (gone.signal.aborted) {
+      return;
+    }
     if (result.ok) {
       history.push({ content: result.text, role: "assistant" });
     } else {
@@ -133,18 +147,20 @@ const serve = (socket: net.Socket) => {
   const drain = async () => {
     if (busy) {return;}
     busy = true;
-    for (let line = queue.shift(); line !== undefined; line = queue.shift()) {
+    for (let line = queue.shift(); line !== undefined && !gone.signal.aborted; line = queue.shift()) {
       // oxlint-disable-next-line no-await-in-loop -- a chat answers in order.
       await answer(line);
     }
     busy = false;
   };
 
+  const tooLong = () => write(`That's a long one; I read up to ${MAX_LINE} characters per message.`);
+
   const onLine = (raw: string) => {
     const line = raw.trim();
     if (line === "") {return;}
     if (line.length > MAX_LINE) {
-      write(`That's a long one; I read up to ${MAX_LINE} characters per message.`);
+      tooLong();
       return;
     }
     if (queue.length >= MAX_QUEUE) {return;}
@@ -158,13 +174,33 @@ const serve = (socket: net.Socket) => {
   socket.on("data", (chunk: string) => {
     const lines = `${partial}${chunk}`.split("\n");
     partial = lines.pop() ?? "";
-    if (partial.length > MAX_LINE * 4) {partial = "";}
+    // The first piece ends the line we were dropping.
+    if (skipping && lines.length > 0) {
+      lines.shift();
+      skipping = false;
+    }
     for (const line of lines) {onLine(line);}
+    // A line already past the limit can't come back under it: drop it all,
+    // rather than answer whatever follows its cut.
+    if (partial.length > MAX_LINE) {
+      if (!skipping) {tooLong();}
+      skipping = true;
+      partial = "";
+    }
   });
-  // The visitor left (their Fin, through minipaw): finish our side too.
-  socket.on("end", () => socket.end());
+  const leave = () => {
+    queue.length = 0;
+    gone.abort();
+  };
+  // The visitor left (their Fin, through minipaw): stop answering, and
+  // finish our side too.
+  socket.on("end", () => {
+    leave();
+    socket.end();
+  });
   socket.on("error", (error) => console.error(`[${id}] ${error.message}`));
   socket.on("close", () => {
+    leave();
     const secs = Math.round((Date.now() - started) / 1000);
     console.log(`[${id}] closed after ${secs}s, ${replies} replies (${repliesToday} today)`);
   });

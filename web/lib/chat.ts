@@ -157,6 +157,10 @@ class Session implements Chat {
     this.#on.state({ kind: "loading" });
     try {
       await initMinip2p({ wasm });
+      // Closed while the wasm loaded: no endpoint to start, or to leak.
+      if (this.#ended) {
+        return;
+      }
       this.#endpoint = Minip2p.create({
         // Streams open only on registered protocols, outbound ones too.
         protocols: [PROTOCOL],
