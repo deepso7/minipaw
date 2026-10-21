@@ -2,7 +2,10 @@
 # Runs the paw bot and `minipaw serve` in front of it. Either one exiting
 # stops both, so systemd (pawbot.service) restarts them together.
 #   run.sh          serve the bot
-#   run.sh ticket   print the bot's ticket (creating its identity on first use)
+#   run.sh ticket   print this invocation's ticket (creating its identity on
+#                   first use). Outside systemd that's under the caller's HOME,
+#                   not the service's; for the deployed bot's ticket, use the
+#                   journalctl command in README.md.
 #
 # Looks for `pawbot` beside this script and `minipaw` on PATH or beside it;
 # PAWBOT_BIN and MINIPAW_BIN override. State (the identity and the day's

@@ -28,7 +28,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now pawbot
 journalctl -u pawbot | grep -m1 'minipaw mp'    # the ticket for web/pages/index.astro
 ```
 
-The identity, and so the ticket, lives in `/var/lib/pawbot` and survives restarts and redeploys. To redeploy, copy the new `pawbot` over and `sudo systemctl restart pawbot`.
+The identity, and so the ticket, lives in `/var/lib/pawbot` and survives restarts and redeploys. To redeploy, copy the new `pawbot` over and `sudo systemctl restart pawbot`. Get the deployed bot's ticket from the journal as above: `/opt/pawbot/run.sh ticket` run by hand uses your own `$HOME`, so it makes and prints a different identity.
 
 ## Settings
 
