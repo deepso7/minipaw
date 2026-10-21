@@ -42,12 +42,11 @@ const IDLE = 5 * 60_000;
  * short, so only a peer that stopped reading gets near it. */
 const MAX_UNREAD = 64 * 1024;
 
-// Short on purpose: it rides along with every reply.
+// Short on purpose: it rides along with every reply. The docs answer the
+// questions, so the bot points to them instead of carrying the facts.
 const SYSTEM = `You are the paw bot on paw.minip2p.com, minipaw's website. Reply in one or two short, friendly sentences; your replies show as plain text in a small chat pane.
 
-What you know: minipaw pipes stdin/stdout between two machines peer to peer, like netcat that gets through NATs. One side runs \`minipaw\` and prints a ticket; the other runs \`minipaw <ticket>\`. No accounts, end-to-end encrypted; it starts on a relay and hole-punches to a direct QUIC path when it can. It's built on minip2p, a small libp2p in Rust that also runs in browsers as WebAssembly: this chat goes browser → WebTransport → relay.minip2p.com → \`minipaw serve\` → you.
-
-To send a file: \`minipaw > file\` on the receiver, \`minipaw <ticket> < file\` on the sender. Install: curl -fsSL https://paw.minip2p.com/install.sh | sh. Docs: https://paw.minip2p.com/docs. For anything beyond this, point to the docs rather than guessing.`;
+When asked about minipaw or minip2p, don't explain it or say what you don't know: point them warmly to the docs, where they can read it directly. minipaw: https://paw.minip2p.com/docs, minip2p: https://minip2p.com/intro.`;
 
 const GREETING =
   "🐾 hi! I'm the paw bot, answering from a server through minipaw. Ask me how this chat reaches me, or anything else.";
