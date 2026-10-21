@@ -5,20 +5,26 @@
 //
 // Environment: ANTHROPIC_API_KEY, and optionally PAWBOT_PORT (7777),
 // PAWBOT_MODEL (claude-opus-5-5), PAWBOT_DAILY_LIMIT (300 replies per UTC
-// day across all visitors), PAWBOT_SESSION_LIMIT (20 replies per chat).
+// day across all visitors), PAWBOT_SESSION_LIMIT (20 replies per chat), and
+// PAWBOT_STATE, a file that keeps the day's count across restarts (the
+// container sets /data/usage.json; unset, the count lives in memory only).
 
+import { readFileSync, writeFileSync } from "node:fs";
 import net from "node:net";
 
 import Anthropic from "@anthropic-ai/sdk";
 
-/** A whole-number setting, or `fallback` when it's unset or malformed: a NaN
- * limit would compare false and switch the cap off. */
-const setting = (name: string, fallback: number) => {
-  const value = Number(process.env[name]);
-  return process.env[name] !== undefined && Number.isInteger(value) && value >= 0 ? value : fallback;
+/** A whole-number setting of at least `min`, or `fallback` when it's unset,
+ * blank or malformed: a NaN limit would compare false and switch the cap off,
+ * and a blank port would read as 0. entrypoint.sh reads PAWBOT_PORT by the
+ * same rule, so both processes agree on it. */
+const setting = (name: string, fallback: number, min = 0) => {
+  const raw = process.env[name]?.trim() ?? "";
+  const value = Number(raw);
+  return /^\d+$/u.test(raw) && value >= min ? value : fallback;
 };
 
-const PORT = setting("PAWBOT_PORT", 7777);
+const PORT = setting("PAWBOT_PORT", 7777, 1);
 const MODEL = process.env.PAWBOT_MODEL ?? "claude-opus-5-5";
 const DAILY_LIMIT = setting("PAWBOT_DAILY_LIMIT", 300);
 const SESSION_LIMIT = setting("PAWBOT_SESSION_LIMIT", 20);
@@ -43,9 +49,33 @@ const GREETING =
 
 const client = new Anthropic();
 
-// Replies across all chats today, against DAILY_LIMIT.
+const STATE = process.env.PAWBOT_STATE;
+
+// Replies across all chats today, against DAILY_LIMIT. Saved to STATE on
+// every reply, so a restart or redeploy doesn't hand out a fresh budget.
 let day = "";
 let repliesToday = 0;
+
+if (STATE) {
+  try {
+    const saved: unknown = JSON.parse(readFileSync(STATE, "utf8"));
+    if (saved && typeof saved === "object" && "day" in saved && "replies" in saved) {
+      day = String(saved.day);
+      repliesToday = Number(saved.replies) || 0;
+    }
+  } catch {
+    // No count saved yet (or unreadable): start the day from zero.
+  }
+}
+
+const saveBudget = () => {
+  if (!STATE) {return;}
+  try {
+    writeFileSync(STATE, JSON.stringify({ day, replies: repliesToday }));
+  } catch (error) {
+    console.error(`state: ${String(error)}`);
+  }
+};
 
 const takeDailyBudget = () => {
   const today = new Date().toISOString().slice(0, 10);
@@ -55,6 +85,7 @@ const takeDailyBudget = () => {
   }
   if (repliesToday >= DAILY_LIMIT) {return false;}
   repliesToday += 1;
+  saveBudget();
   return true;
 };
 
@@ -225,5 +256,7 @@ const serve = (socket: net.Socket) => {
 };
 
 net.createServer(serve).listen(PORT, "127.0.0.1", () => {
-  console.log(`pawbot on 127.0.0.1:${PORT}, ${MODEL}, ${DAILY_LIMIT} replies a day`);
+  console.log(
+    `pawbot on 127.0.0.1:${PORT}, ${MODEL}, ${DAILY_LIMIT} replies a day (${repliesToday} used ${day || "today"})`
+  );
 });

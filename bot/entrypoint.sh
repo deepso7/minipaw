@@ -6,7 +6,13 @@
 set -euo pipefail
 
 identity=/data/serve.key
-port="${PAWBOT_PORT:-7777}"
+# The same rule as pawbot.ts: a blank or malformed port means the default.
+port="${PAWBOT_PORT:-}"
+port="${port//[[:space:]]/}"
+if [[ ! "$port" =~ ^[0-9]+$ ]] || ((10#$port < 1)); then
+  port=7777
+fi
+export PAWBOT_PORT="$port"
 
 if [[ "${1:-}" == ticket ]]; then
   exec minipaw ticket --identity "$identity"

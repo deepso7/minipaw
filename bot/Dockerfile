@@ -11,13 +11,20 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl \
   && rm -rf /var/lib/apt/lists/*
 # The site's installer checks the tarball against the release's SHA256SUMS.
-RUN curl -fsSL https://paw.minip2p.com/install.sh \
-  | MINIPAW_VERSION="$MINIPAW_VERSION" MINIPAW_INSTALL=/usr/local/bin sh
+# Downloaded first, so a failed fetch fails the build instead of piping
+# nothing into sh.
+RUN curl -fsSL -o /tmp/minipaw-install.sh https://paw.minip2p.com/install.sh \
+  && MINIPAW_VERSION="$MINIPAW_VERSION" MINIPAW_INSTALL=/usr/local/bin sh /tmp/minipaw-install.sh \
+  && rm /tmp/minipaw-install.sh \
+  && minipaw --version
 
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY pawbot.ts entrypoint.sh ./
+
+# The day's reply count lives beside the identity, so restarts keep it.
+ENV PAWBOT_STATE=/data/usage.json
 
 # minipaw refuses an identity in a directory others can write.
 RUN mkdir /data && chown node:node /data && chmod 700 /data
