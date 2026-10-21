@@ -93,6 +93,13 @@ const takeDailyBudget = () => {
   return true;
 };
 
+/** Control characters a reply must not carry to a terminal: C0 but tab and
+ * newline (so ESC, and with it every escape sequence), DEL, C1, and the bidi
+ * overrides that make text read differently from what it is. A visitor could
+ * talk the model into emitting them, and a CLI visitor's terminal would act
+ * on them. */
+const CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/gu;
+
 const textOf = (message: Anthropic.Message) =>
   message.content
     .flatMap((block) => (block.type === "text" ? [block.text] : []))
@@ -164,7 +171,7 @@ const serve = (socket: net.Socket) => {
       return;
     }
     // One line per line; the pane shows each as its own message.
-    socket.write(`${text.replaceAll("\r", "").replaceAll(/\n+/gu, "\n")}\n`);
+    socket.write(`${text.replaceAll(CONTROL, "").replaceAll(/\n+/gu, "\n")}\n`);
   };
 
   /** How long a closing chat waits for its last line to be read. */
