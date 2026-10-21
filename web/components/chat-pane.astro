@@ -264,6 +264,20 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
     log?.scrollTo({ top: log.scrollHeight });
   };
 
+  // The transcript keeps its last MAX_ROWS rows, and wraps the other side's
+  // lines at MAX_LINE characters, so a terminal piping output at the page
+  // can't grow it without bound.
+  const MAX_ROWS = 500;
+  const MAX_LINE = 2000;
+
+  const trim = () => {
+    const log = $("[data-chat-log]");
+    const extra = (log?.children.length ?? 0) - MAX_ROWS;
+    for (const row of [...(log?.children ?? [])].slice(0, Math.max(extra, 0))) {
+      row.remove();
+    }
+  };
+
   const append = (cls: string, who?: string) => {
     const item = document.createElement("li");
     item.className = cls;
@@ -276,6 +290,7 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
     const body = document.createElement("span");
     item.append(body);
     $("[data-chat-log]")?.append(item);
+    trim();
     scrollDown();
     return body;
   };
@@ -349,13 +364,19 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
 
   const onText = (text: string) => {
     const who = `${pane()?.dataset.peer ?? "peer"}›`;
-    for (const [i, part] of text.split("\n").entries()) {
+    for (const [i, line] of text.split("\n").entries()) {
       if (i > 0) {peerLine = undefined;}
-      if (part !== "") {
+      let rest = line;
+      while (rest !== "") {
+        const room = MAX_LINE - (peerLine?.textContent?.length ?? 0);
+        if (room <= 0) {peerLine = undefined;}
         peerLine ??= append("peer", who);
-        peerLine.textContent += part;
+        const take = Math.min(rest.length, room > 0 ? room : MAX_LINE);
+        peerLine.textContent += rest.slice(0, take);
+        rest = rest.slice(take);
       }
     }
+    trim();
     scrollDown();
   };
 
