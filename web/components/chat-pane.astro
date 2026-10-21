@@ -403,7 +403,9 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
         };
       chat = startChat(ticket, { acked: live(onAcked), state: live(onState), text: live(onText) });
     } catch (error) {
-      onState({ kind: "ended", ok: false, reason: `couldn't load the chat: ${String(error)}` });
+      if (mine === generation) {
+        onState({ kind: "ended", ok: false, reason: `couldn't load the chat: ${String(error)}` });
+      }
     }
   };
 
