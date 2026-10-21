@@ -2,10 +2,11 @@
   "compilerOptions": {
     "allowImportingTsExtensions": true,
     "erasableSyntaxOnly": true,
-    "module": "nodenext",
+    "module": "preserve",
+    "moduleResolution": "bundler",
     "noEmit": true,
     "strict": true,
-    "target": "es2024",
-    "types": ["node"]
+    "target": "esnext",
+    "types": ["bun"]
   }
 }

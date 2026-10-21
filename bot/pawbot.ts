@@ -3,11 +3,14 @@
 // It listens on loopback only; visitors reach it through minipaw and the
 // relay, so nothing here is exposed to the network.
 //
+// Runs on Bun, compiled to one executable (`bun run build`); run.sh starts it
+// beside `minipaw serve`.
+//
 // Environment: ANTHROPIC_API_KEY, and optionally PAWBOT_PORT (7777),
-// PAWBOT_MODEL (claude-opus-5-5), PAWBOT_DAILY_LIMIT (300 replies per UTC
+// PAWBOT_MODEL (claude-haiku-5-5), PAWBOT_DAILY_LIMIT (300 replies per UTC
 // day across all visitors), PAWBOT_SESSION_LIMIT (20 replies per chat), and
-// PAWBOT_STATE, a file that keeps the day's count across restarts (the
-// container sets /data/usage.json; unset, the count lives in memory only).
+// PAWBOT_STATE, a file that keeps the day's count across restarts (run.sh
+// sets one beside the identity; unset, the count lives in memory only).
 
 import { readFileSync, writeFileSync } from "node:fs";
 import net from "node:net";
@@ -16,7 +19,7 @@ import Anthropic from "@anthropic-ai/sdk";
 
 /** A whole-number setting of at least `min`, or `fallback` when it's unset,
  * blank or malformed: a NaN limit would compare false and switch the cap off,
- * and a blank port would read as 0. entrypoint.sh reads PAWBOT_PORT by the
+ * and a blank port would read as 0. run.sh reads PAWBOT_PORT by the
  * same rule, so both processes agree on it. */
 const setting = (name: string, fallback: number, min = 0) => {
   const raw = process.env[name]?.trim() ?? "";
@@ -25,7 +28,7 @@ const setting = (name: string, fallback: number, min = 0) => {
 };
 
 const PORT = setting("PAWBOT_PORT", 7777, 1);
-const MODEL = process.env.PAWBOT_MODEL ?? "claude-opus-5-5";
+const MODEL = process.env.PAWBOT_MODEL ?? "claude-haiku-5-5";
 const DAILY_LIMIT = setting("PAWBOT_DAILY_LIMIT", 300);
 const SESSION_LIMIT = setting("PAWBOT_SESSION_LIMIT", 20);
 /** Longest line we answer; the page caps its input at 500 characters too. */
@@ -39,13 +42,12 @@ const IDLE = 5 * 60_000;
  * short, so only a peer that stopped reading gets near it. */
 const MAX_UNREAD = 64 * 1024;
 
-const SYSTEM = `You are the paw bot, a small friendly bot on the minipaw website (paw.minip2p.com). Visitors reach you by pressing "say hi" on the landing page.
+// Short on purpose: it rides along with every reply.
+const SYSTEM = `You are the paw bot on paw.minip2p.com, minipaw's website. Reply in one or two short, friendly sentences; your replies show as plain text in a small chat pane.
 
-minipaw pipes stdin/stdout between two machines peer to peer, like netcat but through NATs, with no accounts and end-to-end encryption. One side runs \`minipaw\` and prints a ticket (mp…); the other runs \`minipaw <ticket>\`. It starts on a relay, hole-punches a direct QUIC path when it can, and resumes across drops for 60 s. \`minipaw serve\` keeps a stable ticket and forwards sessions to a local port (default sshd); \`minipaw ssh\` and \`minipaw cp\` use it. Install: curl -fsSL https://paw.minip2p.com/install.sh | sh (Linux and macOS), or cargo install minipaw-cli. It is built on minip2p, a small libp2p implementation in Rust.
+What you know: minipaw pipes stdin/stdout between two machines peer to peer, like netcat that gets through NATs. One side runs \`minipaw\` and prints a ticket; the other runs \`minipaw <ticket>\`. No accounts, end-to-end encrypted; it starts on a relay and hole-punches to a direct QUIC path when it can. It's built on minip2p, a small libp2p in Rust that also runs in browsers as WebAssembly: this chat goes browser → WebTransport → relay.minip2p.com → \`minipaw serve\` → you.
 
-How this very chat reaches you: the visitor's browser runs minip2p compiled to WebAssembly and dials relay.minip2p.com over WebTransport. The relay bridges a circuit to \`minipaw serve\` on your server, which forwards the session to you over local TCP. Browsers can't hole-punch, so it stays on the relay, which only sees ciphertext.
-
-Your replies show up as plain text lines in a small terminal-style chat pane. Write one to three short sentences, no Markdown, no headings or bullet lists, no code fences (inline commands are fine as plain text). Be warm and a little playful, but useful first. If you don't know something about minipaw, say so rather than guessing, and point to https://paw.minip2p.com/docs. Latency-sensitive; begin your visible answer immediately.`;
+To send a file: \`minipaw > file\` on the receiver, \`minipaw <ticket> < file\` on the sender. Install: curl -fsSL https://paw.minip2p.com/install.sh | sh. Docs: https://paw.minip2p.com/docs. For anything beyond this, point to the docs rather than guessing.`;
 
 const GREETING =
   "🐾 hi! I'm the paw bot, answering from a server through minipaw. Ask me how this chat reaches me, or anything else.";
@@ -92,29 +94,27 @@ const takeDailyBudget = () => {
   return true;
 };
 
-const textOf = (message: Anthropic.Beta.BetaMessage) =>
+const textOf = (message: Anthropic.Message) =>
   message.content
     .flatMap((block) => (block.type === "text" ? [block.text] : []))
     .join("")
     .trim();
 
 /** Claude's answer to the chat so far, or a line saying why there's none. */
-const reply = async (history: Anthropic.Beta.BetaMessageParam[], signal: AbortSignal) => {
+const reply = async (history: Anthropic.MessageParam[], signal: AbortSignal) => {
   try {
-    const message = await client.beta.messages.create(
+    const message = await client.messages.create(
       {
-      betas: ["server-side-fallback-2026-07-01"],
-      // On a safety decline, rerun on Anthropic's recommended fallback model.
-      fallbacks: "default",
-      // Short chat replies; low effort keeps them quick and cheap.
-      max_tokens: 2048,
-      messages: history,
-      model: MODEL,
-      output_config: { effort: "low" },
-      system: SYSTEM,
+        // Short chat replies; low effort keeps them quick and cheap.
+        max_tokens: 1024,
+        messages: history,
+        model: MODEL,
+        output_config: { effort: "low" },
+        system: SYSTEM,
       },
       { signal }
     );
+    // Haiku has no server-side refusal fallback, so a decline ends here.
     if (message.stop_reason === "refusal") {
       return { ok: false, text: "I'd rather not answer that one. Ask me something else?" };
     }
@@ -143,7 +143,7 @@ const serve = (socket: net.Socket) => {
   sessions += 1;
   const id = sessions;
   const started = Date.now();
-  const history: Anthropic.Beta.BetaMessageParam[] = [];
+  const history: Anthropic.MessageParam[] = [];
   const queue: string[] = [];
   let replies = 0;
   let busy = false;
