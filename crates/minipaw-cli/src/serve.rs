@@ -7,7 +7,7 @@
 //! sessions are numbered, `# [3] …`, as the SDK numbers them.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -34,6 +34,9 @@ pub struct Options<'a> {
     pub ssh: bool,
     pub authorized_keys: &'a [PathBuf],
     pub no_auth: bool,
+    /// `--send-peer-id`: start each forwarded connection with the
+    /// dialer's peer ID.
+    pub send_peer_id: bool,
 }
 
 /// Serves until Ctrl-C (exit 0); a second Ctrl-C exits 130 at once.
@@ -63,7 +66,10 @@ fn serve(options: &Options<'_>) -> Result<(), String> {
     eprintln!("# forwarding to {}", target_text(options.forward, &targets));
 
     let delay = settings.connect_delay;
-    let server = minipaw::serve(config, move |peer| connect(peer, &targets, delay));
+    let send_peer_id = options.send_peer_id;
+    let server = minipaw::serve(config, move |peer| {
+        connect(peer, &targets, delay, send_peer_id)
+    });
     run_server(server)?;
     eprintln!("# stopped");
     Ok(())
@@ -123,8 +129,15 @@ fn target_text(forward: &Forward, targets: &[SocketAddr]) -> String {
 }
 
 /// The local end of a new session: a fresh connection to the target,
-/// trying each of its addresses in turn. Runs on a worker thread.
-fn connect(peer: &PeerId, targets: &[SocketAddr], delay: Option<Duration>) -> io::Result<Io> {
+/// trying each of its addresses in turn, first told who the dialer is when
+/// `send_peer_id`. Runs on a worker thread.
+fn connect(
+    peer: &PeerId,
+    targets: &[SocketAddr],
+    delay: Option<Duration>,
+    send_peer_id: bool,
+) -> io::Result<Io> {
+    let header = peer_line(peer);
     let peer = fmt::short_peer(peer);
     if let Some(delay) = delay {
         log::debug!("test hook: waiting {delay:?} before connecting for {peer}");
@@ -134,10 +147,14 @@ fn connect(peer: &PeerId, targets: &[SocketAddr], delay: Option<Duration>) -> io
     for addr in targets {
         log::debug!("target: connecting to {addr} for {peer}");
         match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
-            Ok(stream) => {
+            Ok(mut stream) => {
                 // Interactive traffic like ssh's keystrokes must not wait
                 // for Nagle.
                 stream.set_nodelay(true)?;
+                // Ahead of anything the dialer sends, so it can't forge it.
+                if send_peer_id {
+                    stream.write_all(header.as_bytes())?;
+                }
                 log::debug!("target: connected to {addr} for {peer}");
                 return Io::tcp(stream);
             }
@@ -150,6 +167,11 @@ fn connect(peer: &PeerId, targets: &[SocketAddr], delay: Option<Duration>) -> io
     let e = last.unwrap_or_else(|| io::Error::other("no target address"));
     // The text is what the dialer is told: "server refused: <it>".
     Err(io::Error::new(e.kind(), connect_reason(&e)))
+}
+
+/// The line `--send-peer-id` starts a forwarded connection with.
+fn peer_line(peer: &PeerId) -> String {
+    format!("minipaw-peer {peer}\n")
 }
 
 /// A short reason for a failed connection to the target, without the
@@ -298,8 +320,31 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         drop(listener);
-        let e = connect(&peer(), &[addr], None).err().expect("refused");
+        let e = connect(&peer(), &[addr], None, false)
+            .err()
+            .expect("refused");
         assert_eq!(e.to_string(), "connection refused");
+    }
+
+    #[test]
+    fn the_peer_id_line_comes_first_and_only_when_asked() {
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let first_bytes = |send_peer_id| {
+            let io = connect(&peer(), &[addr], None, send_peer_id).expect("connect");
+            let (mut accepted, _) = listener.accept().expect("accept");
+            drop(io);
+            let mut got = Vec::new();
+            accepted.read_to_end(&mut got).expect("read");
+            got
+        };
+        assert_eq!(
+            first_bytes(true),
+            format!("minipaw-peer {}\n", peer()).into_bytes()
+        );
+        assert!(first_bytes(false).is_empty());
     }
 
     #[test]

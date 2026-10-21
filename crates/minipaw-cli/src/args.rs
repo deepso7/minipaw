@@ -21,7 +21,7 @@ use minipaw::{Config, Identity, Multiaddr, PeerAddr, Ticket};
 #[command(
     name = "minipaw",
     version,
-    override_usage = "minipaw [OPTIONS] [TICKET]\n       minipaw [-v] parse <TICKET>\n       minipaw [-v] ticket [--identity PATH] [--relay MULTIADDR]\n       minipaw [-v] serve [--forward HOST:PORT|PORT | --ssh [--authorized-keys PATH]... [--no-auth]] [--identity PATH] [--new] [--max-sessions N] [--relay MULTIADDR]\n       minipaw ssh [SSH OPTIONS] [USER@]TICKET [COMMAND]\n       minipaw cp [SCP OPTIONS] SOURCE... TARGET",
+    override_usage = "minipaw [OPTIONS] [TICKET]\n       minipaw [-v] parse <TICKET>\n       minipaw [-v] ticket [--identity PATH] [--relay MULTIADDR]\n       minipaw [-v] serve [--forward HOST:PORT|PORT | --ssh [--authorized-keys PATH]... [--no-auth]] [--identity PATH] [--new] [--max-sessions N] [--relay MULTIADDR] [--send-peer-id]\n       minipaw ssh [SSH OPTIONS] [USER@]TICKET [COMMAND]\n       minipaw cp [SCP OPTIONS] SOURCE... TARGET",
     after_help = "\
 Examples:
   minipaw <big.iso                 send a file; prints a ticket
@@ -193,6 +193,12 @@ pub enum Command {
         /// the ticket. Defaults to $MINIPAW_RELAY, then the built-in relay.
         #[arg(long, value_name = "MULTIADDR")]
         relay: Option<String>,
+        /// Start each forwarded connection with one line, `minipaw-peer
+        /// <PEER ID>`, before the session's bytes, so the target knows who
+        /// is connecting. The peer ID is authenticated, but anyone can
+        /// make a new one.
+        #[arg(long, conflicts_with = "ssh")]
+        send_peer_id: bool,
     },
     /// ssh to a machine running `minipaw serve`, its ticket in place of the
     /// host.
@@ -611,13 +617,14 @@ mod tests {
             ssh,
             authorized_keys,
             no_auth,
+            send_peer_id,
         }) = args.command
         else {
             panic!("not serve");
         };
         assert_eq!(forward.to_string(), "127.0.0.1:22");
         assert!(identity.is_none() && !new && relay.is_none());
-        assert!(!ssh && authorized_keys.is_empty() && !no_auth);
+        assert!(!ssh && authorized_keys.is_empty() && !no_auth && !send_peer_id);
         assert_eq!(max_sessions, minipaw::DEFAULT_MAX_SESSIONS);
 
         let argv = [
@@ -632,6 +639,7 @@ mod tests {
             "3",
             "--relay",
             RELAY,
+            "--send-peer-id",
         ];
         let args = parse(&argv).expect("serve");
         assert!(args.verbose);
@@ -641,6 +649,7 @@ mod tests {
             new,
             max_sessions,
             relay,
+            send_peer_id,
             ..
         }) = args.command
         else {
@@ -651,6 +660,7 @@ mod tests {
         assert!(new);
         assert_eq!(max_sessions, 3);
         assert_eq!(relay.as_deref(), Some(RELAY));
+        assert!(send_peer_id);
     }
 
     #[test]
@@ -697,6 +707,11 @@ mod tests {
         }
         assert_eq!(
             kind(&["serve", "--ssh", "--no-auth", "--authorized-keys", "a"]),
+            ErrorKind::ArgumentConflict
+        );
+        // There is no forwarded connection to start with the peer ID.
+        assert_eq!(
+            kind(&["serve", "--ssh", "--send-peer-id"]),
             ErrorKind::ArgumentConflict
         );
         for argv in [

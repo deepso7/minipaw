@@ -74,6 +74,9 @@ session to a local TCP port, several at once (16 by default,
 `--max-sessions N`). It defaults to sshd on `127.0.0.1:22`; `--forward
 HOST:PORT` or `--forward PORT` picks another, and `--ssh` answers with a
 built-in SSH server instead ([below](#built-in-ssh-server---ssh)).
+`--send-peer-id` starts each forwarded connection with one line,
+`minipaw-peer <PEER ID>`, so the target knows who is connecting; the peer
+ID is authenticated, but anyone can make a new one.
 
 ```console
 $ minipaw serve                             # on the machine to reach

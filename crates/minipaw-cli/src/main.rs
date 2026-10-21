@@ -49,6 +49,7 @@ fn main() -> ExitCode {
             ssh,
             authorized_keys,
             no_auth,
+            send_peer_id,
         }) => {
             ui::log::install(args.verbose, false);
             return serve::run(&serve::Options {
@@ -60,6 +61,7 @@ fn main() -> ExitCode {
                 ssh: *ssh,
                 authorized_keys,
                 no_auth: *no_auth,
+                send_peer_id: *send_peer_id,
             });
         }
         Some(Command::Ssh { args }) => return ssh::run(ssh::Tool::Ssh, args),
