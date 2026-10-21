@@ -1304,9 +1304,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "minip2p-autonat"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11115c17a6bf7f62b4530d96b9ad17244f889567642293f5226adff95f730e86"
+checksum = "13b2991f3c3248eb66e845ecc05244c1c53f08936593334b8e8d07d72c6618a3"
 dependencies = [
  "minip2p-core",
  "thiserror",
@@ -1314,13 +1314,12 @@ dependencies = [
 
 [[package]]
 name = "minip2p-circuit"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4b637c813b8711dda281cf7b07606e3017826304cd27ac907165de77079a98b"
+checksum = "48b94d9fa0f8651738f763dccc1aa1a4fa930c2fabd95a0b1b1dc631f725e1b0"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
- "minip2p-platform",
  "minip2p-secure-mux",
  "minip2p-transport",
  "thiserror",
@@ -1328,20 +1327,22 @@ dependencies = [
 
 [[package]]
 name = "minip2p-core"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91c3e3b982cbd106497b9e600280e66735d7125c03a127543579cc981993967e"
+checksum = "72a479ade03e6d54430a373e9d9e6514d340bc82aa35cc07d24bb514f2199f6e"
 dependencies = [
+ "base64ct",
  "bytes",
+ "getrandom 0.4.3",
  "minip2p-identity",
  "thiserror",
 ]
 
 [[package]]
 name = "minip2p-dcutr"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d0d37064e10e75680050bc84879d4014035b89db67edcc7ed1c17dbec6c70a9"
+checksum = "84f3c9a10a7439e1a200d930406fcd09c7103a802e850fcf3a68e09219b4f20f"
 dependencies = [
  "minip2p-core",
  "thiserror",
@@ -1349,9 +1350,9 @@ dependencies = [
 
 [[package]]
 name = "minip2p-discovery"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdc41f8e5ff31785402ce5121e839179613c869d848bc208eb8f1003d3c809a7"
+checksum = "6d8d83ed40dc56cb1daa27999b6cfbffc3bbebd76bc96aeb4483e1d2e97d318c"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
@@ -1360,9 +1361,9 @@ dependencies = [
 
 [[package]]
 name = "minip2p-identify"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8925e82795c2ac155c43d4be6aec4fec8ffc26c05f22e0b83ab067e8779dc3f7"
+checksum = "c80ee19e58545a76af6085c779bdca672c92d886d42e831b030e601bc0e2519c"
 dependencies = [
  "minip2p-core",
  "minip2p-transport",
@@ -1371,9 +1372,9 @@ dependencies = [
 
 [[package]]
 name = "minip2p-identity"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93cda31c0654d0a416739e6b9c8e53e94180be2c3132ddd6e6056597572f90d7"
+checksum = "eb28517dc85f1a10fbfe3690470291b34902cf722b2820ddfb3e7e383b154fd3"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
@@ -1385,22 +1386,23 @@ dependencies = [
 
 [[package]]
 name = "minip2p-mdns"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a89641c162425c036344aae3dad145ce91484b4b930cc5df4933fb1de237195"
+checksum = "29dfd4c1556338a0a0de2c44657a1c6985da5d2f96c0f0199489af1cb0522fa3"
 dependencies = [
  "if-addrs",
  "minip2p-core",
  "minip2p-identity",
+ "minip2p-transport",
  "socket2",
  "thiserror",
 ]
 
 [[package]]
 name = "minip2p-multistream-select"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f4c80c1d87e3f82eb170f14969d275867e502e6e70989466f1f2d7be511d219"
+checksum = "1a1d3cc7e98f30135787b3b7e1657b6602edcb53adf23817f63ebbe7648001a6"
 dependencies = [
  "minip2p-core",
  "thiserror",
@@ -1408,9 +1410,9 @@ dependencies = [
 
 [[package]]
 name = "minip2p-nat"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ebaae826712e3c0c771fc715ba100b06cd7c450880f87c34b099a910083162d"
+checksum = "d1cd4f2c336ff84a4dcdf99265f31db66d37446bca0ce49aa1c7f07355d4cb01"
 dependencies = [
  "minip2p-autonat",
  "minip2p-core",
@@ -1422,25 +1424,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "minip2p-noise"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1af56dcb9fa9438af425293c23062f3f15ae7c523a5aeb409d4011846c301d88"
-dependencies = [
- "chacha20poly1305",
- "hmac",
- "minip2p-core",
- "minip2p-identity",
- "sha2",
- "thiserror",
- "x25519-dalek",
-]
-
-[[package]]
 name = "minip2p-ping"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cfebd1e11f83935a8dd9af446c5411f3db604ae64d93311b310734e495d6751"
+checksum = "b761985eb0bc0cc74b6e6eb49de219d7ad7f60b840dd67a885d648a169637059"
 dependencies = [
  "minip2p-core",
  "minip2p-transport",
@@ -1448,20 +1435,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "minip2p-platform"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0060a5d3021940844a3b421f276aa8d8425e04d3b5675a341523c85d596602d9"
-dependencies = [
- "getrandom 0.4.3",
- "thiserror",
-]
-
-[[package]]
 name = "minip2p-pubsub"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "624d5cc6679b911bd6bcf00172d1400916ac00f219442181c7e44bd6c2215204"
+checksum = "e98c8bfe3ca871d1f4af352e16c511ff31e6a120720f65f95d7cbf5f9a3d15a2"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
@@ -1472,28 +1449,30 @@ dependencies = [
 
 [[package]]
 name = "minip2p-quic"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e93eac0a12fb7990a19edfee817df96cdab160f3251a0cfb771b793ba7082eb"
+checksum = "5b13c71ad12c854b07b725df77e35b6fa2bd25ed24d7a2db2e429058de455713"
 dependencies = [
  "bytes",
  "minip2p-core",
  "minip2p-identity",
- "minip2p-platform",
+ "minip2p-secure-mux",
  "minip2p-tls",
  "minip2p-transport",
+ "minip2p-webtransport",
  "mio",
  "quinn-proto",
  "quinn-udp",
  "rustls",
  "socket2",
+ "thiserror",
 ]
 
 [[package]]
 name = "minip2p-relay"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af0bde4aff42def13031cb68fc2977851c431106cfb7c1d2685cc1058bec6d29"
+checksum = "48982408b56941abb7e410ce453742b0420182973bd6d9ebf19dcbfdb90130e8"
 dependencies = [
  "minip2p-core",
  "thiserror",
@@ -1501,12 +1480,11 @@ dependencies = [
 
 [[package]]
 name = "minip2p-relay-server"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6c62d6aef625c447b430de6fd6c2920600a0745fe3bfaec65d8e2593f43b1e2"
+checksum = "1fcc75539ba49f7f5d5a0697749b302e312394bf486c9f2ed98024d327f0e334"
 dependencies = [
  "minip2p-core",
- "minip2p-platform",
  "minip2p-relay",
  "minip2p-swarm",
  "minip2p-transport",
@@ -1515,9 +1493,9 @@ dependencies = [
 
 [[package]]
 name = "minip2p-rs"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1def7da5e3b3dba2c15effde46f05be9082bbc2f53b0c908ca2701a49f8659c1"
+checksum = "b54a4dc5b999958e7d7382a919b096aa3910552e9a53573efe9619ee69bdb394"
 dependencies = [
  "minip2p-circuit",
  "minip2p-core",
@@ -1526,7 +1504,6 @@ dependencies = [
  "minip2p-identity",
  "minip2p-mdns",
  "minip2p-nat",
- "minip2p-platform",
  "minip2p-pubsub",
  "minip2p-quic",
  "minip2p-relay-server",
@@ -1538,45 +1515,44 @@ dependencies = [
 
 [[package]]
 name = "minip2p-secure-mux"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a159f436368cae05a7ba549eadacbe880df4b7345a0477ae3fb3fb4f09ff7cc"
+checksum = "12a25005cd8927bea9428dfd28f0f68ef1dbdf9aabac12b9f270f6f565b26e73"
 dependencies = [
+ "chacha20poly1305",
+ "hmac",
  "minip2p-core",
  "minip2p-identity",
  "minip2p-multistream-select",
- "minip2p-noise",
- "minip2p-platform",
  "minip2p-transport",
- "minip2p-yamux",
+ "sha2",
  "thiserror",
+ "x25519-dalek",
 ]
 
 [[package]]
 name = "minip2p-swarm"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0db9fa74b1cc98d0a779d19539324a9545776b55fb400d69b3187b1d4a5b2a4"
+checksum = "8b1ce3da0ed25932cb95f962a8096790f86f2f495fbb16d3944d452412512b70"
 dependencies = [
  "minip2p-core",
  "minip2p-identify",
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-ping",
- "minip2p-platform",
  "minip2p-transport",
  "thiserror",
 ]
 
 [[package]]
 name = "minip2p-tcp"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c64810a729862b1cda2b9265d760023ffc735c5a5a36f8fcd92acdb5e8b20966"
+checksum = "5779a19451f1807024c081c8b995f5bfbe735a5c610fc164cb81d948737f845a"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
- "minip2p-platform",
  "minip2p-secure-mux",
  "minip2p-transport",
  "mio",
@@ -1586,14 +1562,15 @@ dependencies = [
 
 [[package]]
 name = "minip2p-tls"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d4a7bce1ddbacc9ee0f03f1a32a9f622bc867236ef6d64af0f56189b4940d50"
+checksum = "c24ceae6eca6eacb151b5ac33bf4511fa002c99ff7ad26858760a359b5ee1e1b"
 dependencies = [
  "const-oid",
  "der",
  "ecdsa",
  "getrandom 0.4.3",
+ "hkdf",
  "minip2p-identity",
  "p256",
  "rand_core",
@@ -1606,24 +1583,25 @@ dependencies = [
 
 [[package]]
 name = "minip2p-transport"
-version = "0.8.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf26c59dea6b993650b9a13636449170dd569d5f46be4020e01a3c9f13db4f44"
+checksum = "a07cdecb94ae9d80105135af1f5c0201bfaefdc637c80bfca3fced0f3950512a"
 dependencies = [
  "minip2p-core",
- "minip2p-platform",
- "rustix",
+ "mio",
  "thiserror",
 ]
 
 [[package]]
-name = "minip2p-yamux"
-version = "0.8.0"
+name = "minip2p-webtransport"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2080db881d89e4e9259214dda7e97ce167e55456cdf3da8df20cb89e8f18d425"
+checksum = "91613e6da75d7dd246664c2c1145ab67f9eb3098f47f789c140c3983104fd1df"
 dependencies = [
  "minip2p-core",
- "minip2p-platform",
+ "minip2p-identity",
+ "minip2p-secure-mux",
+ "minip2p-transport",
  "thiserror",
 ]
 

@@ -379,7 +379,7 @@ mod tests {
     fn host(accept: impl Fn(&PeerId) -> std::io::Result<Io> + Send + Sync + 'static) -> ServeHost {
         let events = Box::new(|_| {});
         let shared = Arc::default();
-        ServeHost::new(Arc::new(accept), WaitHandle::noop(), 2, shared, events)
+        ServeHost::new(Arc::new(accept), crate::net::test_wake(), 2, shared, events)
     }
 
     /// The next result, waiting for a worker to send it.

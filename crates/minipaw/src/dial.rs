@@ -399,9 +399,9 @@ impl Client {
                 stream_id,
                 ..
             } if self.carries(&peer_id, conn_id, Some(stream_id)) => self.lose("stream closed"),
-            EndpointEvent::ConnectionClosed { peer_id, conn_id }
-                if self.carries(&peer_id, conn_id, None) =>
-            {
+            EndpointEvent::ConnectionClosed {
+                peer_id, conn_id, ..
+            } if self.carries(&peer_id, conn_id, None) => {
                 self.lose("connection closed");
             }
             EndpointEvent::ConnectionReplaced { peer_id, old, new }
@@ -526,10 +526,9 @@ impl Client {
 
     /// Drops the current stream, if any, and schedules a fresh one.
     fn lose(&mut self, reason: &str) {
-        let peer = self.peer().clone();
         match std::mem::replace(&mut self.phase, Phase::Idle { at: Instant::now() }) {
             Phase::Opening { conn, stream, .. } => {
-                if let Err(e) = self.endpoint.abandon_stream(&peer, conn, stream) {
+                if let Err(e) = self.endpoint.abandon_stream(conn, stream) {
                     log::debug!("abandon stream: {e}");
                 }
             }
