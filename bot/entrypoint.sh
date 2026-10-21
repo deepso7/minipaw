@@ -17,8 +17,17 @@ node /app/pawbot.ts &
 # dials out, to its relay reservation, so no port needs opening.
 minipaw serve --forward "127.0.0.1:$port" --identity "$identity" &
 
-trap 'kill $(jobs -p) 2>/dev/null' INT TERM
-wait -n
-status=$?
-kill $(jobs -p) 2>/dev/null || true
+# Stops whichever of the two is still running.
+stop() {
+  local pids
+  pids="$(jobs -p)"
+  if [[ -n "$pids" ]]; then
+    # shellcheck disable=SC2086 # one PID per word
+    kill $pids 2>/dev/null || true
+  fi
+}
+trap stop INT TERM
+status=0
+wait -n || status=$?
+stop
 exit "$status"

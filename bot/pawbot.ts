@@ -11,10 +11,17 @@ import net from "node:net";
 
 import Anthropic from "@anthropic-ai/sdk";
 
-const PORT = Number(process.env.PAWBOT_PORT ?? 7777);
+/** A whole-number setting, or `fallback` when it's unset or malformed: a NaN
+ * limit would compare false and switch the cap off. */
+const setting = (name: string, fallback: number) => {
+  const value = Number(process.env[name]);
+  return process.env[name] !== undefined && Number.isInteger(value) && value >= 0 ? value : fallback;
+};
+
+const PORT = setting("PAWBOT_PORT", 7777);
 const MODEL = process.env.PAWBOT_MODEL ?? "claude-opus-5-5";
-const DAILY_LIMIT = Number(process.env.PAWBOT_DAILY_LIMIT ?? 300);
-const SESSION_LIMIT = Number(process.env.PAWBOT_SESSION_LIMIT ?? 20);
+const DAILY_LIMIT = setting("PAWBOT_DAILY_LIMIT", 300);
+const SESSION_LIMIT = setting("PAWBOT_SESSION_LIMIT", 20);
 /** Longest line we answer; the page caps its input at 500 characters too. */
 const MAX_LINE = 500;
 /** Lines waiting while a reply is being written; more are dropped. */
@@ -155,11 +162,14 @@ const serve = (socket: net.Socket) => {
   const drain = async () => {
     if (busy) {return;}
     busy = true;
-    for (let line = queue.shift(); line !== undefined && !gone.signal.aborted; line = queue.shift()) {
-      // oxlint-disable-next-line no-await-in-loop -- a chat answers in order.
-      await answer(line);
+    try {
+      for (let line = queue.shift(); line !== undefined && !gone.signal.aborted; line = queue.shift()) {
+        // oxlint-disable-next-line no-await-in-loop -- a chat answers in order.
+        await answer(line);
+      }
+    } finally {
+      busy = false;
     }
-    busy = false;
   };
 
   const tooLong = () => write(`That's a long one; I read up to ${MAX_LINE} characters per message.`);

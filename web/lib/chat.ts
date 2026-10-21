@@ -184,6 +184,8 @@ class Session implements Chat {
       return;
     }
     this.#on.state({ kind: "connecting" });
+    // The resume window covers reaching the terminal, not loading the wasm.
+    this.#lostSince = Date.now();
     this.#timer = setInterval(() => this.#tick(), 1000);
     let backoff = 0;
     while (!this.#ended) {
