@@ -191,12 +191,12 @@ minipaw <span class="ticket">{ticket}</span>
           <span class="tag" aria-hidden="true">[ machine b: this browser ]</span>
           <h2 class="pixel">say hi to the paw</h2>
           <p class="sub">
-            A paw bot runs <code>minipaw serve</code> on a server. This button dials its ticket from
-            your browser, over WebTransport through the relay, the same way <code>minipaw</code>{" "}
-            would from a terminal. To chat with your own terminal instead, <a href="/chat">paste its
+            A paw bot runs <code>minipaw serve</code> on a server. Type below and your browser dials
+            its ticket over WebTransport through the relay, the same way <code>minipaw</code> would
+            from a terminal. To chat with your own terminal instead, <a href="/chat">paste its
             ticket here</a>.
           </p>
-          <ChatPane peer="paw" start="say hi" ticket={pawBot} />
+          <ChatPane peer="paw" placeholder="say hi to the paw…" ticket={pawBot} />
         </section>
 
         <section class="block" id="path">

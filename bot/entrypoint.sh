@@ -21,7 +21,10 @@ fi
 node /app/pawbot.ts &
 # Each session is forwarded to the bot over loopback; serve itself only
 # dials out, to its relay reservation, so no port needs opening.
-minipaw serve --forward "127.0.0.1:$port" --identity "$identity" &
+# The landing page connects whoever clicks into its chat box, so allow more
+# chats than serve's default 16; the bot closes idle ones after 5 minutes.
+minipaw serve --forward "127.0.0.1:$port" --identity "$identity" \
+  --max-sessions "${PAWBOT_SESSIONS:-64}" &
 
 # Stops whichever of the two is still running.
 stop() {

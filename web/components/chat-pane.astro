@@ -1,34 +1,33 @@
 ---
 // A live minipaw chat in the page: the browser dials a terminal's ticket over
 // WebTransport through the relay (lib/chat.ts, imported on connect, with its
-// 3.6 MB of wasm). With a `ticket` it talks to that one listener, such as the
-// paw bot on the landing page, behind a single button; without one, it asks
-// for a ticket to paste. One pane per page.
+// 3.6 MB of wasm). Without a `ticket` it asks for one to paste. With one, such
+// as the paw bot's on the landing page, the chat box is there from the start:
+// focusing it loads minip2p and connects, and anything sent before the
+// connection is up goes out once it is. One pane per page.
 interface Props {
-  /** A fixed ticket to connect to; omit to have the visitor paste one. */
+  /** A fixed ticket to chat with; omit to have the visitor paste one. */
   ticket?: string;
-  /** The button that starts a fixed-ticket chat. */
-  start?: string;
   /** How the other side's lines are labelled. */
   peer?: string;
+  /** The message box's placeholder. */
+  placeholder?: string;
 }
 
-const { peer = "peer", start = "connect", ticket } = Astro.props;
+const { peer = "peer", placeholder, ticket } = Astro.props;
 const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the first time.";
+const autoNote =
+  "Click into the box below to connect: that loads minip2p (about 3.6 MB of WebAssembly) and dials it through the relay.";
 ---
 
-<div class="chat-pane" data-chat data-peer={peer} data-phase="idle" data-ticket={ticket}>
-  <!-- data-astro-reload keeps the client router from treating a submit as a
-       navigation, which would swap the page out from under the session; the
-       script handles both forms. -->
-  <form class="connect" data-astro-reload data-chat-connect>
-    {
-      ticket ? (
-        <button class="btn" data-chat-go type="submit">
-          {start}
-        </button>
-      ) : (
-        <>
+<div class="chat-pane" data-auto={ticket ? "" : undefined} data-chat data-peer={peer} data-phase="idle" data-ticket={ticket}>
+  {
+    !ticket && (
+      <>
+        <!-- data-astro-reload keeps the client router from treating a submit
+             as a navigation, which would swap the page out from under the
+             session; the script handles both forms. -->
+        <form class="connect" data-astro-reload data-chat-connect>
           <input
             aria-describedby="chat-ticket-note"
             aria-label="Ticket from the terminal"
@@ -40,15 +39,15 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
             type="text"
           />
           <button class="btn" data-chat-go disabled type="submit">
-            {start}
+            connect
           </button>
-        </>
-      )
-    }
-  </form>
-  <p class="note" aria-live="polite" data-chat-ticket-note data-note={loadNote} id="chat-ticket-note">
-    {loadNote}
-  </p>
+        </form>
+        <p class="note" aria-live="polite" data-chat-ticket-note data-note={loadNote} id="chat-ticket-note">
+          {loadNote}
+        </p>
+      </>
+    )
+  }
 
   <div class="session">
     <!-- The CLI's status line, live. -->
@@ -57,7 +56,9 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
       <span><span data-chat-dot>○</span> <b data-chat-state>not connected</b></span>
       <span class="dim wide" data-chat-peer></span>
     </div>
-    <ol aria-label="Chat" aria-live="polite" class="log" data-chat-log></ol>
+    <ol aria-label="Chat" aria-live="polite" class="log" data-chat-log>
+      {ticket && <li class="sys">{autoNote}</li>}
+    </ol>
     <form class="compose" data-astro-reload data-chat-compose>
       <span aria-hidden="true" class="dim">you›</span>
       <input
@@ -65,13 +66,14 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
         autocomplete="off"
         class="line"
         data-chat-message
-        disabled
+        disabled={!ticket}
         enterkeyhint="send"
         maxlength="500"
+        placeholder={placeholder}
         type="text"
       />
-      <button class="btn" data-chat-send disabled type="submit">send</button>
-      <button class="btn ghost" data-chat-leave type="button">leave</button>
+      <button class="btn" data-chat-send disabled={!ticket} type="submit">send</button>
+      {!ticket && <button class="btn ghost" data-chat-leave type="button">leave</button>}
     </form>
   </div>
 </div>
@@ -157,6 +159,17 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
   }
   [data-phase="ended"] .compose {
     display: none;
+  }
+  /* A fixed-ticket pane is a chat box from the start, and stays one: typing
+     after a chat ends starts the next. */
+  [data-auto] .session {
+    display: block;
+  }
+  [data-auto][data-phase="ended"] .compose {
+    display: flex;
+  }
+  .line::placeholder {
+    color: var(--blume-muted-foreground);
   }
   .status {
     display: flex;
@@ -246,11 +259,17 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
   let generation = 0;
   // Leave was pressed: a resume after it must not reopen the message box.
   let leaving = false;
+  // Lines sent in a fixed-ticket pane while lib/chat.ts is still loading,
+  // with their rows: they go out once the session exists.
+  let pending: { text: string; item: HTMLElement }[] = [];
   // The other side's current line, which its next text continues.
   let peerLine: HTMLElement | undefined;
 
   const $ = <T extends Element>(selector: string) => document.querySelector<T>(selector);
   const pane = () => $<HTMLElement>("[data-chat]");
+  // A fixed-ticket pane: the message box works before, during and after a
+  // session, and using it is what connects.
+  const isAuto = () => pane()?.dataset.auto !== undefined;
 
   const setPhase = (phase: string) => {
     const root = pane();
@@ -314,6 +333,7 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
   };
 
   const setComposing = (on: boolean) => {
+    if (isAuto()) {return;}
     for (const el of document.querySelectorAll<HTMLInputElement | HTMLButtonElement>(
       "[data-chat-message], [data-chat-send]"
     )) {
@@ -351,7 +371,9 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
         say(state.reason, state.ok ? "" : "bad");
         setComposing(false);
         chat = undefined;
+        pending = [];
         setPhase("ended");
+        if (isAuto()) {say("type to start a new chat");}
         const go = $<HTMLButtonElement>("[data-chat-go]");
         if (go) {go.disabled = false;}
         break;
@@ -384,6 +406,8 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
   // has written that far, the line is on its screen.
   const onAcked = (offset: number) => {
     for (const item of document.querySelectorAll<HTMLElement>(".log .you:not(.delivered)")) {
+      // Not handed to the session yet (or refused): nothing to confirm.
+      if (item.dataset.end === undefined) {continue;}
       if (Number(item.dataset.end) > offset) {break;}
       item.classList.add("delivered");
       const tick = item.querySelector(".tick");
@@ -407,10 +431,35 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
     return problem ? undefined : found?.ticket;
   };
 
+  // Our line's row, with the "…" that becomes ✓ once it's printed.
+  const ourLine = (text: string) => {
+    peerLine = undefined;
+    const body = append("you", "you›");
+    body.textContent = text;
+    const item = body.parentElement ?? body;
+    const tick = document.createElement("span");
+    tick.className = "tick";
+    tick.textContent = "…";
+    tick.title = "✓ once the other side has printed it";
+    item.append(tick);
+    return item;
+  };
+
+  // Records where the session put a line, or that it didn't take it.
+  const queue = (item: HTMLElement, end: number | undefined) => {
+    if (end === undefined) {
+      const tick = item.querySelector(".tick");
+      if (tick) {tick.textContent = "not sent";}
+      return;
+    }
+    item.dataset.end = String(end);
+  };
+
   const connect = async (ticket: Ticket) => {
     $<HTMLButtonElement>("[data-chat-go]")?.setAttribute("disabled", "");
     setPhase("active");
-    $("[data-chat-log]")?.replaceChildren();
+    // A fixed-ticket pane keeps its transcript across chats.
+    if (!isAuto()) {$("[data-chat-log]")?.replaceChildren();}
     peerLine = undefined;
     $("[data-chat-peer]")?.replaceChildren(`· peer ${short(ticket.peerId)}`);
     generation += 1;
@@ -426,6 +475,9 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
           if (mine === generation) {handler(value);}
         };
       chat = startChat(ticket, { acked: live(onAcked), state: live(onState), text: live(onText) });
+      // The session buffers what it's given until its stream is up.
+      for (const { text, item } of pending) {queue(item, chat.send(`${text}\n`));}
+      pending = [];
     } catch (error) {
       if (mine === generation) {
         onState({ kind: "ended", ok: false, reason: `couldn't load the chat: ${String(error)}` });
@@ -433,10 +485,25 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
     }
   };
 
+  // Starts a fixed-ticket pane's session, unless one is already starting.
+  const autoConnect = () => {
+    const fixed = pane()?.dataset.ticket;
+    const ticket = fixed ? parseTicket(fixed) : undefined;
+    if (ticket && !chat && pane()?.dataset.phase !== "active") {void connect(ticket);}
+  };
+
   const send = () => {
     const input = $<HTMLInputElement>("[data-chat-message]");
-    if (!chat || !input || input.value === "") {return;}
+    if (!input || input.value === "") {return;}
     const text = input.value;
+    if (!chat) {
+      // A fixed-ticket pane takes the line now and sends it once connected.
+      if (!isAuto()) {return;}
+      input.value = "";
+      pending.push({ item: ourLine(text), text });
+      autoConnect();
+      return;
+    }
     // A terminal reads lines, so each message is one.
     const end = chat.send(`${text}\n`);
     if (end === undefined) {
@@ -444,19 +511,15 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
       return;
     }
     input.value = "";
-    peerLine = undefined;
-    const body = append("you", "you›");
-    body.textContent = text;
-    const item = body.parentElement;
-    if (item) {
-      item.dataset.end = String(end);
-      const tick = document.createElement("span");
-      tick.className = "tick";
-      tick.textContent = "…";
-      tick.title = "✓ once the other side has printed it";
-      item.append(tick);
-    }
+    queue(ourLine(text), end);
   };
+
+  // Clicking into a fixed-ticket pane's box connects, so the bot is likely
+  // there by the time the first line is typed.
+  document.addEventListener("focusin", (event) => {
+    const { target } = event;
+    if (target instanceof HTMLInputElement && target.matches("[data-chat-message]") && isAuto()) {autoConnect();}
+  });
 
   document.addEventListener("input", (event) => {
     const { target } = event;

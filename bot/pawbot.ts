@@ -32,6 +32,9 @@ const SESSION_LIMIT = setting("PAWBOT_SESSION_LIMIT", 20);
 const MAX_LINE = 500;
 /** Lines waiting while a reply is being written; more are dropped. */
 const MAX_QUEUE = 3;
+/** A chat with no traffic either way this long is closed, so a tab left
+ * open doesn't hold one of serve's session slots. */
+const IDLE = 5 * 60_000;
 /** Output a visitor hasn't read yet before we hang up on them. Replies are
  * short, so only a peer that stopped reading gets near it. */
 const MAX_UNREAD = 64 * 1024;
@@ -219,6 +222,7 @@ const serve = (socket: net.Socket) => {
 
   console.log(`[${id}] connected`);
   socket.setEncoding("utf8");
+  socket.setTimeout(IDLE, () => finish("I'm dozing off after 5 quiet minutes. Type again to wake me. 🐾"));
   write(GREETING);
   socket.on("data", (chunk: string) => {
     const lines = `${partial}${chunk}`.split("\n");
