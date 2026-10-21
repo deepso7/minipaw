@@ -23,7 +23,7 @@ getrandom = "0.4"
 # tree through minip2p.
 hkdf = "0.13"
 log = "0.4"
-minip2p-rs = { version = "0.8.0", features = ["nat"] }
+minip2p-rs = { version = "0.10.1", features = ["nat"] }
 # PTYs for `serve --ssh`: a non-blocking master registered with tokio, and a
 # Command that does setsid and TIOCSCTTY itself, so no unsafe here.
 pty-process = { version = "0.5", features = ["async"] }

@@ -86,8 +86,8 @@ pub fn is_direct(endpoint: &Endpoint, peer: &minip2p::PeerId) -> bool {
 
 pub fn path_name(path: &Path) -> &'static str {
     match path {
-        Path::DirectDialed => "direct",
-        Path::DirectPunched => "direct (hole-punched)",
+        Path::Direct => "direct",
+        Path::Punched => "direct (hole-punched)",
         Path::Relayed { .. } => "relayed",
         _ => "unknown",
     }
@@ -101,8 +101,12 @@ pub fn log_event(event: &EndpointEvent) {
         EndpointEvent::ConnectionEstablished { peer_id, conn_id } => {
             log::debug!("connected to {peer_id} ({conn_id:?})");
         }
-        EndpointEvent::ConnectionClosed { peer_id, conn_id } => {
-            log::debug!("disconnected from {peer_id} ({conn_id:?})");
+        EndpointEvent::ConnectionClosed {
+            peer_id,
+            conn_id,
+            reason,
+        } => {
+            log::debug!("disconnected from {peer_id} ({conn_id:?}): {reason:?}");
         }
         EndpointEvent::ConnectionReplaced { peer_id, old, new } => {
             log::debug!("connection to {peer_id} replaced ({old:?} -> {new:?})");
@@ -151,7 +155,7 @@ fn flush(endpoint: &mut Endpoint) {
 /// Flushes, then closes the endpoint.
 pub fn close(mut endpoint: Endpoint) {
     flush(&mut endpoint);
-    if let Err(e) = endpoint.close() {
+    for e in endpoint.close().errors {
         log::debug!("close endpoint: {e}");
     }
 }
@@ -505,4 +509,17 @@ fn abort(
         }
     }
     close(endpoint);
+}
+
+/// A wait handle for tests that need one but no peer: `WaitHandle` has
+/// no public constructor, so it comes from a loopback endpoint that is then
+/// dropped, and interrupting it does nothing.
+#[cfg(test)]
+pub fn test_wake() -> minip2p::WaitHandle {
+    Endpoint::builder()
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("listen address")
+        .bind()
+        .expect("bind endpoint")
+        .wait_handle()
 }

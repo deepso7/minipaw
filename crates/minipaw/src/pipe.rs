@@ -145,7 +145,7 @@ impl Link {
         self.flush(endpoint)?;
         let data = Bytes::from(frame.encode());
         let len = data.len();
-        match endpoint.send_stream(&self.peer, self.conn, self.stream, data) {
+        match endpoint.send_stream(self.conn, self.stream, data) {
             Ok(()) => {}
             Err(Error::Full { unsent, .. }) => {
                 let full = self.block();
@@ -166,7 +166,7 @@ impl Link {
         if data.is_empty() {
             return Ok(());
         }
-        match endpoint.send_stream(&self.peer, self.conn, self.stream, data) {
+        match endpoint.send_stream(self.conn, self.stream, data) {
             Ok(()) => Ok(()),
             Err(Error::Full { unsent, .. }) => {
                 *self.unsent.borrow_mut() = unsent;
@@ -187,7 +187,7 @@ impl Link {
                 self.unsent.borrow().len()
             );
         }
-        if let Err(e) = endpoint.close_stream_write(&self.peer, self.conn, self.stream) {
+        if let Err(e) = endpoint.close_stream_write(self.conn, self.stream) {
             log::debug!("close stream: {e}");
         }
     }
@@ -202,7 +202,7 @@ impl Link {
 
     /// Drops the stream and any events still buffered for it.
     pub fn abandon(self, endpoint: &mut Endpoint) {
-        if let Err(e) = endpoint.abandon_stream(&self.peer, self.conn, self.stream) {
+        if let Err(e) = endpoint.abandon_stream(self.conn, self.stream) {
             log::debug!("abandon stream {}: {e}", self.stream);
         }
     }
@@ -751,7 +751,7 @@ mod tests {
     }
 
     fn pipe(io: Io) -> Pipe {
-        Pipe::new(&WaitHandle::new(|| {}), io, Arc::default())
+        Pipe::new(&crate::net::test_wake(), io, Arc::default())
     }
 
     #[test]

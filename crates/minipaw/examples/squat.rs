@@ -193,7 +193,7 @@ fn talk(
                         recv: 0,
                         resume: false,
                     };
-                    endpoint.send_stream(&peer, conn_id, stream_id, hello.encode())?;
+                    endpoint.send_stream(conn_id, stream_id, hello.encode())?;
                     session = Some((conn_id, stream_id));
                 } else if let Some((conn, stream)) = session
                     && leaving
@@ -202,8 +202,8 @@ fn talk(
                     // The second stream is up and says nothing; now end the
                     // session, as a client does on a stop.
                     let bye = Frame::Error("leaving".into()).encode();
-                    endpoint.send_stream(&peer, conn, stream, bye)?;
-                    endpoint.close_stream_write(&peer, conn, stream)?;
+                    endpoint.send_stream(conn, stream, bye)?;
+                    endpoint.close_stream_write(conn, stream)?;
                     ended = Some(Instant::now());
                 }
             }
@@ -257,10 +257,7 @@ fn talk(
         match (hold, welcomed) {
             (None, _) => {
                 // A full send buffer is fine: more goes out next time.
-                if endpoint
-                    .send_stream(&peer, conn, stream, chunk.clone())
-                    .is_ok()
-                {
+                if endpoint.send_stream(conn, stream, chunk.clone()).is_ok() {
                     sent += wire::MAX_DATA;
                 }
             }
@@ -271,7 +268,7 @@ fn talk(
             }
             (Some(_), Some(_)) if !leaving && Instant::now() >= ping_at => {
                 // Keeps the session's stream alive meanwhile.
-                let _ = endpoint.send_stream(&peer, conn, stream, Frame::Ping.encode());
+                let _ = endpoint.send_stream(conn, stream, Frame::Ping.encode());
                 ping_at = Instant::now() + Duration::from_secs(2);
             }
             _ => {}

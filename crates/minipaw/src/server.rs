@@ -361,7 +361,7 @@ impl<H: Host> ServerCore<H> {
                 self.lost = self.announced;
                 self.host.server_event(Event::ReservationLost);
             }
-            EndpointEvent::Nat(NatEvent::InboundDirectUpgrade { peer }) => {
+            EndpointEvent::Nat(NatEvent::InboundDirectUpgrade { peer, .. }) => {
                 for ((p, _), slot) in &mut self.sessions {
                     if let State::Running(live) = &mut slot.state
                         && *p == peer
@@ -450,7 +450,9 @@ impl<H: Host> ServerCore<H> {
                     self.drop_link(&key, false, "stream closed");
                 }
             }
-            EndpointEvent::ConnectionClosed { peer_id, conn_id } => {
+            EndpointEvent::ConnectionClosed {
+                peer_id, conn_id, ..
+            } => {
                 // Gone altogether: a new connection starts a new deadline.
                 self.admission.remove(&peer_id);
                 self.drop_conn(&peer_id, conn_id, false);
