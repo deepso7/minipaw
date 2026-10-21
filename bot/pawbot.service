@@ -1,0 +1,20 @@
+# The paw bot as a systemd service: run.sh, with pawbot and minipaw beside it
+# in /opt/pawbot, state in /var/lib/pawbot, and the API key in
+# /etc/pawbot.env (ANTHROPIC_API_KEY=…, mode 600). See README.md.
+[Unit]
+Description=minipaw paw bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/opt/pawbot/run.sh
+EnvironmentFile=/etc/pawbot.env
+DynamicUser=yes
+StateDirectory=pawbot
+StateDirectoryMode=0700
+Environment=HOME=/var/lib/pawbot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

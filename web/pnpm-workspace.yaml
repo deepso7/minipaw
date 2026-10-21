@@ -1,3 +1,6 @@
 allowBuilds:
   esbuild: true
   "@scarf/scarf": false
+minimumReleaseAgeExclude:
+  - "@minip2p/core@0.10.1"
+  - "@minip2p/web@0.10.1"

@@ -11,6 +11,7 @@
     "fix": "ultracite fix"
   },
   "dependencies": {
+    "@minip2p/web": "0.10.1",
     "blume": "^2.2.2"
   },
   "devDependencies": {
