@@ -19,6 +19,9 @@ const SESSION_LIMIT = Number(process.env.PAWBOT_SESSION_LIMIT ?? 20);
 const MAX_LINE = 500;
 /** Lines waiting while a reply is being written; more are dropped. */
 const MAX_QUEUE = 3;
+/** Output a visitor hasn't read yet before we hang up on them. Replies are
+ * short, so only a peer that stopped reading gets near it. */
+const MAX_UNREAD = 64 * 1024;
 
 const SYSTEM = `You are the paw bot, a small friendly bot on the minipaw website (paw.minip2p.com). Visitors reach you by pressing "say hi" on the landing page.
 
@@ -111,6 +114,11 @@ const serve = (socket: net.Socket) => {
 
   const write = (text: string) => {
     if (!socket.writable) {return;}
+    if (socket.writableLength > MAX_UNREAD) {
+      console.log(`[${id}] not reading; hanging up`);
+      socket.destroy();
+      return;
+    }
     // One line per line; the pane shows each as its own message.
     socket.write(`${text.replaceAll("\r", "").replaceAll(/\n+/gu, "\n")}\n`);
   };

@@ -46,6 +46,10 @@ const PING_INTERVAL = 5000;
 /** A stream silent this long is dead, even if nothing said so. */
 const DEAD_AFTER = 20_000;
 const MAX_BACKOFF = 2000;
+/** Unacknowledged bytes we hold before refusing more. A chat never gets
+ * near it unless the terminal stalls; it keeps every write under the
+ * stream's 256 KiB buffer and far under the terminal's 4 MiB window. */
+const MAX_UNACKED = 128 * 1024;
 /** How long the last ack or Error gets to leave before the endpoint closes. */
 const LINGER = 2000;
 
@@ -65,8 +69,10 @@ export interface ChatHandlers {
 }
 
 export interface Chat {
-  /** Sends `text` and returns the session offset just past it. */
-  send: (text: string) => number;
+  /** Sends `text` and returns the session offset just past it, or
+   * undefined when it isn't taken: after leaving, or while the terminal is
+   * too far behind. */
+  send: (text: string) => number | undefined;
   /** Finishes our side; the session ends once the terminal's side has too. */
   leave: () => void;
   /** Ends at once, telling the terminal why. */
@@ -123,9 +129,12 @@ class Session implements Chat {
 
   send(text: string) {
     if (this.#eof || this.#ended) {
-      return this.#end;
+      return;
     }
     const bytes = new TextEncoder().encode(text);
+    if (this.#unacked.length + bytes.length > MAX_UNACKED) {
+      return;
+    }
     const unacked = new Uint8Array(this.#unacked.length + bytes.length);
     unacked.set(this.#unacked);
     unacked.set(bytes, this.#unacked.length);

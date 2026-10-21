@@ -244,6 +244,8 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
   // Bumped whenever the page lets go of its chat, so a connect still loading
   // lib/chat.ts when the visitor navigates away never starts.
   let generation = 0;
+  // Leave was pressed: a resume after it must not reopen the message box.
+  let leaving = false;
   // The other side's current line, which its next text continues.
   let peerLine: HTMLElement | undefined;
 
@@ -320,7 +322,7 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
       case "up": {
         status(state.resumed ? "connected (resumed)" : "connected", "up");
         say(state.resumed ? "resumed" : "connected via relay", "ok");
-        setComposing(true);
+        setComposing(!leaving);
         break;
       }
       case "reconnecting": {
@@ -391,6 +393,7 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
     peerLine = undefined;
     $("[data-chat-peer]")?.replaceChildren(`· peer ${short(ticket.peerId)}`);
     generation += 1;
+    leaving = false;
     const mine = generation;
     try {
       const { startChat } = await import("../lib/chat");
@@ -413,9 +416,13 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
     const input = $<HTMLInputElement>("[data-chat-message]");
     if (!chat || !input || input.value === "") {return;}
     const text = input.value;
-    input.value = "";
     // A terminal reads lines, so each message is one.
     const end = chat.send(`${text}\n`);
+    if (end === undefined) {
+      say("not sent: the other side isn't keeping up. Try again in a moment.", "bad");
+      return;
+    }
+    input.value = "";
     peerLine = undefined;
     const body = append("you", "you›");
     body.textContent = text;
@@ -455,6 +462,7 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
     const { target } = event;
     if (!(target instanceof Element) || !target.closest("[data-chat-leave]") || !chat) {return;}
     say("leaving; waiting for the other side to finish…");
+    leaving = true;
     setComposing(false);
     chat.leave();
   });
@@ -464,6 +472,12 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
   const abandon = () => {
     generation += 1;
     chat?.close("closed the chat page");
+    // The session's own "ended" is dropped with its generation, so end the
+    // pane here: a page restored from the back/forward cache can connect
+    // again.
+    if (pane()?.dataset.phase === "active") {
+      onState({ kind: "ended", ok: true, reason: "closed when you left the page" });
+    }
     chat = undefined;
   };
   document.addEventListener("astro:before-swap", abandon);
