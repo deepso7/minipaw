@@ -1,0 +1,158 @@
+---
+import PageLayout from "blume/components/layout/PageLayout.astro";
+import data from "blume:data";
+
+import ChatPane from "../components/chat-pane.astro";
+import SiteFooter from "../components/site-footer.astro";
+import SiteSidebar from "../components/site-sidebar.astro";
+
+const { config } = data;
+const description =
+  "Chat with a minipaw running in a terminal, from this browser: paste its ticket and type. Peer to peer over the relay, end to end encrypted.";
+---
+
+<PageLayout
+  site={{ title: config.title, description: config.description }}
+  logo={config.logo}
+  banner={config.banner}
+  analytics={config.analytics}
+  navigation={data.navigation}
+  favicon={config.favicon}
+  appleIcon={config.appleIcon}
+  fontCssVars={data.fontCssVars}
+  themeMode={config.theme.mode}
+  searchEnabled={config.search.enabled}
+  siteUrl={config.site}
+  ogEnabled={config.og.enabled}
+  ogImage="/opengraph-image.png"
+  ogImageAlt="minipaw: pipe bytes, paw to paw"
+  ogImageSize={{ width: 1200, height: 630 }}
+  structuredDataEnabled={config.structuredData}
+  page={{ title: "Chat from the browser", description }}
+>
+  <div class="chat-page">
+    <div class="shell">
+      <aside class="index">
+        <SiteSidebar currentRoute="/chat" />
+      </aside>
+
+      <div class="rail">
+        <section class="block">
+          <span class="tag" aria-hidden="true">[ machine b: this browser ]</span>
+          <h1 class="pixel">chat, paw to browser</h1>
+          <p class="sub">
+            Run <code>minipaw</code> in a terminal and paste the ticket it prints. This page connects
+            to it through the relay over WebTransport, and whatever either side types shows up on
+            the other.
+          </p>
+
+          <ChatPane />
+
+          <p class="fine dim">
+            The ticket works like a password, and stays on this page. Browsers can't hole-punch, so
+            the chat stays on the relay, which only ever sees ciphertext. A ✓ means the terminal
+            has printed your line.
+          </p>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <SiteFooter slot="footer" />
+</PageLayout>
+
+<style>
+  /* The landing page's frame and inks (pages/index.astro), trimmed to what
+     this page uses. */
+  .chat-page {
+    --rule: var(--blume-border);
+    font-size: 13.5px;
+    line-height: 1.6;
+  }
+  @media (min-width: 861px) {
+    :global(body:has(.chat-page) [data-blume-header]) {
+      position: fixed;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      visibility: hidden;
+    }
+    :global(body:has(.chat-page) [data-blume-header] [data-blume-search-dialog]) {
+      visibility: visible;
+    }
+  }
+  .shell {
+    display: grid;
+    grid-template-columns: 232px minmax(0, 1fr);
+    max-width: 1440px;
+    min-height: calc(100dvh - 2.75rem);
+    margin: 0 auto;
+  }
+  .index {
+    position: sticky;
+    top: 0;
+    align-self: start;
+    height: 100dvh;
+    overflow-y: auto;
+    padding: 1.75rem 1.5rem 1.5rem;
+  }
+  .rail {
+    min-width: 0;
+    border-right: 1px dashed var(--rule);
+    border-left: 1px dashed var(--rule);
+  }
+  .block {
+    position: relative;
+    display: grid;
+    gap: 1rem;
+    align-content: start;
+    padding: 3.5rem 3rem;
+  }
+  .tag {
+    position: absolute;
+    top: 1rem;
+    right: 1.25rem;
+    font-size: 11.5px;
+    color: var(--blume-muted-foreground);
+  }
+  .pixel {
+    font-family: var(--blume-font-display-src);
+    font-weight: 600;
+    letter-spacing: 0;
+  }
+  h1 {
+    margin: 0;
+    font-size: 2.5rem;
+    line-height: 1.02;
+  }
+  .sub {
+    max-width: 40em;
+    margin: 0;
+  }
+  .dim {
+    color: var(--blume-muted-foreground);
+  }
+  .fine {
+    max-width: 48em;
+    margin: 0;
+    font-size: 12px;
+  }
+  @media (max-width: 860px) {
+    .shell {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .index {
+      display: none;
+    }
+    .rail {
+      border: 0;
+    }
+    .block {
+      padding: 3rem 1.25rem;
+    }
+    h1 {
+      font-size: 2rem;
+    }
+  }
+</style>

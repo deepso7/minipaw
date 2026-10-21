@@ -2,6 +2,7 @@
 import PageLayout from "blume/components/layout/PageLayout.astro";
 import data from "blume:data";
 
+import ChatPane from "../components/chat-pane.astro";
 import Command from "../components/command.astro";
 import SiteFooter from "../components/site-footer.astro";
 import SiteSidebar from "../components/site-sidebar.astro";
@@ -39,7 +40,12 @@ const recipes = [
   },
   {
     a: { cmd: "minipaw", note: "Prints a ticket and waits.", title: "on machine A" },
-    b: { cmd: "minipaw <ticket>", note: "Then type on either side.", title: "on machine B" },
+    b: {
+      cmd: "minipaw <ticket>",
+      link: { href: "/chat", label: "Or chat from this browser" },
+      note: "Then type on either side.",
+      title: "on machine B",
+    },
     id: "chat",
     tab: "chat",
   },
@@ -91,8 +97,14 @@ const specs = [
   },
 ];
 
+// The paw bot's ticket: `minipaw serve` on the relay's host, forwarding each
+// session to a Claude-backed bot (bot/ in this repo). Public on purpose: it
+// reaches only the bot.
+const pawBot = "mpAQDLrZ5HqHPG9mHjnY8mETMHJgAkCAESILgChs4eNpkr7sbxx3TuWQmm_VqXdE3Uq3Veiny5jUwc";
+
 const sections = [
   { href: "#install", label: "Install" },
+  { href: "#try", label: "Try it" },
   { href: "#path", label: "The path" },
   { href: "#recipes", label: "Recipes" },
   { href: "#spec", label: "Spec sheet" },
@@ -173,6 +185,18 @@ minipaw <span class="ticket">{ticket}</span>
               <span class="call r two">resume window<br /><b>60 s</b></span>
             </div>
           </div>
+        </section>
+
+        <section class="block" id="try">
+          <span class="tag" aria-hidden="true">[ machine b: this browser ]</span>
+          <h2 class="pixel">say hi to the paw</h2>
+          <p class="sub">
+            A paw bot runs <code>minipaw serve</code> on a server. This button dials its ticket from
+            your browser, over WebTransport through the relay, the same way <code>minipaw</code>{" "}
+            would from a terminal. To chat with your own terminal instead, <a href="/chat">paste its
+            ticket here</a>.
+          </p>
+          <ChatPane peer="paw" start="say hi" ticket={pawBot} />
         </section>
 
         <section class="block" id="path">
@@ -269,6 +293,11 @@ minipaw <span class="ticket">{ticket}</span>
                     <p class="note fill-status" aria-live="polite" data-note={recipe.b.note}>
                       {recipe.b.note}
                     </p>
+                    {recipe.b.link && (
+                      <p class="note">
+                        <a href={recipe.b.link.href}>{recipe.b.link.label}</a>
+                      </p>
+                    )}
                   </div>
                 </div>
               ))
@@ -842,6 +871,8 @@ minipaw <span class="ticket">{ticket}</span>
 </style>
 
 <script>
+  import { findTicket } from "../lib/ticket";
+
   // Listeners are delegated from document: Blume's client router swaps the
   // page's DOM on navigation but runs this module once, so a listener on an
   // element would be lost after leaving the page and coming back.
@@ -871,50 +902,10 @@ minipaw <span class="ticket">{ticket}</span>
   });
 
   // B's ticket field fills `<ticket>` into B's commands. Every tab has its own
-  // field, kept in step so switching tabs keeps the ticket. A
-  // ticket is `mp` and URL-safe base64, so one is found inside a pasted line
-  // such as `minipaw mpAQ…` or `# ssh: minipaw ssh user@mpAQ…`.
-  const CANDIDATE = /\bmp[\w-]+/gu;
+  // field, kept in step so switching tabs keeps the ticket. A ticket is found
+  // inside a pasted line such as `minipaw mpAQ…` or `# ssh: minipaw ssh
+  // user@mpAQ…`, and a truncated paste fails here rather than in the CLI.
 
-  // Whether `field` is a peer ID, as libp2p reads one: a multihash that is
-  // either the public key inline (identity, code 0x00, at most 42 bytes) or
-  // its sha2-256 (code 0x12, 32 bytes).
-  const isPeerId = (field: Uint8Array) =>
-    (field[0] === 0x00 && field[1] === field.length - 2 && field.length <= 44) ||
-    (field[0] === 0x12 && field[1] === 32 && field.length === 34);
-
-  // Whether `text` parses as a ticket, as crates/minipaw/src/ticket.rs reads
-  // one: base64url of [version 1][flags][token; 16][peer id len][peer id],
-  // then [relay len][relay] when flags is odd, and nothing after. So a
-  // truncated paste fails here rather than in the CLI. The relay, which only
-  // a listener on a non-default relay embeds, is checked for length only.
-  const isTicket = (text: string) => {
-    const body = text.slice(2);
-    let bytes: Uint8Array;
-    try {
-      const binary = atob(body.replaceAll("-", "+").replaceAll("_", "/"));
-      // atob ignores stray bits in the last character, which the CLI's
-      // decoder refuses; re-encoding catches a typo there.
-      const canonical = btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
-      if (canonical !== body) {return false;}
-      bytes = Uint8Array.from(binary, (char) => char.codePointAt(0) ?? 0);
-    } catch {
-      return false;
-    }
-    if (bytes.length < 19 || bytes[0] !== 1) {return false;}
-    let at = 18;
-    // Takes one length-prefixed field; undefined when it runs off the end.
-    const field = () => {
-      const len = bytes[at] ?? 0;
-      const start = at + 1;
-      at = start + len;
-      return len > 0 && at <= bytes.length ? bytes.subarray(start, at) : undefined;
-    };
-    const peer = field();
-    if (!peer || !isPeerId(peer)) {return false;}
-    if (bytes[1] % 2 === 1 && !field()) {return false;}
-    return at === bytes.length;
-  };
   // Each template's markup with its placeholders, to put back when the
   // ticket is cleared.
   const placeholders = new WeakMap<Element, string>();
@@ -943,7 +934,7 @@ minipaw <span class="ticket">{ticket}</span>
       other.value = field.value;
     }
     const raw = field.value.trim();
-    const ticket = raw.match(CANDIDATE)?.find(isTicket);
+    const ticket = findTicket(raw)?.text;
     // Under the commands: B's note, or why the paste isn't a ticket.
     for (const line of document.querySelectorAll<HTMLElement>(".recipes .fill-status")) {
       line.textContent = raw && !ticket ? "That isn't a whole ticket. Paste the full line A printed." : (line.dataset.note ?? "");
