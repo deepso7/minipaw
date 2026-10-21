@@ -395,7 +395,13 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
     try {
       const { startChat } = await import("../lib/chat");
       if (mine !== generation) {return;}
-      chat = startChat(ticket, { acked: onAcked, state: onState, text: onText });
+      // A session the page has let go of may still report; drop it.
+      const live =
+        <T,>(handler: (value: T) => void) =>
+        (value: T) => {
+          if (mine === generation) {handler(value);}
+        };
+      chat = startChat(ticket, { acked: live(onAcked), state: live(onState), text: live(onText) });
     } catch (error) {
       onState({ kind: "ended", ok: false, reason: `couldn't load the chat: ${String(error)}` });
     }
@@ -456,6 +462,7 @@ const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the fir
   const abandon = () => {
     generation += 1;
     chat?.close("closed the chat page");
+    chat = undefined;
   };
   document.addEventListener("astro:before-swap", abandon);
   window.addEventListener("pagehide", abandon);

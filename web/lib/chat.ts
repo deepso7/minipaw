@@ -89,6 +89,9 @@ class Session implements Chat {
   #stream: Stream | undefined;
   #up = false;
   #wasUp = false;
+  /** A Hello went out: from then on the terminal may hold our session, so
+   * stopping must tell it, even on a stream still waiting for Welcome. */
+  #helloSent = false;
   #ended = false;
   /** Since when we've had no working stream; 0 while up. */
   #lostSince = Date.now();
@@ -136,7 +139,7 @@ class Session implements Chat {
       return;
     }
     if (!this.#wasUp) {
-      this.#finish(true, "left before connecting");
+      this.close("left before connecting");
       return;
     }
     this.#eof = true;
@@ -147,7 +150,7 @@ class Session implements Chat {
     if (this.#ended) {
       return;
     }
-    if (this.#wasUp) {
+    if (this.#helloSent) {
       this.#write(frame(ERROR, new TextEncoder().encode(reason)));
     }
     this.#finish(true, reason);
@@ -233,11 +236,16 @@ class Session implements Chat {
     // Once welcomed, the terminal holds our session: from then on a Hello
     // asks to resume it, and a terminal that doesn't have it refuses.
     this.#write(hello(this.#ticket.token, this.#id, this.#recv, this.#wasUp));
+    this.#helloSent = true;
     const reader = frameReader();
     try {
       for (;;) {
         // oxlint-disable-next-line no-await-in-loop -- a stream reads in order.
         const chunk = await stream.read();
+        // Closed while waiting: what arrives now is for nobody.
+        if (this.#ended) {
+          return;
+        }
         if (chunk === undefined) {
           throw new Error("stream closed");
         }
