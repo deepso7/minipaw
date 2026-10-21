@@ -42,4 +42,4 @@ In `/etc/pawbot.env`, besides `ANTHROPIC_API_KEY`:
 | `PAWBOT_SESSIONS`      | 64                 | chats at once (`serve --max-sessions`) |
 | `PAWBOT_PORT`          | 7777               | loopback port between serve and bot |
 
-Chats close after 5 quiet minutes. Locally, `bun pawbot.ts` runs the bot alone, and `./run.sh` runs both (with `pawbot` built for your machine via `bun build pawbot.ts --compile --outfile pawbot`).
+Chats close after 5 quiet minutes. `run.sh` runs serve with `--send-peer-id`, so the journal shows each chat's peer ID (`[3] peer 12D3KooW…`); a peer ID is authenticated, but anyone can make a new one. Locally, `bun pawbot.ts` runs the bot alone, and `./run.sh` runs both (with `pawbot` built for your machine via `bun build pawbot.ts --compile --outfile pawbot`).

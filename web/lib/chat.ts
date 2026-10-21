@@ -1,8 +1,8 @@
 // A minipaw dialer for the browser: the client side of crates/minipaw's
 // session (src/dial.rs, src/pipe.rs) over @minip2p/web, for typing to a
 // `minipaw` running in a terminal. The chat page imports this module only
-// when someone connects, so the 3.6 MB wasm and its glue load then, not with
-// the page.
+// when someone connects, so the wasm (3.6 MB, about 0.5 MB compressed) and its
+// glue load then, not with the page.
 //
 // Browsers can't listen or hole punch, so the session always runs through
 // the default relay's WebTransport address. Like the CLI, it survives the

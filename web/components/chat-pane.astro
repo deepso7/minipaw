@@ -1,7 +1,7 @@
 ---
 // A live minipaw chat in the page: the browser dials a terminal's ticket over
 // WebTransport through the relay (lib/chat.ts, imported on connect, with its
-// 3.6 MB of wasm). Without a `ticket` it asks for one to paste. With one, such
+// 3.6 MB of wasm, about 0.5 MB compressed). Without a `ticket` it asks for one to paste. With one, such
 // as the paw bot's on the landing page, the chat box is there from the start:
 // focusing it loads minip2p and connects, and anything sent before the
 // connection is up goes out once it is. One pane per page.
@@ -15,9 +15,10 @@ interface Props {
 }
 
 const { peer = "peer", placeholder, ticket } = Astro.props;
-const loadNote = "Connecting loads minip2p, about 3.6 MB of WebAssembly, the first time.";
+// The wasm is 3.6 MB, about 0.5 MB compressed over the wire.
+const loadNote = "Connecting downloads minip2p, about 0.5 MB of WebAssembly, the first time.";
 const autoNote =
-  "Click into the box below to connect: that loads minip2p (about 3.6 MB of WebAssembly) and dials it through the relay.";
+  "Click into the box below to connect: that downloads minip2p (about 0.5 MB of WebAssembly) and dials it through the relay.";
 ---
 
 <div class="chat-pane" data-auto={ticket ? "" : undefined} data-chat data-peer={peer} data-phase="idle" data-ticket={ticket}>

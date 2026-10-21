@@ -39,6 +39,8 @@ if [[ ! "$port" =~ ^[0-9]+$ ]] || ((10#$port < 1)); then
 fi
 export PAWBOT_PORT="$port"
 
+# serve starts each connection with the visitor's peer ID; the bot reads it.
+export PAWBOT_PEER_LINE=1
 "$pawbot" &
 bot=$!
 # Each session is forwarded to the bot over loopback; serve itself only
@@ -46,7 +48,7 @@ bot=$!
 # page connects whoever clicks into its chat box, so allow more chats than
 # serve's default 16; the bot closes idle ones after 5 minutes.
 "$minipaw" serve --forward "127.0.0.1:$port" --identity "$identity" \
-  --max-sessions "${PAWBOT_SESSIONS:-64}" &
+  --max-sessions "${PAWBOT_SESSIONS:-64}" --send-peer-id &
 serve=$!
 
 stop() {

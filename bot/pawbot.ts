@@ -10,7 +10,8 @@
 // PAWBOT_MODEL (claude-haiku-5-5), PAWBOT_DAILY_LIMIT (300 replies per UTC
 // day across all visitors), PAWBOT_SESSION_LIMIT (20 replies per chat), and
 // PAWBOT_STATE, a file that keeps the day's count across restarts (run.sh
-// sets one beside the identity; unset, the count lives in memory only).
+// sets one beside the identity; unset, the count lives in memory only), and
+// PAWBOT_PEER_LINE=1 when serve runs with --send-peer-id (run.sh sets both).
 
 import { readFileSync, writeFileSync } from "node:fs";
 import net from "node:net";
@@ -54,6 +55,11 @@ const GREETING =
 const client = new Anthropic();
 
 const STATE = process.env.PAWBOT_STATE;
+/** serve starts each connection with `minipaw-peer <id>`, ahead of anything
+ * the visitor sends. Only then is a first line read as one: otherwise a
+ * visitor could type it. */
+const PEER_LINE = process.env.PAWBOT_PEER_LINE === "1";
+const PEER = /^minipaw-peer (\S+)$/u;
 
 // Replies across all chats today, against DAILY_LIMIT. Saved to STATE on
 // every reply, so a restart or redeploy doesn't hand out a fresh budget.
@@ -154,6 +160,11 @@ const serve = (socket: net.Socket) => {
   let replies = 0;
   let busy = false;
   let partial = "";
+  // The visitor's peer ID, once serve's first line has given it.
+  let peer = "";
+  let awaitingPeer = PEER_LINE;
+  // The visitor's input ended (their Fin): answer what's queued, then close.
+  let inputEnded = false;
   // Dropping a line too long to answer, up to its next newline.
   let skipping = false;
   // Aborted when the visitor leaves, along with any request in flight.
@@ -213,6 +224,12 @@ const serve = (socket: net.Socket) => {
     write(result.text);
   };
 
+  // Closes our side once the visitor's input has ended and every line it
+  // sent has its answer, so `echo question | minipaw <ticket>` gets one.
+  const endIfDone = () => {
+    if (inputEnded && !busy && queue.length === 0 && !gone.signal.aborted) {socket.end();}
+  };
+
   const drain = async () => {
     if (busy) {return;}
     busy = true;
@@ -224,11 +241,22 @@ const serve = (socket: net.Socket) => {
     } finally {
       busy = false;
     }
+    endIfDone();
   };
 
   const tooLong = () => write(`That's a long one; I read up to ${MAX_LINE} characters per message.`);
 
   const onLine = (raw: string) => {
+    if (awaitingPeer) {
+      awaitingPeer = false;
+      const match = PEER.exec(raw.trim());
+      if (match) {
+        peer = match[1] ?? "";
+        console.log(`[${id}] peer ${peer}`);
+        return;
+      }
+      console.error(`[${id}] no minipaw-peer line; is serve running with --send-peer-id?`);
+    }
     const line = raw.trim();
     if (line === "") {return;}
     if (line.length > MAX_LINE) {
@@ -261,21 +289,26 @@ const serve = (socket: net.Socket) => {
       partial = "";
     }
   });
-  // The visitor left (their Fin, through minipaw): stop answering, and
-  // finish our side too.
+  // The visitor finished sending (their Fin, through minipaw): a last line
+  // without its newline still counts, and our side closes once it's answered.
+  // A visitor who's gone altogether is "close", below.
   socket.on("end", () => {
-    leave();
-    socket.end();
+    inputEnded = true;
+    if (partial !== "" && !skipping) {onLine(partial);}
+    partial = "";
+    endIfDone();
   });
   socket.on("error", (error) => console.error(`[${id}] ${error.message}`));
   socket.on("close", () => {
     leave();
     const secs = Math.round((Date.now() - started) / 1000);
-    console.log(`[${id}] closed after ${secs}s, ${replies} replies (${repliesToday} today)`);
+    const who = peer ? `, peer ${peer}` : "";
+    console.log(`[${id}] closed after ${secs}s, ${replies} replies (${repliesToday} today)${who}`);
   });
 };
 
-net.createServer(serve).listen(PORT, "127.0.0.1", () => {
+// Half-open, so a visitor that has finished sending still gets its answers.
+net.createServer({ allowHalfOpen: true }, serve).listen(PORT, "127.0.0.1", () => {
   console.log(
     `pawbot on 127.0.0.1:${PORT}, ${MODEL}, ${DAILY_LIMIT} replies a day (${repliesToday} used ${day || "today"})`
   );
