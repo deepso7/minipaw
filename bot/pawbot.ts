@@ -152,6 +152,10 @@ const serve = (socket: net.Socket) => {
   let skipping = false;
   // Aborted when the visitor leaves, along with any request in flight.
   const gone = new AbortController();
+  const leave = () => {
+    queue.length = 0;
+    gone.abort();
+  };
 
   const write = (text: string) => {
     if (!socket.writable) {return;}
@@ -164,9 +168,19 @@ const serve = (socket: net.Socket) => {
     socket.write(`${text.replaceAll("\r", "").replaceAll(/\n+/gu, "\n")}\n`);
   };
 
+  /** How long a closing chat waits for its last line to be read. */
+  const LINGER = 5000;
+
+  // Ends the chat from our side: says why, stops all work, and closes. A
+  // half-close alone would leave the session up for as long as the visitor
+  // keeps its side open, holding one of serve's slots.
   const finish = (text: string) => {
     write(text);
+    leave();
     socket.end();
+    // A reset, not a plain close: the FIN already went out, so closing would
+    // tell serve nothing more, and it would keep the session.
+    setTimeout(() => socket.resetAndDestroy(), LINGER).unref();
   };
 
   const answer = async (line: string) => {
@@ -241,10 +255,6 @@ const serve = (socket: net.Socket) => {
       partial = "";
     }
   });
-  const leave = () => {
-    queue.length = 0;
-    gone.abort();
-  };
   // The visitor left (their Fin, through minipaw): stop answering, and
   // finish our side too.
   socket.on("end", () => {

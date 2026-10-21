@@ -370,6 +370,16 @@ const autoNote =
         status(state.ok ? "ended" : "failed", state.ok ? "idle" : "down");
         say(state.reason, state.ok ? "" : "bad");
         setComposing(false);
+        // Offsets belong to one session: rows it never confirmed can't be
+        // confirmed by the next one, whose offsets start over.
+        for (const item of document.querySelectorAll<HTMLElement>(".log .you:not(.delivered)")) {
+          delete item.dataset.end;
+          const tick = item.querySelector<HTMLElement>(".tick");
+          if (tick) {
+            tick.textContent = "–";
+            tick.title = "not confirmed before the chat ended";
+          }
+        }
         chat = undefined;
         pending = [];
         setPhase("ended");
