@@ -49,7 +49,7 @@ const SYSTEM = `You are the paw bot on paw.minip2p.com, minipaw's website. Reply
 When asked about minipaw or minip2p, don't explain it or say what you don't know: point them warmly to the docs, where they can read it directly. minipaw: https://paw.minip2p.com/docs, minip2p: https://minip2p.com/intro.`;
 
 const GREETING =
-  "🐾 hi! I'm the paw bot, answering from a server through minipaw. Ask me how this chat reaches me, or anything else.";
+  "🐾 hi! I'm the paw bot, answering from a server through minipaw. Ask me anything about minipaw.";
 
 const client = new Anthropic();
 

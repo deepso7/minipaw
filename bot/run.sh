@@ -18,6 +18,9 @@ data="${PAWBOT_DATA:-${STATE_DIRECTORY:-$HOME/.local/state/pawbot}}"
 # minipaw refuses an identity in a directory others can read or write.
 mkdir -p "$data"
 chmod 700 "$data"
+# minipaw also refuses one behind a symlinked directory, which is what
+# systemd's DynamicUser makes of /var/lib/pawbot: use the real path.
+data="$(cd "$data" && pwd -P)"
 identity="$data/serve.key"
 export PAWBOT_STATE="${PAWBOT_STATE:-$data/usage.json}"
 
