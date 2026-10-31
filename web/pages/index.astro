@@ -10,6 +10,7 @@ import SiteSidebar from "../components/site-sidebar.astro";
 const { config } = data;
 
 const install = "curl -fsSL https://paw.minip2p.com/install.sh | sh";
+
 // A real one is this long: the listener's peer ID and a 16-byte token.
 const ticket = "mpAQDEiiVb-s5zPPFvR0SjX0lVJgAkCAESINgMwzfDtX-D_vKZ0slyfVb4K-lw-ijkyHNLfPt1UkM2";
 
@@ -879,24 +880,35 @@ minipaw <span class="ticket">{ticket}</span>
 
   document.addEventListener("click", async (event) => {
     const { target } = event;
+
     if (!(target instanceof Element)) {return;}
+
     const button = target.closest<HTMLButtonElement>("button.copy");
+
     if (!button) {return;}
+
     const status = document.querySelector("#copy-status");
+
     try {
       await navigator.clipboard.writeText(button.dataset.copy ?? "");
       button.textContent = "copied";
+
       if (status) {status.textContent = "Copied";}
     } catch {
       // No clipboard access (denied, or not a secure context): select the
       // command so a manual copy is one keystroke away.
       const code = button.parentElement?.querySelector("code");
+
       if (code) {window.getSelection()?.selectAllChildren(code);}
+
       button.textContent = "press ⌘/Ctrl+C";
+
       if (status) {status.textContent = "Couldn't copy. The command is selected; press ⌘/Ctrl+C.";}
     }
+
     setTimeout(() => {
       button.textContent = "copy";
+
       if (status) {status.textContent = "";}
     }, 2500);
   });
@@ -913,14 +925,20 @@ minipaw <span class="ticket">{ticket}</span>
   const render = (ticket: string | undefined) => {
     for (const code of document.querySelectorAll<HTMLElement>("code[data-template]")) {
       const button = code.parentElement?.querySelector<HTMLButtonElement>("button.copy");
+
       if (!placeholders.has(code)) {placeholders.set(code, code.innerHTML);}
+
       if (!ticket) {
         code.innerHTML = placeholders.get(code) ?? "";
+
         if (button) {button.hidden = true;}
+
         continue;
       }
+
       const cmd = (code.dataset.template ?? "").replace("<ticket>", ticket);
       code.textContent = cmd;
+
       if (button) {
         button.dataset.copy = cmd;
         button.setAttribute("aria-label", `Copy: ${cmd}`);
@@ -933,24 +951,30 @@ minipaw <span class="ticket">{ticket}</span>
     for (const other of document.querySelectorAll<HTMLInputElement>('.recipes input[name="ticket"]')) {
       other.value = field.value;
     }
+
     const raw = field.value.trim();
     const ticket = findTicket(raw)?.text;
+
     // Under the commands: B's note, or why the paste isn't a ticket.
     for (const line of document.querySelectorAll<HTMLElement>(".recipes .fill-status")) {
       line.textContent = raw && !ticket ? "That isn't a whole ticket. Paste the full line A printed." : (line.dataset.note ?? "");
     }
+
     render(ticket);
   };
 
   document.addEventListener("input", (event) => {
     const { target } = event;
+
     if (target instanceof HTMLInputElement && target.closest(".recipes") && target.type === "text") {fill(target);}
   });
 
   // The tabs are radio buttons, for arrow-key moves between them for free.
   document.addEventListener("change", (event) => {
     const { target } = event;
+
     if (!(target instanceof HTMLInputElement) || target.name !== "recipe") {return;}
+
     for (const panel of document.querySelectorAll<HTMLElement>(".recipes .panel")) {
       panel.hidden = panel.dataset.panel !== target.value;
     }
@@ -962,15 +986,23 @@ minipaw <span class="ticket">{ticket}</span>
   // that held it may have just been hidden.
   document.addEventListener("keydown", (event) => {
     if (event.metaKey || event.ctrlKey || event.altKey || event.repeat) {return;}
+
     const { target } = event;
+
     if (!(target instanceof HTMLElement) || !target.closest(".recipes")) {return;}
+
     if (target.matches('input[type="text"], textarea, select, [contenteditable]')) {return;}
+
     const radios = document.querySelectorAll<HTMLInputElement>('.recipes input[name="recipe"]');
     const radio = radios[Number(event.key) - 1];
+
     if (!radio) {return;}
+
     event.preventDefault();
     radio.focus();
+
     if (radio.checked) {return;}
+
     radio.checked = true;
     radio.dispatchEvent(new Event("change", { bubbles: true }));
   });
@@ -982,17 +1014,25 @@ minipaw <span class="ticket">{ticket}</span>
   // client router fires on the first load and after every navigation, so
   // coming back to this page from the docs counts again.
   let statusTimer: ReturnType<typeof setInterval> | undefined;
+
   document.addEventListener("astro:page-load", () => {
     clearInterval(statusTimer);
+
     if (!document.querySelector("[data-elapsed]")) {return;}
+
     if (matchMedia("(prefers-reduced-motion: reduce)").matches) {return;}
+
     let tick = 0;
     statusTimer = setInterval(() => {
       tick += 1;
+
       if (tick >= 4) {clearInterval(statusTimer);}
+
       const elapsed = document.querySelector("[data-elapsed]");
       const sent = document.querySelector("[data-sent]");
+
       if (!elapsed || !sent) {return;}
+
       elapsed.textContent = `0:${12 + tick}`;
       sent.textContent = `${(1.2 + tick * 2).toFixed(1)} MiB`;
     }, 1000);

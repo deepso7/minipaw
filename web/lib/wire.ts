@@ -6,6 +6,7 @@
 // replaced.
 
 export const PROTOCOL = "/minipaw/pipe/1";
+
 /** The session protocol version a Hello carries; the CLI must match. */
 const VERSION = 3;
 
@@ -19,6 +20,7 @@ export const PING = 7;
 
 /** Largest Data payload we send. */
 export const MAX_DATA = 32 * 1024;
+
 /** Largest payload we accept for any frame. */
 const MAX_PAYLOAD = 64 * 1024;
 const HEADER_LEN = 5;
@@ -42,6 +44,7 @@ export const frame = (kind: number, payload: Uint8Array = new Uint8Array()) => {
   view.setUint8(0, kind);
   view.setUint32(1, payload.length);
   out.set(payload, HEADER_LEN);
+
   return out;
 };
 
@@ -49,6 +52,7 @@ export const frame = (kind: number, payload: Uint8Array = new Uint8Array()) => {
 export const u64 = (value: number, extra = 0) => {
   const out = new Uint8Array(8 + extra);
   new DataView(out.buffer).setBigUint64(0, BigInt(value));
+
   return out;
 };
 
@@ -64,12 +68,14 @@ export const hello = (
   payload.set(session, 17);
   payload.set(u64(recv), 33);
   payload[41] = resume ? 1 : 0;
+
   return frame(HELLO, payload);
 };
 
 export const ack = (offset: number, fin: boolean) => {
   const payload = u64(offset, 1);
   payload[8] = fin ? 1 : 0;
+
   return frame(ACK, payload);
 };
 
@@ -79,32 +85,42 @@ const decode = (kind: number, payload: Uint8Array): Frame => {
     payload.byteOffset,
     payload.byteLength
   );
+
   const sized = (len: number) => {
     if (payload.length !== len) {
       throw new FatalError(`malformed frame kind ${kind}`);
     }
+
     return len > 0 ? Number(view.getBigUint64(0)) : 0;
   };
+
   switch (kind) {
     case WELCOME: {
       return { kind, recv: sized(8) };
     }
+
     case DATA: {
       return { data: payload, kind };
     }
+
     case ACK: {
       return { fin: payload[8] !== 0, kind, offset: sized(9) };
     }
+
     case FIN: {
       return { kind, offset: sized(8) };
     }
+
     case ERROR: {
       return { kind, message: new TextDecoder().decode(payload) };
     }
+
     case PING: {
       sized(0);
+
       return { kind };
     }
+
     default: {
       throw new FatalError(`unexpected frame kind ${kind}`);
     }
@@ -114,24 +130,30 @@ const decode = (kind: number, payload: Uint8Array): Frame => {
 /** Reassembles frames from stream chunks, which may split or coalesce them. */
 export const frameReader = () => {
   let buf = new Uint8Array();
+
   return {
     next: (): Frame | undefined => {
       if (buf.length < HEADER_LEN) {
         return;
       }
+
       const view = new DataView(buf.buffer, buf.byteOffset);
       const len = view.getUint32(1);
+
       if (len > MAX_PAYLOAD) {
         throw new FatalError(
           `frame of ${len} bytes exceeds the ${MAX_PAYLOAD} byte limit`
         );
       }
+
       if (buf.length < HEADER_LEN + len) {
         return;
       }
+
       const kind = view.getUint8(0);
       const payload = buf.slice(HEADER_LEN, HEADER_LEN + len);
       buf = buf.subarray(HEADER_LEN + len);
+
       return decode(kind, payload);
     },
     push: (chunk: Uint8Array) => {

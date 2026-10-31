@@ -56,6 +56,7 @@ const raised = [
 const channel = (v) => {
   const x = Math.min(1, Math.max(0, v));
   const srgb = x <= 0.0031308 ? 12.92 * x : 1.055 * x ** (1 / 2.4) - 0.055;
+
   return Math.round(srgb * 255)
     .toString(16)
     .padStart(2, "0");
@@ -67,16 +68,19 @@ const hex = (color) => {
   const [l, c, h] = color.match(/[\d.]+/gu).map(Number);
   const hr = (h * Math.PI) / 180;
   const [L, a, b] = [l / 100, c * Math.cos(hr), c * Math.sin(hr)];
+
   const lms = [
     L + 0.3963377774 * a + 0.2158037573 * b,
     L - 0.1055613458 * a - 0.0638541728 * b,
     L - 0.0894841775 * a - 1.291485548 * b,
   ].map((v) => v ** 3);
+
   const rgb = [
     [4.0767416621, -3.3077115913, 0.2309699292],
     [-1.2684380046, 2.6097574011, -0.3413193965],
     [-0.0041960863, -0.7034186147, 1.707614701],
   ].map((row) => row.reduce((sum, k, i) => sum + k * lms[i], 0));
+
   return `#${rgb.map(channel).join("")}`;
 };
 
@@ -84,38 +88,51 @@ const hex = (color) => {
 // `square` centres the art on a square canvas, so favicons aren't stretched.
 const svg = (grid, { square = false, className, fill = (c) => c } = {}) => {
   const runs = {};
+
   for (const [y, row] of grid.entries()) {
     for (let x = 0; x < row.length;) {
       const c = row[x];
       let end = x;
+
       while (row[end + 1] === c) {
         end += 1;
       }
+
       if (c !== ".") {
         (runs[c] ??= []).push(`M${x} ${y}h${end - x + 1}v1h-${end - x + 1}z`);
       }
+
       x = end + 1;
     }
   }
+
   let [x0, y0, w, h] = [0, 0, grid[0].length, grid.length];
+
   if (square) {
     const size = Math.max(w, h);
     [x0, y0, w, h] = [-(size - w) / 2, -(size - h) / 2, size, size];
   }
+
   const cls = className ? ` class="${className}"` : "";
+
   const paths = Object.entries(runs)
     .map(([c, d]) => `<path fill="${fill(palette[c])}" d="${d.join("")}"/>`)
     .join("");
+
   return `<svg xmlns="http://www.w3.org/2000/svg"${cls} viewBox="${x0} ${y0} ${w} ${h}" width="${w}" height="${h}" shape-rendering="crispEdges">${paths}</svg>\n`;
 };
 
 const out = new URL("../public/", import.meta.url);
+
 writeFileSync(
   new URL("logo.svg", out),
   svg(print, { className: "minipaw-logo" })
 );
+
 writeFileSync(new URL("icon.svg", out), svg(print, { square: true }));
+
 writeFileSync(new URL("paw-raised.svg", out), svg(raised));
+
 // The generated OG cards' brand mark (seo.og.logo). Square, so the card's
 // 32px mark puts each sprite pixel on 2 image pixels.
 writeFileSync(

@@ -56,8 +56,11 @@ ensure_relay() {
     exit 2
   fi
   local flags=("$@")
+  # Every test peer shares 127.0.0.1, so the per-IP caps go up to the
+  # relay-wide ones (128 reservations, 16 circuits).
   [ ${#flags[@]} -gt 0 ] || flags=(--max-circuit-bytes 0 --max-circuit-duration 0
-    --circuit-peer-rate off --circuit-ip-rate off)
+    --circuit-peer-rate off --circuit-ip-rate off
+    --max-reservations-per-ip 128 --max-circuits-per-ip 16)
   RELAY_LOG=$(mktemp)
   "$bin" --quic 127.0.0.1:0 --tcp 127.0.0.1:0 "${flags[@]}" >"$RELAY_LOG" 2>&1 &
   RELAY_PID=$!
