@@ -15,8 +15,10 @@ interface Props {
 }
 
 const { peer = "peer", placeholder, ticket } = Astro.props;
+
 // The wasm is 3.6 MB, about 0.5 MB compressed over the wire.
 const loadNote = "Connecting downloads minip2p, about 0.5 MB of WebAssembly, the first time.";
+
 const autoNote =
   "Click into the box below to connect: that downloads minip2p (about 0.5 MB of WebAssembly) and dials it through the relay.";
 ---
@@ -255,25 +257,31 @@ const autoNote =
   import type { Ticket } from "../lib/ticket";
 
   let chat: Chat | undefined;
+
   // Bumped whenever the page lets go of its chat, so a connect still loading
   // lib/chat.ts when the visitor navigates away never starts.
   let generation = 0;
+
   // Leave was pressed: a resume after it must not reopen the message box.
   let leaving = false;
+
   // Lines sent in a fixed-ticket pane while lib/chat.ts is still loading,
   // with their rows: they go out once the session exists.
   let pending: { text: string; item: HTMLElement }[] = [];
+
   // The other side's current line, which its next text continues.
   let peerLine: HTMLElement | undefined;
 
   const $ = <T extends Element>(selector: string) => document.querySelector<T>(selector);
   const pane = () => $<HTMLElement>("[data-chat]");
+
   // A fixed-ticket pane: the message box works before, during and after a
   // session, and using it is what connects.
   const isAuto = () => pane()?.dataset.auto !== undefined;
 
   const setPhase = (phase: string) => {
     const root = pane();
+
     if (root) {root.dataset.phase = phase;}
   };
 
@@ -293,6 +301,7 @@ const autoNote =
   const trim = () => {
     const log = $("[data-chat-log]");
     const extra = (log?.children.length ?? 0) - MAX_ROWS;
+
     for (const row of [...(log?.children ?? [])].slice(0, Math.max(extra, 0))) {
       row.remove();
     }
@@ -301,17 +310,20 @@ const autoNote =
   const append = (cls: string, who?: string) => {
     const item = document.createElement("li");
     item.className = cls;
+
     if (who) {
       const label = document.createElement("span");
       label.className = "who";
       label.textContent = who;
       item.append(label);
     }
+
     const body = document.createElement("span");
     item.append(body);
     $("[data-chat-log]")?.append(item);
     trim();
     scrollDown();
+
     return body;
   };
 
@@ -323,10 +335,12 @@ const autoNote =
   const status = (text: string, state: "up" | "down" | "idle") => {
     const label = $<HTMLElement>("[data-chat-state]");
     const dot = $<HTMLElement>("[data-chat-dot]");
+
     if (label) {
       label.textContent = text;
       label.dataset.state = state;
     }
+
     if (dot) {
       dot.textContent = state === "up" ? "●" : "○";
       dot.dataset.state = state;
@@ -335,11 +349,13 @@ const autoNote =
 
   const setComposing = (on: boolean) => {
     if (isAuto()) {return;}
+
     for (const el of document.querySelectorAll<HTMLInputElement | HTMLButtonElement>(
       "[data-chat-message], [data-chat-send]"
     )) {
       el.disabled = !on;
     }
+
     if (on) {$<HTMLInputElement>("[data-chat-message]")?.focus({ preventScroll: true });}
   };
 
@@ -350,45 +366,57 @@ const autoNote =
         say("loading minip2p…");
         break;
       }
+
       case "connecting": {
         status("connecting", "idle");
         say("connecting through the relay…");
         break;
       }
+
       case "up": {
         status(state.resumed ? "connected (resumed)" : "connected", "up");
         say(state.resumed ? "resumed" : "connected via relay", "ok");
         setComposing(!leaving);
         break;
       }
+
       case "reconnecting": {
         status("reconnecting", "down");
         say(`link lost (${state.reason}); reconnecting…`, "bad");
         setComposing(false);
         break;
       }
+
       case "ended": {
         status(state.ok ? "ended" : "failed", state.ok ? "idle" : "down");
         say(state.reason, state.ok ? "" : "bad");
         setComposing(false);
+
         // Offsets belong to one session: rows it never confirmed can't be
         // confirmed by the next one, whose offsets start over.
         for (const item of document.querySelectorAll<HTMLElement>(".log .you:not(.delivered)")) {
           delete item.dataset.end;
           const tick = item.querySelector<HTMLElement>(".tick");
+
           if (tick) {
             tick.textContent = "–";
             tick.title = "not confirmed before the chat ended";
           }
         }
+
         chat = undefined;
         pending = [];
         setPhase("ended");
+
         if (isAuto()) {say("type to start a new chat");}
+
         const go = $<HTMLButtonElement>("[data-chat-go]");
+
         if (go) {go.disabled = false;}
+
         break;
       }
+
       default: {
         break;
       }
@@ -397,18 +425,24 @@ const autoNote =
 
   const onText = (text: string) => {
     const who = `${pane()?.dataset.peer ?? "peer"}›`;
+
     for (const [i, line] of text.split("\n").entries()) {
       if (i > 0) {peerLine = undefined;}
+
       let rest = line;
+
       while (rest !== "") {
         const room = MAX_LINE - (peerLine?.textContent?.length ?? 0);
+
         if (room <= 0) {peerLine = undefined;}
+
         peerLine ??= append("peer", who);
         const take = Math.min(rest.length, room > 0 ? room : MAX_LINE);
         peerLine.textContent += rest.slice(0, take);
         rest = rest.slice(take);
       }
     }
+
     trim();
     scrollDown();
   };
@@ -419,9 +453,12 @@ const autoNote =
     for (const item of document.querySelectorAll<HTMLElement>(".log .you:not(.delivered)")) {
       // Not handed to the session yet (or refused): nothing to confirm.
       if (item.dataset.end === undefined) {continue;}
+
       if (Number(item.dataset.end) > offset) {break;}
+
       item.classList.add("delivered");
       const tick = item.querySelector(".tick");
+
       if (tick) {tick.textContent = "✓";}
     }
   };
@@ -432,13 +469,17 @@ const autoNote =
     const note = $<HTMLElement>("[data-chat-ticket-note]");
     const go = $<HTMLButtonElement>("[data-chat-go]");
     let problem = "";
+
     if (raw && !found) {
       problem = "That isn't a whole ticket. Paste the full line minipaw printed.";
     } else if (found?.ticket.ownRelay) {
       problem = "This ticket names its own relay. The browser can only reach a minipaw on the default relay.";
     }
+
     if (note) {note.textContent = problem || (note.dataset.note ?? "");}
+
     if (go) {go.disabled = chat !== undefined || !found || Boolean(problem);}
+
     return problem ? undefined : found?.ticket;
   };
 
@@ -453,6 +494,7 @@ const autoNote =
     tick.textContent = "…";
     tick.title = "✓ once the other side has printed it";
     item.append(tick);
+
     return item;
   };
 
@@ -460,34 +502,45 @@ const autoNote =
   const queue = (item: HTMLElement, end: number | undefined) => {
     if (end === undefined) {
       const tick = item.querySelector(".tick");
+
       if (tick) {tick.textContent = "not sent";}
+
       return;
     }
+
     item.dataset.end = String(end);
   };
 
   const connect = async (ticket: Ticket) => {
     $<HTMLButtonElement>("[data-chat-go]")?.setAttribute("disabled", "");
     setPhase("active");
+
     // A fixed-ticket pane keeps its transcript across chats.
     if (!isAuto()) {$("[data-chat-log]")?.replaceChildren();}
+
     peerLine = undefined;
     $("[data-chat-peer]")?.replaceChildren(`· peer ${short(ticket.peerId)}`);
     generation += 1;
     leaving = false;
     const mine = generation;
+
     try {
       const { startChat } = await import("../lib/chat");
+
       if (mine !== generation) {return;}
+
       // A session the page has let go of may still report; drop it.
       const live =
         <T,>(handler: (value: T) => void) =>
         (value: T) => {
           if (mine === generation) {handler(value);}
         };
+
       chat = startChat(ticket, { acked: live(onAcked), state: live(onState), text: live(onText) });
+
       // The session buffers what it's given until its stream is up.
       for (const { text, item } of pending) {queue(item, chat.send(`${text}\n`));}
+
       pending = [];
     } catch (error) {
       if (mine === generation) {
@@ -500,27 +553,37 @@ const autoNote =
   const autoConnect = () => {
     const fixed = pane()?.dataset.ticket;
     const ticket = fixed ? parseTicket(fixed) : undefined;
+
     if (ticket && !chat && pane()?.dataset.phase !== "active") {void connect(ticket);}
   };
 
   const send = () => {
     const input = $<HTMLInputElement>("[data-chat-message]");
+
     if (!input || input.value === "") {return;}
+
     const text = input.value;
+
     if (!chat) {
       // A fixed-ticket pane takes the line now and sends it once connected.
       if (!isAuto()) {return;}
+
       input.value = "";
       pending.push({ item: ourLine(text), text });
       autoConnect();
+
       return;
     }
+
     // A terminal reads lines, so each message is one.
     const end = chat.send(`${text}\n`);
+
     if (end === undefined) {
       say("not sent: the other side isn't keeping up. Try again in a moment.", "bad");
+
       return;
     }
+
     input.value = "";
     queue(ourLine(text), end);
   };
@@ -529,23 +592,30 @@ const autoNote =
   // there by the time the first line is typed.
   document.addEventListener("focusin", (event) => {
     const { target } = event;
+
     if (target instanceof HTMLInputElement && target.matches("[data-chat-message]") && isAuto()) {autoConnect();}
   });
 
   document.addEventListener("input", (event) => {
     const { target } = event;
+
     if (target instanceof HTMLInputElement && target.matches("[data-chat-ticket]")) {checkTicket(target);}
   });
 
   document.addEventListener("submit", (event) => {
     const { target } = event;
+
     if (!(target instanceof HTMLFormElement)) {return;}
+
     if (target.matches("[data-chat-connect]")) {
       event.preventDefault();
+
       if (chat) {return;}
+
       const fixed = pane()?.dataset.ticket;
       const input = $<HTMLInputElement>("[data-chat-ticket]");
       const ticket = fixed ? parseTicket(fixed) : input && checkTicket(input);
+
       if (ticket) {void connect(ticket);}
     } else if (target.matches("[data-chat-compose]")) {
       event.preventDefault();
@@ -555,15 +625,19 @@ const autoNote =
 
   document.addEventListener("click", (event) => {
     const { target } = event;
+
     if (!(target instanceof Element) || !target.closest("[data-chat-leave]")) {return;}
+
     if (!chat) {
       // Still loading lib/chat.ts: drop the pending connect, so it never starts.
       if (pane()?.dataset.phase === "active") {
         generation += 1;
         onState({ kind: "ended", ok: true, reason: "connection cancelled" });
       }
+
       return;
     }
+
     say("leaving; waiting for the other side to finish…");
     leaving = true;
     setComposing(false);
@@ -575,14 +649,18 @@ const autoNote =
   const abandon = () => {
     generation += 1;
     chat?.close("closed the chat page");
+
     // The session's own "ended" is dropped with its generation, so end the
     // pane here: a page restored from the back/forward cache can connect
     // again.
     if (pane()?.dataset.phase === "active") {
       onState({ kind: "ended", ok: true, reason: "closed when you left the page" });
     }
+
     chat = undefined;
   };
+
   document.addEventListener("astro:before-swap", abandon);
+
   window.addEventListener("pagehide", abandon);
 </script>

@@ -8,6 +8,7 @@ interface Props {
 }
 
 const { cmd, label } = Astro.props;
+
 // The label grows to fill the column, so commands side by side in a grid line
 // up even when their labels wrap to different heights.
 const template = cmd.includes("<ticket>");

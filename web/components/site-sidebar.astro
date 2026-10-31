@@ -19,6 +19,7 @@ const site = [
   { href: "/changelog", label: "Changelog" },
   { href: "https://github.com/deepso7/minipaw", label: "GitHub" },
 ];
+
 const isCurrent = (href: string) =>
   href === "/"
     ? currentRoute === "/"
@@ -196,11 +197,14 @@ const isCurrent = (href: string) =>
   // swaps the sidebar on navigation, and guarded since the landing page
   // registers the same listener.
   const root = document.documentElement;
+
   if (root.dataset.pawSearchReady === undefined) {
     root.dataset.pawSearchReady = "";
     document.addEventListener("click", (event) => {
       const { target } = event;
+
       if (!(target instanceof Element) || !target.closest("[data-paw-search]")) {return;}
+
       document.querySelector<HTMLButtonElement>("[data-blume-search-open]")?.click();
     });
   }

@@ -23,12 +23,14 @@ const isPeerId = (field: Uint8Array) =>
 const decode = (body: string): Uint8Array | undefined => {
   try {
     const binary = atob(body.replaceAll("-", "+").replaceAll("_", "/"));
+
     // atob ignores stray bits in the last character, which the CLI's
     // decoder refuses; re-encoding catches a typo there.
     const canonical = btoa(binary)
       .replaceAll("+", "-")
       .replaceAll("/", "_")
-      .replace(/=+$/u, "");
+      .replace(/[=]+$/u, "");
+
     return canonical === body
       ? Uint8Array.from(binary, (char) => char.codePointAt(0) ?? 0)
       : undefined;
@@ -41,28 +43,36 @@ const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 const base58 = (bytes: Uint8Array) => {
   const digits: number[] = [];
+
   for (const byte of bytes) {
     let carry = byte;
+
     for (let i = 0; i < digits.length; i += 1) {
       carry += (digits[i] ?? 0) * 256;
       digits[i] = carry % 58;
       carry = Math.floor(carry / 58);
     }
+
     while (carry > 0) {
       digits.push(carry % 58);
       carry = Math.floor(carry / 58);
     }
   }
+
   let out = "";
+
   for (const byte of bytes) {
     if (byte !== 0) {
       break;
     }
+
     out += "1";
   }
+
   for (let i = digits.length - 1; i >= 0; i -= 1) {
     out += BASE58[digits[i] ?? 0];
   }
+
   return out;
 };
 
@@ -71,33 +81,44 @@ export const parseTicket = (text: string): Ticket | undefined => {
   if (!text.startsWith("mp")) {
     return undefined;
   }
+
   const bytes = decode(text.slice(2));
+
   if (!bytes || bytes.length < 19 || bytes[0] !== 1) {
     return undefined;
   }
+
   let at = 18;
+
   // Takes one length-prefixed field; undefined when it runs off the end.
   const field = () => {
     const len = bytes[at] ?? 0;
     const start = at + 1;
     at = start + len;
+
     return len > 0 && at <= bytes.length
       ? bytes.subarray(start, at)
       : undefined;
   };
+
   const peer = field();
+
   if (!peer || !isPeerId(peer)) {
     return undefined;
   }
+
   // The relay, which only a listener on a non-default relay embeds, is
   // checked for length only.
   const ownRelay = (bytes[1] ?? 0) % 2 === 1;
+
   if (ownRelay && !field()) {
     return undefined;
   }
+
   if (at !== bytes.length) {
     return undefined;
   }
+
   return { ownRelay, peerId: base58(peer), token: bytes.slice(2, 18) };
 };
 
@@ -105,6 +126,7 @@ export const parseTicket = (text: string): Ticket | undefined => {
 export const findTicket = (line: string) => {
   for (const [candidate] of line.trim().matchAll(CANDIDATE)) {
     const ticket = parseTicket(candidate);
+
     if (ticket) {
       return { text: candidate, ticket };
     }

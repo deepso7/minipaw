@@ -35,6 +35,7 @@ import {
 import type { Frame } from "./wire";
 
 const RELAY_PEER = "12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf";
+
 /** relay.minip2p.com, the CLI's default relay, at its WebTransport address.
  * No certhash: the relay serves a CA-signed certificate for its domain,
  * which the browser checks as for any HTTPS page, so renewals need no
@@ -43,16 +44,20 @@ const RELAY = `/dns/relay.minip2p.com/udp/19876/quic-v1/webtransport/p2p/${RELAY
 
 /** How long to keep trying to get a stream back, as the CLI does. */
 const RESUME_TIMEOUT = 60_000;
+
 /** Ceiling on each of connecting, opening the stream, and the handshake. */
 const SETUP_TIMEOUT = 15_000;
 const PING_INTERVAL = 5000;
+
 /** A stream silent this long is dead, even if nothing said so. */
 const DEAD_AFTER = 20_000;
 const MAX_BACKOFF = 2000;
+
 /** Unacknowledged bytes we hold before refusing more. A chat never gets
  * near it unless the terminal stalls; it keeps every write under the
  * stream's 256 KiB buffer and far under the terminal's 4 MiB window. */
 const MAX_UNACKED = 128 * 1024;
+
 /** How long the last ack or Error gets to leave before the endpoint closes. */
 const LINGER = 2000;
 
@@ -134,15 +139,19 @@ class Session implements Chat {
     if (this.#eof || this.#ended) {
       return;
     }
+
     const bytes = new TextEncoder().encode(text);
+
     if (this.#unacked.length + bytes.length > MAX_UNACKED) {
       return;
     }
+
     const unacked = new Uint8Array(this.#unacked.length + bytes.length);
     unacked.set(this.#unacked);
     unacked.set(bytes, this.#unacked.length);
     this.#unacked = unacked;
     this.#flush();
+
     return this.#end;
   }
 
@@ -150,10 +159,13 @@ class Session implements Chat {
     if (this.#ended) {
       return;
     }
+
     if (!this.#wasUp) {
       this.close("left before connecting");
+
       return;
     }
+
     this.#eof = true;
     this.#flush();
   }
@@ -162,20 +174,25 @@ class Session implements Chat {
     if (this.#ended) {
       return;
     }
+
     if (this.#helloSent) {
       this.#write(frame(ERROR, new TextEncoder().encode(reason)));
     }
+
     this.#finish(true, reason);
   }
 
   async run() {
     this.#on.state({ kind: "loading" });
+
     try {
       await initMinip2p({ wasm });
+
       // Closed while the wasm loaded: no endpoint to start, or to leak.
       if (this.#ended) {
         return;
       }
+
       this.#endpoint = Minip2p.create({
         // Streams open only on registered protocols, outbound ones too.
         protocols: [PROTOCOL],
@@ -184,13 +201,16 @@ class Session implements Chat {
       });
     } catch (error) {
       this.#finish(false, `couldn't start minip2p: ${String(error)}`);
+
       return;
     }
+
     this.#on.state({ kind: "connecting" });
     // The resume window covers reaching the terminal, not loading the wasm.
     this.#lostSince = Date.now();
     this.#timer = setInterval(() => this.#tick(), 1000);
     let backoff = 0;
+
     while (!this.#ended) {
       try {
         // oxlint-disable-next-line no-await-in-loop -- one stream at a time, by design.
@@ -203,9 +223,11 @@ class Session implements Chat {
           this.#lose(String(error));
         }
       }
+
       if (this.#ended) {
         return;
       }
+
       if (Date.now() - this.#lostSince >= RESUME_TIMEOUT) {
         this.#finish(
           false,
@@ -213,8 +235,10 @@ class Session implements Chat {
             ? "lost the connection to the terminal"
             : "couldn't reach the terminal"
         );
+
         return;
       }
+
       // oxlint-disable-next-line no-await-in-loop -- backing off between attempts.
       await sleep(backoff);
       backoff = Math.min(Math.max(backoff * 2, 250), MAX_BACKOFF);
@@ -224,27 +248,35 @@ class Session implements Chat {
   /** Runs one stream, from connecting to its end. */
   async #link() {
     const endpoint = this.#endpoint;
+
     if (!endpoint) {
       return;
     }
+
     const peer = this.#ticket.peerId;
     const options = { cancelOnTimeout: true, timeoutMs: SETUP_TIMEOUT };
     const connected = endpoint.connectedPeers();
+
     if (!connected.includes(peer)) {
       // Dialing a peer ID goes through a connected relay, so reach the
       // relay first; `create` only starts on it.
       if (!connected.includes(RELAY_PEER)) {
         await endpoint.connect(RELAY, options);
       }
+
       await endpoint.connect(peer, options);
     }
+
     const stream = await endpoint.openStream(peer, PROTOCOL, {
       timeoutMs: SETUP_TIMEOUT,
     });
+
     if (this.#ended) {
       stream.reset();
+
       return;
     }
+
     this.#stream = stream;
     this.#heardAt = Date.now();
     // Once welcomed, the terminal holds our session: from then on a Hello
@@ -252,19 +284,24 @@ class Session implements Chat {
     this.#write(hello(this.#ticket.token, this.#id, this.#recv, this.#wasUp));
     this.#helloSent = true;
     const reader = frameReader();
+
     try {
       for (;;) {
         // oxlint-disable-next-line no-await-in-loop -- a stream reads in order.
         const chunk = await stream.read();
+
         // Closed while waiting: what arrives now is for nobody.
         if (this.#ended) {
           return;
         }
+
         if (chunk === undefined) {
           throw new Error("stream closed");
         }
+
         this.#heardAt = Date.now();
         reader.push(chunk);
+
         for (let next = reader.next(); next; next = reader.next()) {
           if (this.#up) {
             this.#onFrame(next);
@@ -272,9 +309,12 @@ class Session implements Chat {
             this.#onHandshake(next);
           }
         }
+
         this.#flush();
+
         if (this.#finAcked && this.#peerFinAcked) {
           this.#finish(true, "the chat is over");
+
           return;
         }
       }
@@ -282,6 +322,7 @@ class Session implements Chat {
       if (this.#stream === stream) {
         this.#stream = undefined;
       }
+
       this.#up = false;
     }
   }
@@ -292,14 +333,17 @@ class Session implements Chat {
         `${this.#wasUp ? "the terminal ended the session" : "the terminal refused"}: ${next.message}`
       );
     }
+
     if (next.kind !== WELCOME) {
       throw new FatalError(`unexpected frame kind ${next.kind} before Welcome`);
     }
+
     if (next.recv < this.#acked || next.recv > this.#end) {
       throw new FatalError(
         `the terminal resumed at ${next.recv}, outside ${this.#acked}..=${this.#end}`
       );
     }
+
     // Resend from what it received; acked bytes stay until it writes them.
     this.#sent = next.recv;
     this.#finSent = false;
@@ -307,6 +351,7 @@ class Session implements Chat {
     this.#on.state({ kind: "up", resumed: this.#wasUp });
     this.#wasUp = true;
     this.#lostSince = 0;
+
     // The last ack may have died with the old stream.
     if (this.#recv > 0 || this.#peerFin !== undefined) {
       this.#sendAck();
@@ -319,29 +364,36 @@ class Session implements Chat {
         if (this.#peerFin !== undefined) {
           throw new FatalError("the terminal sent data after its Fin");
         }
+
         if (next.data.length === 0) {
           throw new FatalError("the terminal sent an empty Data frame");
         }
+
         this.#recv += next.data.length;
         this.#on.text(this.#decoder.decode(next.data, { stream: true }));
         // Shown is written: ack it now, so the terminal's window moves.
         this.#sendAck();
         break;
       }
+
       case ACK: {
         this.#onAck(next.offset, next.fin);
         break;
       }
+
       case FIN: {
         this.#onFin(next.offset);
         break;
       }
+
       case ERROR: {
         throw new FatalError(`the terminal ended the session: ${next.message}`);
       }
+
       case PING: {
         break;
       }
+
       default: {
         throw new FatalError("unexpected Welcome mid-session");
       }
@@ -354,16 +406,19 @@ class Session implements Chat {
         `the terminal acked ${offset} past our end ${this.#end}`
       );
     }
+
     if (offset > this.#acked) {
       this.#unacked = this.#unacked.slice(offset - this.#acked);
       this.#acked = offset;
       this.#sent = Math.max(this.#sent, offset);
       this.#on.acked(offset);
     }
+
     if (fin) {
       if (!this.#eof || offset !== this.#end) {
         throw new FatalError("the terminal acked a Fin we never sent");
       }
+
       this.#finAcked = true;
     }
   }
@@ -374,9 +429,11 @@ class Session implements Chat {
         `the terminal moved its Fin from ${this.#peerFin} to ${offset}`
       );
     }
+
     if (offset !== this.#recv) {
       throw new FatalError("the terminal's Fin doesn't match what it sent");
     }
+
     this.#peerFin = offset;
     this.#on.text(this.#decoder.decode());
     this.#sendAck();
@@ -388,6 +445,7 @@ class Session implements Chat {
   #sendAck() {
     const fin = this.#peerFin === this.#recv;
     this.#write(ack(this.#recv, fin));
+
     if (fin) {
       this.#peerFinAcked = true;
     }
@@ -398,12 +456,14 @@ class Session implements Chat {
     if (!this.#up) {
       return;
     }
+
     while (this.#sent < this.#end) {
       const start = this.#sent - this.#acked;
       const chunk = this.#unacked.slice(start, start + MAX_DATA);
       this.#write(frame(DATA, chunk));
       this.#sent += chunk.length;
     }
+
     if (this.#eof && !this.#finSent && !this.#finAcked) {
       this.#write(frame(FIN, u64(this.#end)));
       this.#finSent = true;
@@ -412,9 +472,11 @@ class Session implements Chat {
 
   #write(bytes: Uint8Array) {
     const stream = this.#stream;
+
     if (!stream) {
       return;
     }
+
     this.#sentAt = Date.now();
     void this.#writeTo(stream, bytes);
   }
@@ -433,21 +495,27 @@ class Session implements Chat {
 
   #tick() {
     const stream = this.#stream;
+
     if (!stream) {
       return;
     }
+
     const now = Date.now();
+
     if (now - this.#heardAt >= (this.#up ? DEAD_AFTER : SETUP_TIMEOUT)) {
       // A relayed circuit can die without word; a stream on the same
       // connection would be just as dead, so drop the connection too.
       stream.reset();
+
       try {
         this.#endpoint?.disconnect(this.#ticket.peerId);
       } catch {
         // Already gone.
       }
+
       return;
     }
+
     if (this.#up && now - this.#sentAt >= PING_INTERVAL) {
       this.#write(frame(PING));
     }
@@ -455,10 +523,12 @@ class Session implements Chat {
 
   #lose(reason: string) {
     console.debug(`minipaw: ${reason}; retrying`);
+
     // Report the first failure only, not every retry after it.
     if (this.#lostSince !== 0) {
       return;
     }
+
     this.#lostSince = Date.now();
     this.#on.state({ kind: "reconnecting", reason });
   }
@@ -467,6 +537,7 @@ class Session implements Chat {
     if (this.#ended) {
       return;
     }
+
     this.#ended = true;
     clearInterval(this.#timer);
     this.#on.state({ kind: "ended", ok, reason });
@@ -493,5 +564,6 @@ class Session implements Chat {
 export const startChat = (ticket: Ticket, handlers: ChatHandlers): Chat => {
   const session = new Session(ticket, handlers);
   void session.run();
+
   return session;
 };

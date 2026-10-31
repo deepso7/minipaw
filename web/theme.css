@@ -104,7 +104,9 @@ a:has(.minipaw-logo) > .truncate {
   }
 
   [data-blume-nav-drawer]:has([data-paw-sidebar]) [data-blume-nav-tree],
-  [data-blume-nav-drawer]:has([data-paw-sidebar]) [data-blume-nav-tree] > .lg\:block {
+  [data-blume-nav-drawer]:has([data-paw-sidebar])
+    [data-blume-nav-tree]
+    > .lg\:block {
     height: 100%;
   }
 }
