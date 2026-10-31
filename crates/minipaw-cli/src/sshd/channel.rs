@@ -322,7 +322,7 @@ impl Conn {
                         peer: &peer,
                     };
                     process::spawn(&shared.account, &login, &shared.registry)
-                        .map(|(process, io)| Program::Process(process, io))
+                        .map(|(process, io)| Program::Process(Box::new(process), io))
                 }
             }
         };
@@ -676,7 +676,8 @@ fn close(chan: &mut Chan, why: Reason, session: &mut Session) -> Result<(), russ
 
 /// What a channel's supervisor runs.
 enum Program {
-    Process(Process, Io),
+    // Boxed: a Process is several times the size of an sftp::Fs.
+    Process(Box<Process>, Io),
     Sftp(sftp::Fs),
 }
 
@@ -722,7 +723,7 @@ impl Drop for Live {
 impl Supervisor {
     async fn run(self, program: Program) {
         match program {
-            Program::Process(process, io) => self.process(process, io).await,
+            Program::Process(process, io) => self.process(*process, io).await,
             Program::Sftp(fs) => self.sftp(fs).await,
         }
         self.finished.store(true, Ordering::Release);
