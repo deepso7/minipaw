@@ -560,7 +560,7 @@ impl Chat {
     /// side, what we are waiting for.
     fn draw_input_line(&self, frame: &mut Frame<'_>, inner: Rect) {
         let t = &self.theme;
-        if matches!(self.sender, Input::Ended) {
+        if !matches!(self.sender, Input::Open(_)) && self.input.is_empty() {
             let text = Span::styled(
                 "waiting for the peer to finish · Ctrl-C to quit now",
                 t.hint,
@@ -849,6 +849,14 @@ mod tests {
         let last = chat.outbox.last().expect("a note");
         assert!(matches!(last.who, Who::Warn), "{}", last.text);
         assert!(last.text.contains("not sent"), "{}", last.text);
+
+        // Cleared, the box no longer invites typing.
+        chat.on_key(key(KeyCode::Esc));
+        let rows = box_rows(&chat, 80, Instant::now());
+        assert!(
+            !rows.iter().any(|r| r.contains("type a message")),
+            "{rows:?}"
+        );
     }
 
     #[test]

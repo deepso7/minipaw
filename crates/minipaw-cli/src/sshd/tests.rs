@@ -1005,7 +1005,7 @@ async fn a_close_right_after_the_cap_ends_the_program_at_once() {
         loop {
             sleep(Duration::from_millis(300)).await;
             let now = server.valve.dropped.load(Ordering::SeqCst);
-            if now == dropped {
+            if now == dropped && now > 0 {
                 break;
             }
             dropped = now;
