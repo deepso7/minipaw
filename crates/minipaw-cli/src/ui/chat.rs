@@ -546,9 +546,11 @@ impl Chat {
         bytes.push(b'\n');
         if sender.send(bytes).is_err() {
             self.sender = Input::Closed;
+            // Shown in full, as the input goes once the session ends.
+            let line = sanitize_str(&self.input.text());
             self.push(
                 Who::Warn,
-                "the session is ending; your line was not sent".to_owned(),
+                format!("the session is ending; not sent: {line}"),
             );
             return;
         }
@@ -849,6 +851,7 @@ mod tests {
         let last = chat.outbox.last().expect("a note");
         assert!(matches!(last.who, Who::Warn), "{}", last.text);
         assert!(last.text.contains("not sent"), "{}", last.text);
+        assert!(last.text.ends_with(": b"), "{}", last.text);
 
         // Cleared, the box no longer invites typing.
         chat.on_key(key(KeyCode::Esc));

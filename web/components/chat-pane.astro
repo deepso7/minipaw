@@ -554,6 +554,8 @@ const autoNote =
 
       // The session buffers what it's given until its stream is up.
       for (const { text, item } of mine.pending) {queue(item, chat.send(`${text}\n`));}
+
+      mine.pending = [];
     } catch (error) {
       if (now === mine) {
         onState({ kind: "ended", ok: false, reason: `couldn't load the chat: ${String(error)}` });
