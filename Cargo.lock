@@ -1597,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "minipaw"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "getrandom 0.4.3",
@@ -1610,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "minipaw-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "clap",
