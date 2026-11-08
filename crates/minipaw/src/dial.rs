@@ -14,7 +14,9 @@ use minip2p::{
 use crate::config::Config;
 use crate::event::{Event, Events, PathKind};
 use crate::io::Io;
-use crate::net::{self, DELIVERED_GRACE, Disconnected, Exit, HANDOVER_GRACE, RESUME_TIMEOUT, Stop};
+use crate::net::{
+    self, DELIVERED_GRACE, Disconnected, Exit, LinkState, Lost, RESUME_TIMEOUT, Stop,
+};
 use crate::pipe::{Link, Pipe};
 use crate::session::{Outcome, Shared};
 use crate::ticket::Ticket;
@@ -24,7 +26,13 @@ use crate::wire::{Frame, PROTOCOL, SessionId};
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_BACKOFF: Duration = Duration::from_secs(2);
 
-enum Phase {
+/// Up on a welcomed stream, or down while an attempt gets one.
+type Phase = LinkState<Link, Attempt>;
+
+/// Getting a fresh stream. There is only ever one, so a `Link` held inline
+/// costs nothing a box would save.
+#[allow(clippy::large_enum_variant)]
+enum Attempt {
     /// No stream; try again at `at`.
     Idle {
         at: Instant,
@@ -42,9 +50,6 @@ enum Phase {
         link: Link,
         since: Instant,
     },
-    Up {
-        link: Link,
-    },
 }
 
 struct Client {
@@ -54,8 +59,6 @@ struct Client {
     session: SessionId,
     phase: Phase,
     backoff: Duration,
-    /// Since when we have had no working stream (`None` while up).
-    lost_since: Option<Instant>,
     /// Whether a stream was ever up: for messages, and every later `Hello`
     /// asks to resume.
     was_up: bool,
@@ -64,9 +67,6 @@ struct Client {
     hello_sent: bool,
     /// The user has been told the session runs on a direct path.
     told_direct: bool,
-    /// The stream was dropped to move onto a direct connection: its loss
-    /// and resume go unreported unless it takes [`HANDOVER_GRACE`].
-    handover: bool,
     /// A stop request or a local failure, once seen.
     stop: Option<Stop>,
     shared: Arc<Shared>,
@@ -106,13 +106,11 @@ pub fn run(
         pipe,
         ticket,
         session,
-        phase: Phase::Idle { at: now },
+        phase: LinkState::down(now, Attempt::Idle { at: now }),
         backoff: Duration::ZERO,
-        lost_since: Some(now),
         was_up: false,
         hello_sent: false,
         told_direct: false,
-        handover: false,
         stop: None,
         shared,
         events,
@@ -143,21 +141,20 @@ impl Client {
         loop {
             self.on_timers()?;
             let delivered_by = self
-                .lost_since
+                .phase
+                .since()
                 .filter(|_| self.pipe.delivered())
                 .map(|t| t + DELIVERED_GRACE);
             let deadline = [
                 // Pipe timers are for sending, which stops when stopping.
                 self.stop
                     .is_none()
-                    .then(|| self.pipe.deadline(self.up_link()))
+                    .then(|| self.pipe.deadline(self.phase.up()))
                     .flatten(),
                 self.phase_deadline(),
                 self.stop.as_ref().map(Stop::wake_at),
                 delivered_by,
-                self.lost_since
-                    .filter(|_| self.handover)
-                    .map(|t| t + HANDOVER_GRACE),
+                self.phase.handover_by(),
             ]
             .into_iter()
             .flatten()
@@ -174,11 +171,7 @@ impl Client {
             }
 
             if self.stop.is_none() {
-                let link = match &self.phase {
-                    Phase::Up { link } => Some(link),
-                    _ => None,
-                };
-                if let Err(e) = self.pipe.pump(&mut self.endpoint, link) {
+                if let Err(e) = self.pipe.pump(&mut self.endpoint, self.phase.up()) {
                     self.lose(&format!("send failed: {e}"));
                 }
                 self.stop = Stop::check(&self.shared, &self.pipe);
@@ -190,8 +183,10 @@ impl Client {
                 // From Hello on the server may hold our session, so the news
                 // goes out on a stream still waiting for Welcome too.
                 let link = match &self.phase {
-                    Phase::Up { link } | Phase::Handshaking { link, .. } => Some(link),
-                    _ => None,
+                    LinkState::Up(link) | LinkState::Down(_, Attempt::Handshaking { link, .. }) => {
+                        Some(link)
+                    }
+                    LinkState::Down(..) => None,
                 };
                 match stop.step(&mut self.endpoint, link, self.hello_sent) {
                     Ok(true) => return Ok(Exit::Stopped(self.stop.take().ok_or("no stop")?)),
@@ -211,9 +206,12 @@ impl Client {
 
     /// The current stream, whether or not its handshake finished.
     fn take_link(&mut self) -> Option<Link> {
-        match std::mem::replace(&mut self.phase, Phase::Idle { at: Instant::now() }) {
-            Phase::Handshaking { link, .. } | Phase::Up { link } => Some(link),
-            _ => None,
+        match self
+            .phase
+            .lose(Instant::now(), false, Attempt::Idle { at: Instant::now() })
+        {
+            Lost::Up(link, _) | Lost::Attempt(Attempt::Handshaking { link, .. }) => Some(link),
+            Lost::Attempt(_) => None,
         }
     }
 
@@ -221,27 +219,47 @@ impl Client {
         &self.ticket.peer
     }
 
-    fn up_link(&self) -> Option<&Link> {
+    /// The current stream, whether or not its handshake finished.
+    fn link(&self) -> Option<&Link> {
         match &self.phase {
-            Phase::Up { link } => Some(link),
-            _ => None,
+            LinkState::Up(link) | LinkState::Down(_, Attempt::Handshaking { link, .. }) => {
+                Some(link)
+            }
+            LinkState::Down(..) => None,
+        }
+    }
+
+    fn link_mut(&mut self) -> Option<&mut Link> {
+        match &mut self.phase {
+            LinkState::Up(link) | LinkState::Down(_, Attempt::Handshaking { link, .. }) => {
+                Some(link)
+            }
+            LinkState::Down(..) => None,
+        }
+    }
+
+    /// Where the next attempt goes; ignored while up.
+    fn set_attempt(&mut self, next: Attempt) {
+        if let LinkState::Down(_, attempt) = &mut self.phase {
+            *attempt = next;
         }
     }
 
     fn phase_deadline(&self) -> Option<Instant> {
         match &self.phase {
-            Phase::Idle { at } => Some(*at),
-            Phase::Opening { since, .. } | Phase::Handshaking { since, .. } => {
-                Some(*since + SETUP_TIMEOUT)
-            }
-            Phase::Up { link } => Some(link.dead_at()),
-            Phase::Connecting { .. } => None,
+            LinkState::Down(_, Attempt::Idle { at }) => Some(*at),
+            LinkState::Down(
+                _,
+                Attempt::Opening { since, .. } | Attempt::Handshaking { since, .. },
+            ) => Some(*since + SETUP_TIMEOUT),
+            LinkState::Up(link) => Some(link.dead_at()),
+            LinkState::Down(_, Attempt::Connecting { .. }) => None,
         }
     }
 
     fn on_timers(&mut self) -> Result<(), Box<dyn Error>> {
         let now = Instant::now();
-        if let Some(since) = self.lost_since
+        if let Some(since) = self.phase.since()
             && now.duration_since(since) >= RESUME_TIMEOUT
         {
             return Err(Disconnected(if self.was_up {
@@ -251,23 +269,20 @@ impl Client {
             })
             .into());
         }
-        if self.handover
-            && let Some(since) = self.lost_since
-            && now.duration_since(since) >= HANDOVER_GRACE
-        {
-            self.handover = false;
+        if self.phase.handover_overran(now) {
             self.events.emit(Event::LinkLost {
                 reason: "connection closed".to_owned(),
             });
         }
         match &self.phase {
-            Phase::Idle { at } if now >= *at => self.start(),
-            Phase::Opening { since, .. } | Phase::Handshaking { since, .. }
-                if now.duration_since(*since) >= SETUP_TIMEOUT =>
-            {
+            LinkState::Down(_, Attempt::Idle { at }) if now >= *at => self.start(),
+            LinkState::Down(
+                _,
+                Attempt::Opening { since, .. } | Attempt::Handshaking { since, .. },
+            ) if now.duration_since(*since) >= SETUP_TIMEOUT => {
                 self.lose("stream setup timed out");
             }
-            Phase::Up { link } if now >= link.dead_at() => {
+            LinkState::Up(link) if now >= link.dead_at() => {
                 // The connection under a silent stream may be a relayed
                 // circuit the relay dropped without telling us; a stream on
                 // it would be just as dead, so start over with a fresh one.
@@ -296,7 +311,7 @@ impl Client {
                 self.events.emit(Event::Connecting {
                     peer: self.peer().clone(),
                 });
-                self.phase = Phase::Connecting { id };
+                self.set_attempt(Attempt::Connecting { id });
             }
             Err(e) => self.retry(&format!("connect: {e}")),
         }
@@ -306,11 +321,11 @@ impl Client {
         let peer = self.peer().clone();
         match self.endpoint.open_stream(&peer, PROTOCOL) {
             Ok((conn, stream)) => {
-                self.phase = Phase::Opening {
+                self.set_attempt(Attempt::Opening {
                     conn,
                     stream,
                     since: Instant::now(),
-                };
+                });
             }
             Err(e) => self.retry(&format!("open stream: {e}")),
         }
@@ -321,7 +336,7 @@ impl Client {
         match event {
             // Start on the provisional relayed path rather than waiting out
             // the hole punch; the session moves over if the punch lands.
-            EndpointEvent::Nat(NatEvent::PathEstablished { connect_id, .. }) if matches!(self.phase, Phase::Connecting { id } if id == connect_id) =>
+            EndpointEvent::Nat(NatEvent::PathEstablished { connect_id, .. }) if matches!(self.phase, LinkState::Down(_, Attempt::Connecting { id }) if id == connect_id) =>
             {
                 self.open();
             }
@@ -329,7 +344,7 @@ impl Client {
                 connect_id,
                 outcome,
                 ..
-            } if matches!(self.phase, Phase::Connecting { id } if id == connect_id) => {
+            } if matches!(self.phase, LinkState::Down(_, Attempt::Connecting { id }) if id == connect_id) => {
                 match outcome {
                     ConnectOutcome::Connected { .. } => self.open(),
                     ConnectOutcome::Failed(failure) => self.retry(&format!("connect: {failure}")),
@@ -343,7 +358,7 @@ impl Client {
                 stream_id,
                 initiated_locally: true,
                 ..
-            } if matches!(self.phase, Phase::Opening { conn, stream, .. }
+            } if matches!(self.phase, LinkState::Down(_, Attempt::Opening { conn, stream, .. })
                     if conn == conn_id && stream == stream_id)
                 && peer_id == *self.peer() =>
             {
@@ -360,11 +375,11 @@ impl Client {
                     recv: self.pipe.recv_offset(),
                     resume: self.was_up,
                 };
-                self.phase = Phase::Handshaking {
+                self.set_attempt(Attempt::Handshaking {
                     link,
                     since: Instant::now(),
-                };
-                if let Phase::Handshaking { link, .. } = &self.phase {
+                });
+                if let LinkState::Down(_, Attempt::Handshaking { link, .. }) = &self.phase {
                     match link.send(&mut self.endpoint, &hello) {
                         Ok(()) => self.hello_sent = true,
                         Err(e) => self.lose(&format!("hello: {e}")),
@@ -382,7 +397,7 @@ impl Client {
                 conn_id,
                 stream_id,
             } => {
-                if let Phase::Handshaking { link, .. } | Phase::Up { link } = &self.phase
+                if let Some(link) = self.link()
                     && link.is(&peer_id, conn_id, stream_id)
                 {
                     link.writable();
@@ -439,7 +454,7 @@ impl Client {
         stream: StreamId,
         data: &[u8],
     ) -> Result<(), Box<dyn Error>> {
-        let (Phase::Handshaking { link, .. } | Phase::Up { link }) = &mut self.phase else {
+        let Some(link) = self.link_mut() else {
             return Ok(());
         };
         if !link.is(peer, conn, stream) {
@@ -447,39 +462,41 @@ impl Client {
         }
         link.push(data);
         loop {
-            let (Phase::Handshaking { link, .. } | Phase::Up { link }) = &mut self.phase else {
+            let Some(link) = self.link_mut() else {
                 return Ok(());
             };
             let Some(frame) = link.reader.next()? else {
                 return Ok(());
             };
-            match (frame, &self.phase) {
-                (Frame::Welcome { recv }, Phase::Handshaking { .. }) => {
+            match (frame, &mut self.phase) {
+                (
+                    Frame::Welcome { recv },
+                    LinkState::Down(_, attempt @ Attempt::Handshaking { .. }),
+                ) => {
                     self.pipe.attach(recv)?;
-                    let Phase::Handshaking { link, .. } =
-                        std::mem::replace(&mut self.phase, Phase::Idle { at: Instant::now() })
+                    let Attempt::Handshaking { link, .. } =
+                        std::mem::replace(attempt, Attempt::Idle { at: Instant::now() })
                     else {
                         return Ok(());
                     };
-                    if std::mem::take(&mut self.handover) {
-                        log::debug!("session moved to the direct connection");
-                    } else if self.was_up {
-                        log::debug!("session resumed");
-                        self.events.emit(Event::Resumed);
-                    } else {
+                    let (_, resumed) = self.phase.resume(link);
+                    if !self.was_up {
                         let direct = net::is_direct(&self.endpoint, &self.ticket.peer);
                         self.told_direct = direct;
                         self.events.emit(Event::Connected {
                             peer: self.ticket.peer.clone(),
                             path: PathKind::from_direct(direct),
                         });
+                    } else if resumed {
+                        log::debug!("session resumed");
+                        self.events.emit(Event::Resumed);
+                    } else {
+                        log::debug!("session moved to the direct connection");
                     }
-                    self.phase = Phase::Up { link };
-                    self.lost_since = None;
                     self.backoff = Duration::ZERO;
                     self.was_up = true;
                 }
-                (Frame::Error(message), Phase::Handshaking { .. }) => {
+                (Frame::Error(message), LinkState::Down(_, Attempt::Handshaking { .. })) => {
                     let what = if self.was_up {
                         "server ended the session"
                     } else {
@@ -489,7 +506,7 @@ impl Client {
                         net::PeerEnded(format!("{what}: {}", message.escape_debug())).into(),
                     );
                 }
-                (frame, Phase::Up { .. }) => self.pipe.on_frame(frame)?,
+                (frame, LinkState::Up(_)) => self.pipe.on_frame(frame)?,
                 (frame, _) => return Err(format!("unexpected {frame:?} before Welcome").into()),
             }
         }
@@ -497,9 +514,9 @@ impl Client {
 
     fn phase_conn(&self) -> Option<ConnectionId> {
         match &self.phase {
-            Phase::Opening { conn, .. } => Some(*conn),
-            Phase::Handshaking { link, .. } | Phase::Up { link } => Some(link.conn),
-            Phase::Idle { .. } | Phase::Connecting { .. } => None,
+            LinkState::Down(_, Attempt::Opening { conn, .. }) => Some(*conn),
+            LinkState::Down(_, Attempt::Idle { .. } | Attempt::Connecting { .. }) => None,
+            _ => self.link().map(|link| link.conn),
         }
     }
 
@@ -511,54 +528,57 @@ impl Client {
         }
         match (&self.phase, stream) {
             (
-                Phase::Opening {
-                    conn: c, stream: s, ..
-                },
+                LinkState::Down(
+                    _,
+                    Attempt::Opening {
+                        conn: c, stream: s, ..
+                    },
+                ),
                 Some(stream),
             ) => *c == conn && *s == stream,
-            (Phase::Handshaking { link, .. } | Phase::Up { link }, Some(stream)) => {
-                link.is(peer, conn, stream)
-            }
+            (_, Some(stream)) => self.link().is_some_and(|link| link.is(peer, conn, stream)),
             (_, None) => self.phase_conn() == Some(conn),
-            _ => false,
         }
     }
 
     /// Drops the current stream, if any, and schedules a fresh one.
     fn lose(&mut self, reason: &str) {
-        match std::mem::replace(&mut self.phase, Phase::Idle { at: Instant::now() }) {
-            Phase::Opening { conn, stream, .. } => {
-                if let Err(e) = self.endpoint.abandon_stream(conn, stream) {
-                    log::debug!("abandon stream: {e}");
-                }
-            }
-            Phase::Handshaking { link, .. } => link.abandon(&mut self.endpoint),
-            Phase::Up { link } => {
-                link.abandon(&mut self.endpoint);
-                if !self.handover {
-                    self.events.emit(Event::LinkLost {
-                        reason: reason.to_owned(),
-                    });
-                }
-            }
-            Phase::Idle { .. } | Phase::Connecting { .. } => {}
-        }
-        self.retry(reason);
+        self.drop_stream(reason, false);
     }
 
     /// Moves the session off a relayed circuit onto the direct connection
     /// that replaced it; a planned move, so not reported as a lost link.
     fn hand_over(&mut self) {
-        self.handover = matches!(self.phase, Phase::Up { .. });
-        self.lose("moving to the direct connection");
+        self.drop_stream("moving to the direct connection", true);
+    }
+
+    fn drop_stream(&mut self, reason: &str, handover: bool) {
+        let now = Instant::now();
+        match self.phase.lose(now, handover, Attempt::Idle { at: now }) {
+            Lost::Attempt(Attempt::Opening { conn, stream, .. }) => {
+                if let Err(e) = self.endpoint.abandon_stream(conn, stream) {
+                    log::debug!("abandon stream: {e}");
+                }
+            }
+            Lost::Attempt(Attempt::Handshaking { link, .. }) => link.abandon(&mut self.endpoint),
+            Lost::Up(link, report) => {
+                link.abandon(&mut self.endpoint);
+                if report {
+                    self.events.emit(Event::LinkLost {
+                        reason: reason.to_owned(),
+                    });
+                }
+            }
+            Lost::Attempt(Attempt::Idle { .. } | Attempt::Connecting { .. }) => {}
+        }
+        self.retry(reason);
     }
 
     fn retry(&mut self, reason: &str) {
         log::debug!("{reason}; retrying in {:?}", self.backoff);
-        self.lost_since.get_or_insert_with(Instant::now);
-        self.phase = Phase::Idle {
+        self.set_attempt(Attempt::Idle {
             at: Instant::now() + self.backoff,
-        };
+        });
         self.backoff = (self.backoff * 2)
             .max(Duration::from_millis(250))
             .min(MAX_BACKOFF);

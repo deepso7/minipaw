@@ -22,7 +22,7 @@ use minip2p::{
 use crate::config::Config;
 use crate::event::{Event, PathKind};
 use crate::net::{
-    self, ABORT_GRACE, DELIVERED_GRACE, Disconnected, HANDOVER_GRACE, LINGER, PeerEnded,
+    self, ABORT_GRACE, DELIVERED_GRACE, Disconnected, LINGER, LinkState, Lost, PeerEnded,
     RESUME_TIMEOUT, STDOUT_GRACE, Stop,
 };
 use crate::pipe::{Link, LocalFailure, Pipe};
@@ -111,10 +111,9 @@ pub struct ServerCore<H> {
     admission: HashMap<PeerId, Admission>,
     sessions: HashMap<SlotKey, Slot>,
     next_id: u64,
-    /// A stop was requested: no new sessions, and every slot is ending.
-    stopping: bool,
-    /// Once stopping, when whatever is still ending is cut short: one
-    /// deadline for the whole server, however many sessions it had.
+    /// Set once a stop was requested: no new sessions, and every slot is
+    /// ending. Whatever is still ending by then is cut short: one deadline
+    /// for the whole server, however many sessions it had.
     shutdown_by: Option<Instant>,
     shared: Arc<Shared>,
     started: Instant,
@@ -185,15 +184,10 @@ enum State {
 /// A session that has started.
 struct Live {
     pipe: Pipe,
-    link: Option<Link>,
-    /// Since when the session has had no stream.
-    lost_since: Option<Instant>,
+    /// The stream; down while the client is to come back on a fresh one.
+    path: LinkState<Link, ()>,
     /// The user has been told the client is on a direct path.
     told_direct: bool,
-    /// The stream was dropped as the client moved onto a direct
-    /// connection: its loss and resume go unreported unless it takes
-    /// [`HANDOVER_GRACE`].
-    handover: bool,
 }
 
 /// Why a running session ends.
@@ -250,7 +244,6 @@ impl<H: Host> ServerCore<H> {
             admission: HashMap::new(),
             sessions: HashMap::new(),
             next_id: 1,
-            stopping: false,
             shutdown_by: None,
             shared,
             started: Instant::now(),
@@ -304,7 +297,7 @@ impl<H: Host> ServerCore<H> {
             if self.step_sessions() {
                 return Ok(Exit::Host);
             }
-            if self.stopping && self.sessions.is_empty() {
+            if self.shutdown_by.is_some() && self.sessions.is_empty() {
                 return Ok(Exit::Stopped(crate::Error::Stopped));
             }
         }
@@ -484,7 +477,7 @@ impl<H: Host> ServerCore<H> {
                 self.check_early(key);
             }
             State::Running(live) => {
-                if let Some(link) = &mut live.link {
+                if let Some(link) = live.path.up_mut() {
                     link.push(data);
                 }
                 if let Err(e) = self.read_frames(key) {
@@ -505,7 +498,7 @@ impl<H: Host> ServerCore<H> {
         else {
             return Ok(());
         };
-        let Some(link) = &mut live.link else {
+        let Some(link) = live.path.up_mut() else {
             return Ok(());
         };
         while let Some(frame) = link.reader.next()? {
@@ -517,8 +510,7 @@ impl<H: Host> ServerCore<H> {
         {
             self.drop_link_after = None;
             log::debug!("test hook: dropping the link without closing it");
-            live.link = None;
-            live.lost_since = Some(Instant::now());
+            live.path = LinkState::down(Instant::now(), ());
         }
         Ok(())
     }
@@ -584,7 +576,7 @@ impl<H: Host> ServerCore<H> {
         if resume {
             return self.refuse(link, "session ended");
         }
-        if self.stopping {
+        if self.shutdown_by.is_some() {
             return self.refuse(link, "interrupted");
         }
         if self.sessions.len() >= self.max_sessions {
@@ -713,10 +705,11 @@ impl<H: Host> ServerCore<H> {
         );
         let mut live = Live {
             pipe,
-            lost_since: link.is_none().then(Instant::now),
-            link,
+            path: match link {
+                Some(link) => LinkState::Up(link),
+                None => LinkState::down(Instant::now(), ()),
+            },
             told_direct: direct,
-            handover: false,
         };
         let attached = live.pipe.attach(recv);
         self.sessions.insert(
@@ -756,13 +749,13 @@ impl<H: Host> ServerCore<H> {
             return;
         }
         log::debug!("client resumed at offset {recv}");
-        if !std::mem::take(&mut live.handover) {
+        let (old, resumed) = live.path.resume(link);
+        if resumed {
             self.host.session_event(*id, Event::Resumed);
         }
-        if let Some(old) = live.link.replace(link) {
+        if let Some(old) = old {
             old.abandon(&mut self.endpoint);
         }
-        live.lost_since = None;
         let attached = live.pipe.attach(recv);
         if let Err(e) = attached
             .map_err(Into::into)
@@ -786,7 +779,7 @@ impl<H: Host> ServerCore<H> {
             // The Error goes out on it next, before any Welcome; the dialer
             // takes it then too. The old stream is kept for confirmation.
             log::debug!("session {id}: client is back; telling it the session is over");
-            live.link = Some(link);
+            live.path = LinkState::Up(link);
         } else if ending.clean && Instant::now() < ending.by {
             // The dialer takes an Ack only once welcomed.
             log::debug!("session {id}: client is back for our last ack");
@@ -799,7 +792,7 @@ impl<H: Host> ServerCore<H> {
             match sent {
                 Ok(()) => {
                     link.close_write(&mut self.endpoint);
-                    live.link = Some(link);
+                    live.path = LinkState::Up(link);
                     ending.linger = Some(ending.by);
                 }
                 Err(e) => {
@@ -944,11 +937,10 @@ impl<H: Host> ServerCore<H> {
                 }
             }
             State::Running(live) => {
-                live.handover = upgrade;
-                live.lose(slot.id, &mut self.endpoint, &mut self.host, reason);
+                live.lose(slot.id, &mut self.endpoint, &mut self.host, reason, upgrade);
             }
             State::Ending(live, _) => {
-                if let Some(link) = live.link.take() {
+                if let Lost::Up(link, _) = live.path.lose(Instant::now(), false, ()) {
                     link.abandon(&mut self.endpoint);
                 }
             }
@@ -959,7 +951,7 @@ impl<H: Host> ServerCore<H> {
     /// A stop request, or the host failing while no session holds its end.
     /// Returns the exit when there is no session to see out.
     fn check_stop(&mut self) -> Option<Exit> {
-        if self.stopping {
+        if self.shutdown_by.is_some() {
             return None;
         }
         let mut stop = if self.shared.stopped() {
@@ -967,7 +959,6 @@ impl<H: Host> ServerCore<H> {
         } else {
             Stop::failed(self.host.failure()?)
         };
-        self.stopping = true;
         // Telling a peer takes the longest part of a stop; every slot gets
         // that long, together.
         self.shutdown_by = Some(Instant::now() + ABORT_GRACE);
@@ -1030,14 +1021,14 @@ impl<H: Host> ServerCore<H> {
         };
         let (endpoint, host) = (&mut self.endpoint, &mut self.host);
         if live
-            .link
-            .as_ref()
+            .path
+            .up()
             .is_some_and(|l| Instant::now() >= l.dead_at())
         {
-            live.lose(*id, endpoint, host, "no word from the client");
+            live.lose(*id, endpoint, host, "no word from the client", false);
         }
-        if let Err(e) = live.pipe.pump(endpoint, live.link.as_ref()) {
-            live.lose(*id, endpoint, host, &format!("send failed: {e}"));
+        if let Err(e) = live.pipe.pump(endpoint, live.path.up()) {
+            live.lose(*id, endpoint, host, &format!("send failed: {e}"), false);
         }
         if let Some(failure) = live.pipe.take_failure() {
             host.session_event(*id, Event::Stopping);
@@ -1046,9 +1037,8 @@ impl<H: Host> ServerCore<H> {
         if live.pipe.done() {
             return Some(End::Done);
         }
-        let since = live.lost_since?;
-        if live.handover && since.elapsed() >= HANDOVER_GRACE {
-            live.handover = false;
+        let since = live.path.since()?;
+        if live.path.handover_overran(Instant::now()) {
             host.session_event(
                 *id,
                 Event::LinkLost {
@@ -1095,19 +1085,19 @@ impl<H: Host> ServerCore<H> {
         };
         let now = Instant::now();
         if let Some(stop) = &mut ending.tell {
-            match stop.step(&mut self.endpoint, live.link.as_ref(), true) {
+            match stop.step(&mut self.endpoint, live.path.up(), true) {
                 Ok(true) => ending.tell = None,
                 Ok(false) => {}
                 // A fresh stream from the client can carry it instead.
                 Err(e) => {
                     log::debug!("session {id}: stop not sent: {e}");
-                    if let Some(link) = live.link.take() {
+                    if let Lost::Up(link, _) = live.path.lose(now, false, ()) {
                         link.abandon(&mut self.endpoint);
                     }
                 }
             }
         }
-        if !ending.lingering(live.link.is_some(), now) {
+        if !ending.lingering(live.path.up().is_some(), now) {
             ending.linger = None;
         }
         if !ending.drained {
@@ -1183,7 +1173,7 @@ impl Slot {
     fn link(&self) -> Option<&Link> {
         match &self.state {
             State::Connecting(held) => held.as_ref().map(|(link, _)| link),
-            State::Running(live) | State::Ending(live, _) => live.link.as_ref(),
+            State::Running(live) | State::Ending(live, _) => live.path.up(),
             State::Done => None,
         }
     }
@@ -1193,12 +1183,12 @@ impl Slot {
     fn deadline(&self, resume_timeout: Duration) -> Option<Instant> {
         match &self.state {
             State::Running(live) => {
-                let lost = |grace| live.lost_since.map(|t| t + grace);
+                let lost = |grace| live.path.since().map(|t| t + grace);
                 [
-                    live.pipe.deadline(live.link.as_ref()),
-                    live.link.as_ref().map(Link::dead_at),
+                    live.pipe.deadline(live.path.up()),
+                    live.path.up().map(Link::dead_at),
                     lost(DELIVERED_GRACE).filter(|_| live.pipe.delivered()),
-                    lost(HANDOVER_GRACE).filter(|_| live.handover),
+                    live.path.handover_by(),
                     lost(resume_timeout),
                 ]
                 .into_iter()
@@ -1219,12 +1209,20 @@ impl Slot {
 }
 
 impl Live {
-    fn lose<H: Host>(&mut self, id: u64, endpoint: &mut Endpoint, host: &mut H, reason: &str) {
-        if let Some(link) = self.link.take() {
+    /// Drops the stream, if any; `handover` when the client is moving onto
+    /// a direct connection.
+    fn lose<H: Host>(
+        &mut self,
+        id: u64,
+        endpoint: &mut Endpoint,
+        host: &mut H,
+        reason: &str,
+        handover: bool,
+    ) {
+        if let Lost::Up(link, report) = self.path.lose(Instant::now(), handover, ()) {
             log::debug!("lost the client stream ({reason}); waiting for it to resume");
             link.abandon(endpoint);
-            self.lost_since = Some(Instant::now());
-            if !self.handover {
+            if report {
                 host.session_event(
                     id,
                     Event::LinkLost {
@@ -1264,7 +1262,7 @@ impl Ending {
             drained: false,
         };
         let mut linger = |live: &mut Live| {
-            live.link.as_ref()?.close_write(endpoint);
+            live.path.up()?.close_write(endpoint);
             Some(now + LINGER)
         };
         match end {
