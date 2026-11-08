@@ -79,6 +79,118 @@ pub fn is_upgrade(old: ConnectionId, new: ConnectionId) -> bool {
     old.is_circuit() && !new.is_circuit()
 }
 
+/// A session's stream: up on `U`, or down while `A` gets a fresh one. Both
+/// sides keep one, so that `LinkLost` and `Resumed` are reported alike and
+/// in pairs.
+pub enum LinkState<U, A> {
+    Up(U),
+    Down(Down, A),
+}
+
+/// How long a session has been without a stream, and whether the user has
+/// been told.
+#[derive(Clone, Copy, Debug)]
+pub struct Down {
+    since: Instant,
+    /// The stream was dropped to move onto a direct connection: its loss
+    /// and resume go unreported unless it takes [`HANDOVER_GRACE`].
+    handover: bool,
+}
+
+/// What [`LinkState::lose`] dropped.
+pub enum Lost<U, A> {
+    /// The stream that was up, and whether its loss is reported now.
+    Up(U, bool),
+    /// The attempt that was under way; the session was down already.
+    Attempt(A),
+}
+
+impl<U, A> LinkState<U, A> {
+    /// A path down since `now`, its loss already reported.
+    pub fn down(now: Instant, attempt: A) -> Self {
+        LinkState::Down(
+            Down {
+                since: now,
+                handover: false,
+            },
+            attempt,
+        )
+    }
+
+    pub fn up(&self) -> Option<&U> {
+        match self {
+            LinkState::Up(up) => Some(up),
+            LinkState::Down(..) => None,
+        }
+    }
+
+    pub fn up_mut(&mut self) -> Option<&mut U> {
+        match self {
+            LinkState::Up(up) => Some(up),
+            LinkState::Down(..) => None,
+        }
+    }
+
+    /// Since when the session has had no stream.
+    pub fn since(&self) -> Option<Instant> {
+        match self {
+            LinkState::Up(_) => None,
+            LinkState::Down(down, _) => Some(down.since),
+        }
+    }
+
+    /// When a handover still unreported becomes a lost link.
+    pub fn handover_by(&self) -> Option<Instant> {
+        match self {
+            LinkState::Down(down, _) if down.handover => Some(down.since + HANDOVER_GRACE),
+            _ => None,
+        }
+    }
+
+    /// Drops the stream, or the attempt at one, with `next` attempt to
+    /// follow. `handover` is a stream dropped to move onto a direct
+    /// connection. A session already down stays as it was: whether its loss
+    /// was reported is settled when it went down.
+    pub fn lose(&mut self, now: Instant, handover: bool, next: A) -> Lost<U, A> {
+        let next = match self {
+            LinkState::Up(_) => LinkState::Down(
+                Down {
+                    since: now,
+                    handover,
+                },
+                next,
+            ),
+            LinkState::Down(down, _) => LinkState::Down(*down, next),
+        };
+        match std::mem::replace(self, next) {
+            LinkState::Up(up) => Lost::Up(up, !handover),
+            LinkState::Down(_, attempt) => Lost::Attempt(attempt),
+        }
+    }
+
+    /// Up again on `up`. Returns the stream it replaces, if any, and
+    /// whether to report a resume: one is owed for every loss reported,
+    /// and for a stream replaced while it seemed up.
+    pub fn resume(&mut self, up: U) -> (Option<U>, bool) {
+        match std::mem::replace(self, LinkState::Up(up)) {
+            LinkState::Up(old) => (Some(old), true),
+            LinkState::Down(down, _) => (None, !down.handover),
+        }
+    }
+
+    /// Whether a handover took [`HANDOVER_GRACE`] by `now`, so its loss is
+    /// reported now; its resume will be too.
+    pub fn handover_overran(&mut self, now: Instant) -> bool {
+        match self {
+            LinkState::Down(down, _) if down.handover && now >= down.since + HANDOVER_GRACE => {
+                down.handover = false;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Whether the endpoint's current connection to `peer` skips the relay.
 pub fn is_direct(endpoint: &Endpoint, peer: &minip2p::PeerId) -> bool {
     !matches!(endpoint.path(peer), Some(Path::Relayed { .. }))
@@ -522,4 +634,83 @@ pub fn test_wake() -> minip2p::WaitHandle {
         .bind()
         .expect("bind endpoint")
         .wait_handle()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn up() -> LinkState<&'static str, ()> {
+        LinkState::Up("stream")
+    }
+
+    #[test]
+    fn a_lost_stream_is_reported_and_so_is_its_resume() {
+        let t0 = Instant::now();
+        let mut path = up();
+        assert!(matches!(path.lose(t0, false, ()), Lost::Up("stream", true)));
+        assert_eq!(path.since(), Some(t0));
+        assert_eq!(path.handover_by(), None);
+        assert!(!path.handover_overran(t0 + HANDOVER_GRACE));
+        assert!(matches!(path.resume("fresh"), (None, true)));
+        assert_eq!(path.since(), None);
+    }
+
+    #[test]
+    fn a_quick_handover_goes_unreported() {
+        let t0 = Instant::now();
+        let mut path = up();
+        assert!(matches!(path.lose(t0, true, ()), Lost::Up(_, false)));
+        assert_eq!(path.handover_by(), Some(t0 + HANDOVER_GRACE));
+        assert!(!path.handover_overran(t0 + HANDOVER_GRACE / 2));
+        assert!(matches!(path.resume("direct"), (None, false)));
+    }
+
+    #[test]
+    fn a_slow_handover_is_reported_once_then_resumed() {
+        let t0 = Instant::now();
+        let mut path = up();
+        path.lose(t0, true, ());
+        assert!(path.handover_overran(t0 + HANDOVER_GRACE));
+        assert!(!path.handover_overran(t0 + HANDOVER_GRACE * 2));
+        assert_eq!(path.handover_by(), None);
+        assert!(matches!(path.resume("direct"), (None, true)));
+    }
+
+    #[test]
+    fn later_attempts_keep_a_handover_pending() {
+        // Up on a relayed circuit that is upgraded; within the grace the
+        // direct connection dies, and the attempt on a fresh circuit is
+        // upgraded too. The first loss is still reported once the grace
+        // runs out, and the resume after it.
+        let t0 = Instant::now();
+        let mut path = up();
+        assert!(matches!(path.lose(t0, true, ()), Lost::Up(_, false)));
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(matches!(path.lose(t1, false, ()), Lost::Attempt(())));
+        let t2 = t0 + Duration::from_secs(2);
+        assert!(matches!(path.lose(t2, true, ()), Lost::Attempt(())));
+        assert_eq!(path.since(), Some(t0));
+        assert!(path.handover_overran(t0 + HANDOVER_GRACE));
+        assert!(matches!(path.resume("fresh"), (None, true)));
+    }
+
+    #[test]
+    fn a_handover_while_down_is_not_a_fresh_loss() {
+        // Lost and reported: an upgrade under a later attempt must not
+        // hide the resume that is owed.
+        let t0 = Instant::now();
+        let mut path = up();
+        path.lose(t0, false, ());
+        path.lose(t0 + Duration::from_secs(1), true, ());
+        assert_eq!(path.since(), Some(t0));
+        assert_eq!(path.handover_by(), None);
+        assert!(matches!(path.resume("direct"), (None, true)));
+    }
+
+    #[test]
+    fn a_stream_replaced_while_up_is_a_resume() {
+        let mut path = up();
+        assert!(matches!(path.resume("fresh"), (Some("stream"), true)));
+    }
 }

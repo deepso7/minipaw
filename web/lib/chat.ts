@@ -76,11 +76,14 @@ export interface ChatHandlers {
   acked: (offset: number) => void;
 }
 
+/** The session offset just past a sent text, or why it wasn't taken:
+ * "closed" once either side has finished or the session has ended, "full"
+ * while the terminal is too far behind. */
+export type Sent = number | "closed" | "full";
+
 export interface Chat {
-  /** Sends `text` and returns the session offset just past it, or
-   * undefined when it isn't taken: after leaving, or while the terminal is
-   * too far behind. */
-  send: (text: string) => number | undefined;
+  /** Sends `text`; see {@link Sent}. */
+  send: (text: string) => Sent;
   /** Finishes our side; the session ends once the terminal's side has too. */
   leave: () => void;
   /** Ends at once, telling the terminal why. */
@@ -93,24 +96,32 @@ const sleep = (ms: number) =>
     setTimeout(resolve, ms);
   });
 
+/** Where the session's connection is. `dialing` and `handshaking` count
+ * the resume window from `lostSince`; `heardAt` is when the stream last
+ * delivered anything. */
+type Link =
+  | { kind: "loading" }
+  /** No stream; `reason` is why the last working one was lost. */
+  | { kind: "dialing"; lostSince: number; reason?: string }
+  /** A Hello is out on `stream`, waiting for Welcome. */
+  | { kind: "handshaking"; stream: Stream; lostSince: number; heardAt: number }
+  | { kind: "up"; stream: Stream; heardAt: number }
+  | { kind: "ended"; ok: boolean; reason: string };
+
 class Session implements Chat {
   readonly #ticket: Ticket;
   readonly #on: ChatHandlers;
   readonly #id = crypto.getRandomValues(new Uint8Array(16));
   readonly #decoder = new TextDecoder();
   #endpoint: Minip2p | undefined;
-  /** The current stream, and whether its Welcome came. */
-  #stream: Stream | undefined;
-  #up = false;
+  #link: Link = { kind: "loading" };
+  /** Some stream has been welcomed. */
   #wasUp = false;
   /** A Hello went out: from then on the terminal may hold our session, so
    * stopping must tell it, even on a stream still waiting for Welcome. */
   #helloSent = false;
-  #ended = false;
-  /** Since when we've had no working stream; 0 while up. */
-  #lostSince = Date.now();
-  #heardAt = 0;
   #sentAt = 0;
+  /** Runs from dialing until the end; only `#go` touches it. */
   #timer: ReturnType<typeof setInterval> | undefined;
 
   // Our half: unacked bytes start at session offset `#acked`.
@@ -135,15 +146,28 @@ class Session implements Chat {
     return this.#acked + this.#unacked.length;
   }
 
-  send(text: string) {
+  get #ended() {
+    return this.#link.kind === "ended";
+  }
+
+  /** The current stream, while there is one. */
+  get #stream() {
+    const link = this.#link;
+
+    return link.kind === "handshaking" || link.kind === "up"
+      ? link.stream
+      : undefined;
+  }
+
+  send(text: string): Sent {
     if (this.#eof || this.#ended) {
-      return;
+      return "closed";
     }
 
     const bytes = new TextEncoder().encode(text);
 
     if (this.#unacked.length + bytes.length > MAX_UNACKED) {
-      return;
+      return "full";
     }
 
     const unacked = new Uint8Array(this.#unacked.length + bytes.length);
@@ -183,7 +207,7 @@ class Session implements Chat {
   }
 
   async run() {
-    this.#on.state({ kind: "loading" });
+    this.#go({ kind: "loading" });
 
     try {
       await initMinip2p({ wasm });
@@ -205,30 +229,26 @@ class Session implements Chat {
       return;
     }
 
-    this.#on.state({ kind: "connecting" });
     // The resume window covers reaching the terminal, not loading the wasm.
-    this.#lostSince = Date.now();
-    this.#timer = setInterval(() => this.#tick(), 1000);
+    this.#go({ kind: "dialing", lostSince: Date.now() });
     let backoff = 0;
 
     while (!this.#ended) {
       try {
         // oxlint-disable-next-line no-await-in-loop -- one stream at a time, by design.
-        await this.#link();
-        backoff = 0;
+        await this.#connect();
       } catch (error) {
-        if (error instanceof FatalError) {
-          this.#finish(false, error.message);
-        } else {
-          this.#lose(String(error));
-        }
+        this.#lose(error instanceof FatalError ? error : String(error));
       }
 
-      if (this.#ended) {
+      // Short of the end, a stream that stopped leaves us dialing.
+      const link = this.#link;
+
+      if (link.kind !== "dialing") {
         return;
       }
 
-      if (Date.now() - this.#lostSince >= RESUME_TIMEOUT) {
+      if (Date.now() - link.lostSince >= RESUME_TIMEOUT) {
         this.#finish(
           false,
           this.#wasUp
@@ -246,10 +266,11 @@ class Session implements Chat {
   }
 
   /** Runs one stream, from connecting to its end. */
-  async #link() {
+  async #connect() {
     const endpoint = this.#endpoint;
+    const link = this.#link;
 
-    if (!endpoint) {
+    if (!endpoint || link.kind !== "dialing") {
       return;
     }
 
@@ -277,8 +298,12 @@ class Session implements Chat {
       return;
     }
 
-    this.#stream = stream;
-    this.#heardAt = Date.now();
+    this.#go({
+      heardAt: Date.now(),
+      kind: "handshaking",
+      lostSince: link.lostSince,
+      stream,
+    });
     // Once welcomed, the terminal holds our session: from then on a Hello
     // asks to resume it, and a terminal that doesn't have it refuses.
     this.#write(hello(this.#ticket.token, this.#id, this.#recv, this.#wasUp));
@@ -290,8 +315,10 @@ class Session implements Chat {
         // oxlint-disable-next-line no-await-in-loop -- a stream reads in order.
         const chunk = await stream.read();
 
+        const current = this.#link;
+
         // Closed while waiting: what arrives now is for nobody.
-        if (this.#ended) {
+        if (current.kind !== "handshaking" && current.kind !== "up") {
           return;
         }
 
@@ -299,14 +326,16 @@ class Session implements Chat {
           throw new Error("stream closed");
         }
 
-        this.#heardAt = Date.now();
+        current.heardAt = Date.now();
         reader.push(chunk);
 
         for (let next = reader.next(); next; next = reader.next()) {
-          if (this.#up) {
+          const now = this.#link;
+
+          if (now.kind === "up") {
             this.#onFrame(next);
-          } else {
-            this.#onHandshake(next);
+          } else if (now.kind === "handshaking") {
+            this.#onHandshake(next, now);
           }
         }
 
@@ -318,16 +347,13 @@ class Session implements Chat {
           return;
         }
       }
-    } finally {
-      if (this.#stream === stream) {
-        this.#stream = undefined;
-      }
-
-      this.#up = false;
+    } catch (error) {
+      // Off this stream before anything else can write to it.
+      this.#lose(error instanceof FatalError ? error : String(error));
     }
   }
 
-  #onHandshake(next: Frame) {
+  #onHandshake(next: Frame, link: Link & { kind: "handshaking" }) {
     if (next.kind === ERROR) {
       throw new FatalError(
         `${this.#wasUp ? "the terminal ended the session" : "the terminal refused"}: ${next.message}`
@@ -347,10 +373,7 @@ class Session implements Chat {
     // Resend from what it received; acked bytes stay until it writes them.
     this.#sent = next.recv;
     this.#finSent = false;
-    this.#up = true;
-    this.#on.state({ kind: "up", resumed: this.#wasUp });
-    this.#wasUp = true;
-    this.#lostSince = 0;
+    this.#go({ heardAt: link.heardAt, kind: "up", stream: link.stream });
 
     // The last ack may have died with the old stream.
     if (this.#recv > 0 || this.#peerFin !== undefined) {
@@ -453,7 +476,7 @@ class Session implements Chat {
 
   /** Puts pending data, then our Fin, on the stream once it's up. */
   #flush() {
-    if (!this.#up) {
+    if (this.#link.kind !== "up") {
       return;
     }
 
@@ -494,18 +517,19 @@ class Session implements Chat {
   }
 
   #tick() {
-    const stream = this.#stream;
+    const link = this.#link;
 
-    if (!stream) {
+    if (link.kind !== "handshaking" && link.kind !== "up") {
       return;
     }
 
     const now = Date.now();
+    const up = link.kind === "up";
 
-    if (now - this.#heardAt >= (this.#up ? DEAD_AFTER : SETUP_TIMEOUT)) {
+    if (now - link.heardAt >= (up ? DEAD_AFTER : SETUP_TIMEOUT)) {
       // A relayed circuit can die without word; a stream on the same
       // connection would be just as dead, so drop the connection too.
-      stream.reset();
+      link.stream.reset();
 
       try {
         this.#endpoint?.disconnect(this.#ticket.peerId);
@@ -516,32 +540,102 @@ class Session implements Chat {
       return;
     }
 
-    if (this.#up && now - this.#sentAt >= PING_INTERVAL) {
+    if (up && now - this.#sentAt >= PING_INTERVAL) {
       this.#write(frame(PING));
     }
   }
 
-  #lose(reason: string) {
-    console.debug(`minipaw: ${reason}; retrying`);
-
-    // Report the first failure only, not every retry after it.
-    if (this.#lostSince !== 0) {
-      return;
-    }
-
-    this.#lostSince = Date.now();
-    this.#on.state({ kind: "reconnecting", reason });
-  }
-
-  #finish(ok: boolean, reason: string) {
+  /** A stream, or the attempt at one, failed: end on a FatalError, else go
+   * back to dialing. */
+  #lose(error: FatalError | string) {
+    // A stream failing after the end is just the endpoint closing.
     if (this.#ended) {
       return;
     }
 
-    this.#ended = true;
-    clearInterval(this.#timer);
-    this.#on.state({ kind: "ended", ok, reason });
-    const stream = this.#stream;
+    if (error instanceof FatalError) {
+      // The stream broke the protocol: drop it rather than close it.
+      this.#finish(false, error.message, false);
+
+      return;
+    }
+
+    const reason = error;
+    console.debug(`minipaw: ${reason}; retrying`);
+    const link = this.#link;
+
+    // Report the first failure only, not every retry after it.
+    if (link.kind === "up") {
+      this.#go({ kind: "dialing", lostSince: Date.now(), reason });
+    } else if (link.kind === "handshaking") {
+      this.#go({ kind: "dialing", lostSince: link.lostSince });
+    }
+  }
+
+  /** Moves the link to `next` and tells the page; nothing moves it once
+   * ended. Returns whether it moved. */
+  #go(next: Link) {
+    const prev = this.#link;
+
+    if (prev.kind === "ended") {
+      return false;
+    }
+
+    this.#link = next;
+
+    // The timer is set before the page hears, so a handler that closes the
+    // session at once clears it.
+    if (next.kind === "ended") {
+      clearInterval(this.#timer);
+    } else if (next.kind !== "loading") {
+      this.#timer ??= setInterval(() => this.#tick(), 1000);
+    }
+
+    switch (next.kind) {
+      case "loading": {
+        this.#on.state({ kind: "loading" });
+        break;
+      }
+
+      case "dialing": {
+        if (prev.kind === "loading") {
+          this.#on.state({ kind: "connecting" });
+        } else if (prev.kind === "up") {
+          this.#on.state({ kind: "reconnecting", reason: next.reason ?? "" });
+        }
+
+        break;
+      }
+
+      case "up": {
+        const resumed = this.#wasUp;
+        this.#wasUp = true;
+        this.#on.state({ kind: "up", resumed });
+        break;
+      }
+
+      case "ended": {
+        this.#on.state({ kind: "ended", ok: next.ok, reason: next.reason });
+        break;
+      }
+
+      default: {
+        break;
+      }
+    }
+
+    return true;
+  }
+
+  /** Ends the session; `graceful` closes the stream's write side and gives
+   * what's on it time to leave. */
+  #finish(ok: boolean, reason: string, graceful = true) {
+    const stream = graceful ? this.#stream : undefined;
+
+    if (!this.#go({ kind: "ended", ok, reason })) {
+      return;
+    }
+
     stream?.closeWrite();
     setTimeout(
       () => {

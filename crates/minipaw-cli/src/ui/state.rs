@@ -4,9 +4,9 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use minipaw::{Error, Event, Outcome, PathKind, PeerId, Progress, Role, Ticket};
+use minipaw::{Error, Event, Outcome, PathKind, PeerId, Progress, Role};
 
-use super::Launch;
+use super::{Launch, Target};
 
 /// How many warnings [`State`] keeps; older ones are dropped.
 pub const MAX_WARNINGS: usize = 8;
@@ -54,6 +54,34 @@ impl Phase {
     /// [`Failed`](Phase::Failed).
     pub fn is_ended(self) -> bool {
         matches!(self, Phase::Done | Phase::Failed)
+    }
+
+    /// Whether no peer has connected yet: [`Starting`](Phase::Starting),
+    /// [`Reserving`](Phase::Reserving) or [`Waiting`](Phase::Waiting).
+    pub fn is_before_peer(self) -> bool {
+        matches!(self, Phase::Starting | Phase::Reserving | Phase::Waiting)
+    }
+
+    /// The phase after `event`. Only [`State::finish`] leaves
+    /// [`Stopping`](Phase::Stopping), and an ended phase never changes.
+    fn next(self, event: &Event) -> Phase {
+        match event {
+            // The SDK still reports what happens while it stops.
+            _ if self == Phase::Stopping || self.is_ended() => self,
+            Event::Stopping => Phase::Stopping,
+            Event::Reserving { .. } | Event::ReservationLost if self.is_before_peer() => {
+                Phase::Reserving
+            }
+            Event::Listening { .. } | Event::ReservationRestored if self.is_before_peer() => {
+                Phase::Waiting
+            }
+            // A dialer also reports each reconnect attempt while resuming.
+            Event::Connecting { .. } if self == Phase::Starting => Phase::Connecting,
+            Event::Accepted { .. } | Event::Connected { .. } | Event::Resumed => Phase::Connected,
+            Event::LinkLost { .. } => Phase::Resuming,
+            // Events added to the SDK later change nothing here.
+            _ => self,
+        }
     }
 }
 
@@ -126,14 +154,10 @@ pub struct State {
     /// The peer: the listener from the ticket for a dialer, the dialer once
     /// accepted for a listener.
     pub peer: Option<PeerId>,
-    /// The relay a listener reserves on, once reported.
-    pub relay: Option<PeerId>,
     /// How the connection is routed, once connected.
     pub path: Option<PathKind>,
     /// Whether the connection moved from the relay to a direct path.
     pub upgraded: bool,
-    /// The listener's ticket: ours once listening, or the one we dial.
-    pub ticket: Option<Ticket>,
     /// Recent trouble worth showing (slow reservation, lost links), oldest
     /// first, at most [`MAX_WARNINGS`].
     pub warnings: Vec<String>,
@@ -143,10 +167,6 @@ pub struct State {
     pub connected_at: Option<Instant>,
     /// When the session ended, from [`finish`](Self::finish).
     pub ended_at: Option<Instant>,
-    /// Why the session failed, from [`finish`](Self::finish).
-    pub error: Option<String>,
-    /// How the session succeeded, from [`finish`](Self::finish).
-    pub outcome: Option<Outcome>,
     /// The size of our input, when it is a regular file.
     pub input_len: Option<u64>,
     /// The latest progress snapshot.
@@ -161,19 +181,18 @@ impl State {
     /// A session about to start at `now`.
     pub fn new(launch: &Launch, now: Instant) -> Self {
         State {
-            role: launch.role,
+            role: launch.role(),
             phase: Phase::Starting,
-            peer: launch.ticket.as_ref().map(|t| t.peer().clone()),
-            relay: None,
+            peer: match &launch.target {
+                Target::Listen => None,
+                Target::Dial(ticket) => Some(ticket.peer().clone()),
+            },
             path: None,
             upgraded: false,
-            ticket: launch.ticket.clone(),
             warnings: Vec::new(),
             started: now,
             connected_at: None,
             ended_at: None,
-            error: None,
-            outcome: None,
             input_len: launch.input_len,
             progress: Progress::default(),
             up: RateMeter::default(),
@@ -188,68 +207,26 @@ impl State {
 
     /// Updates the state for `event`, which happened at `now`.
     pub fn apply_at(&mut self, event: &Event, now: Instant) {
-        let before_peer = matches!(
-            self.phase,
-            Phase::Starting | Phase::Reserving | Phase::Waiting
-        );
+        self.phase = self.phase.next(event);
         match event {
-            Event::Reserving { relay } => {
-                self.relay = Some(relay.clone());
-                if before_peer {
-                    self.phase = Phase::Reserving;
-                }
-            }
-            Event::Listening { ticket } => {
-                self.ticket = Some(ticket.clone());
-                if before_peer {
-                    self.phase = Phase::Waiting;
-                }
-            }
             Event::ReservationSlow => {
                 self.warn("still no relay reservation; is the relay reachable over UDP?");
             }
-            Event::ReservationLost => {
-                self.warn("lost the relay reservation; reacquiring");
-                if before_peer {
-                    self.phase = Phase::Reserving;
-                }
-            }
-            Event::ReservationRestored => {
-                if before_peer {
-                    self.phase = Phase::Waiting;
-                }
-            }
-            Event::Connecting { peer } => {
-                self.peer = Some(peer.clone());
-                self.phase = Phase::Connecting;
-            }
+            Event::ReservationLost => self.warn("lost the relay reservation; reacquiring"),
+            Event::Connecting { peer } => self.peer = Some(peer.clone()),
             Event::Accepted { peer, path } | Event::Connected { peer, path } => {
                 self.peer = Some(peer.clone());
                 self.path = Some(*path);
-                // The SDK still reports what happens while it stops.
-                if self.phase != Phase::Stopping {
-                    self.phase = Phase::Connected;
-                }
                 self.connected_at.get_or_insert(now);
             }
             Event::Upgraded => {
                 self.path = Some(PathKind::Direct);
                 self.upgraded = true;
             }
-            Event::LinkLost { reason } => {
-                self.warn(&format!("link lost: {reason}"));
-                if self.phase != Phase::Stopping {
-                    self.phase = Phase::Resuming;
-                }
-            }
+            Event::LinkLost { reason } => self.warn(&format!("link lost: {reason}")),
             Event::Resumed => {
-                if self.phase != Phase::Stopping {
-                    self.phase = Phase::Connected;
-                }
                 self.connected_at.get_or_insert(now);
             }
-            Event::Stopping => self.phase = Phase::Stopping,
-            // Events added to the SDK later change nothing here.
             _ => {}
         }
     }
@@ -261,19 +238,17 @@ impl State {
         self.down.record(now, progress.written);
     }
 
-    /// Records how the session ended, at `now`.
+    /// Records how the session ended, at `now`; only the first call counts.
     pub fn finish(&mut self, result: &Result<Outcome, Error>, now: Instant) {
-        self.ended_at = Some(now);
-        match result {
-            Ok(outcome) => {
-                self.phase = Phase::Done;
-                self.outcome = Some(*outcome);
-            }
-            Err(e) => {
-                self.phase = Phase::Failed;
-                self.error = Some(e.to_string());
-            }
+        if self.phase.is_ended() {
+            return;
         }
+        self.ended_at = Some(now);
+        self.phase = if result.is_ok() {
+            Phase::Done
+        } else {
+            Phase::Failed
+        };
     }
 
     /// Outgoing bytes per second the peer is confirming.
@@ -336,6 +311,8 @@ mod tests {
     use minipaw::Config;
 
     const PEER: &str = "12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf";
+    const TICKET: &str =
+        "mpAQDrKEuiH1EeUzlyYzX5zShnJgAkCAESIJXT0qGmgiYC5QMCzvVNIDiMmFduWCFl_Yuh1DfJ1h8B";
 
     fn peer() -> PeerId {
         PEER.parse().expect("peer id")
@@ -343,8 +320,7 @@ mod tests {
 
     fn launch(input_len: Option<u64>) -> Launch {
         Launch {
-            role: Role::Listener,
-            ticket: None,
+            target: Target::Listen,
             config: Config::default(),
             verbose: false,
             input_len,
@@ -362,7 +338,6 @@ mod tests {
         assert_eq!(state.phase, Phase::Starting);
         state.apply_at(&Event::Reserving { relay: peer() }, t0);
         assert_eq!(state.phase, Phase::Reserving);
-        assert_eq!(state.relay, Some(peer()));
         state.apply_at(&Event::ReservationSlow, t0);
         assert_eq!(state.phase, Phase::Reserving);
         assert_eq!(state.warnings.len(), 1);
@@ -406,17 +381,18 @@ mod tests {
         assert_eq!(state.phase, Phase::Stopping);
         state.finish(&Err(Error::Stopped), secs(t0, 10.0));
         assert_eq!(state.phase, Phase::Failed);
-        assert_eq!(state.error.as_deref(), Some("stopped"));
         assert_eq!(state.elapsed(secs(t0, 60.0)), Duration::from_secs(10));
     }
 
     #[test]
     fn a_dialer_connects() {
         let t0 = Instant::now();
+        let ticket: minipaw::Ticket = TICKET.parse().expect("ticket");
         let mut l = launch(None);
-        l.role = Role::Dialer;
+        l.target = Target::Dial(ticket.clone());
         let mut state = State::new(&l, t0);
-        assert_eq!(state.peer, None);
+        assert_eq!(state.role, Role::Dialer);
+        assert_eq!(state.peer.as_ref(), Some(ticket.peer()));
         state.apply_at(&Event::Connecting { peer: peer() }, t0);
         assert_eq!(state.phase, Phase::Connecting);
         assert_eq!(state.peer, Some(peer()));
@@ -426,7 +402,6 @@ mod tests {
         assert!(!state.upgraded);
         state.finish(&Ok(Outcome::Done), t0);
         assert_eq!(state.phase, Phase::Done);
-        assert_eq!(state.outcome, Some(Outcome::Done));
         assert!(state.phase.is_ended());
     }
 
@@ -444,6 +419,38 @@ mod tests {
         state.apply_at(&Event::Connected { peer: peer(), path }, t0);
         assert_eq!(state.phase, Phase::Stopping);
         assert_eq!(state.path, Some(PathKind::Direct));
+    }
+
+    #[test]
+    fn reconnect_attempts_do_not_hide_resuming_or_stopping() {
+        let t0 = Instant::now();
+        let mut state = State::new(&launch(None), t0);
+        let path = PathKind::Relayed;
+        state.apply_at(&Event::Connected { peer: peer(), path }, t0);
+        state.apply_at(
+            &Event::LinkLost {
+                reason: "gone".into(),
+            },
+            t0,
+        );
+        state.apply_at(&Event::Connecting { peer: peer() }, t0);
+        assert_eq!(state.phase, Phase::Resuming);
+        state.apply_at(&Event::Stopping, t0);
+        state.apply_at(&Event::Connecting { peer: peer() }, t0);
+        assert_eq!(state.phase, Phase::Stopping);
+    }
+
+    #[test]
+    fn an_ended_session_stays_ended() {
+        let t0 = Instant::now();
+        let mut state = State::new(&launch(None), t0);
+        state.finish(&Ok(Outcome::Done), secs(t0, 1.0));
+        state.apply_at(&Event::Stopping, t0);
+        state.apply_at(&Event::Resumed, t0);
+        assert_eq!(state.phase, Phase::Done);
+        state.finish(&Err(Error::Stopped), secs(t0, 2.0));
+        assert_eq!(state.phase, Phase::Done);
+        assert_eq!(state.elapsed(secs(t0, 60.0)), Duration::from_secs(1));
     }
 
     #[test]

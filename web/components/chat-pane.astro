@@ -252,22 +252,24 @@ const autoNote =
 <script>
   // Listeners are delegated from document: Blume's client router swaps the
   // page's DOM on navigation but runs this module once.
-  import type { Chat, ChatState } from "../lib/chat";
+  import type { Chat, ChatState, Sent } from "../lib/chat";
   import { findTicket, parseTicket } from "../lib/ticket";
   import type { Ticket } from "../lib/ticket";
 
-  let chat: Chat | undefined;
+  // Where the page is. Each connect gets fresh `importing` and `live`
+  // objects, so a load or session the page has since let go of sees it isn't
+  // current and drops what it has.
+  type Pane =
+    | { kind: "idle" }
+    // lib/chat.ts is loading. `pending` holds lines sent meanwhile in a
+    // fixed-ticket pane, with their rows: they go out once the session exists.
+    | { kind: "importing"; pending: { text: string; item: HTMLElement }[] }
+    // `up` while the session has a stream; `leaving` once Leave was pressed,
+    // so a resume after it doesn't reopen the message box.
+    | { kind: "live"; chat: Chat; up: boolean; leaving: boolean }
+    | { kind: "ended" };
 
-  // Bumped whenever the page lets go of its chat, so a connect still loading
-  // lib/chat.ts when the visitor navigates away never starts.
-  let generation = 0;
-
-  // Leave was pressed: a resume after it must not reopen the message box.
-  let leaving = false;
-
-  // Lines sent in a fixed-ticket pane while lib/chat.ts is still loading,
-  // with their rows: they go out once the session exists.
-  let pending: { text: string; item: HTMLElement }[] = [];
+  let now: Pane = { kind: "idle" };
 
   // The other side's current line, which its next text continues.
   let peerLine: HTMLElement | undefined;
@@ -278,12 +280,6 @@ const autoNote =
   // A fixed-ticket pane: the message box works before, during and after a
   // session, and using it is what connects.
   const isAuto = () => pane()?.dataset.auto !== undefined;
-
-  const setPhase = (phase: string) => {
-    const root = pane();
-
-    if (root) {root.dataset.phase = phase;}
-  };
 
   const short = (peerId: string) => `${peerId.slice(0, 8)}…${peerId.slice(-4)}`;
 
@@ -347,8 +343,47 @@ const autoNote =
     }
   };
 
-  const setComposing = (on: boolean) => {
+  // A chat is loading or running: no second connect.
+  const busy = () => now.kind === "importing" || now.kind === "live";
+
+  const checkTicket = (input: HTMLInputElement) => {
+    const raw = input.value.trim();
+    const found = findTicket(raw);
+    const note = $<HTMLElement>("[data-chat-ticket-note]");
+    const go = $<HTMLButtonElement>("[data-chat-go]");
+    let problem = "";
+
+    if (raw && !found) {
+      problem = "That isn't a whole ticket. Paste the full line minipaw printed.";
+    } else if (found?.ticket.ownRelay) {
+      problem = "This ticket names its own relay. The browser can only reach a minipaw on the default relay.";
+    }
+
+    if (note) {note.textContent = problem || (note.dataset.note ?? "");}
+
+    if (go) {go.disabled = busy() || !found || Boolean(problem);}
+
+    return problem ? undefined : found?.ticket;
+  };
+
+  // Moves the page to `next`, and the pane's phase and controls with it.
+  const setPane = (next: Pane) => {
+    now = next;
+    const root = pane();
+
+    if (root) {root.dataset.phase = busy() ? "active" : next.kind;}
+
+    const ticket = $<HTMLInputElement>("[data-chat-ticket]");
+
+    if (ticket) {checkTicket(ticket);}
+
+    // A fixed-ticket pane's box always takes lines; otherwise it's open
+    // while connected, until Leave.
     if (isAuto()) {return;}
+
+    const on = next.kind === "live" && next.up && !next.leaving;
+    const message = $<HTMLInputElement>("[data-chat-message]");
+    const opening = on && message?.disabled === true;
 
     for (const el of document.querySelectorAll<HTMLInputElement | HTMLButtonElement>(
       "[data-chat-message], [data-chat-send]"
@@ -356,7 +391,7 @@ const autoNote =
       el.disabled = !on;
     }
 
-    if (on) {$<HTMLInputElement>("[data-chat-message]")?.focus({ preventScroll: true });}
+    if (opening) {message?.focus({ preventScroll: true });}
   };
 
   const onState = (state: ChatState) => {
@@ -376,21 +411,24 @@ const autoNote =
       case "up": {
         status(state.resumed ? "connected (resumed)" : "connected", "up");
         say(state.resumed ? "resumed" : "connected via relay", "ok");
-        setComposing(!leaving);
+
+        if (now.kind === "live") {setPane({ ...now, up: true });}
+
         break;
       }
 
       case "reconnecting": {
         status("reconnecting", "down");
         say(`link lost (${state.reason}); reconnecting…`, "bad");
-        setComposing(false);
+
+        if (now.kind === "live") {setPane({ ...now, up: false });}
+
         break;
       }
 
       case "ended": {
         status(state.ok ? "ended" : "failed", state.ok ? "idle" : "down");
         say(state.reason, state.ok ? "" : "bad");
-        setComposing(false);
 
         // Offsets belong to one session: rows it never confirmed can't be
         // confirmed by the next one, whose offsets start over.
@@ -404,15 +442,9 @@ const autoNote =
           }
         }
 
-        chat = undefined;
-        pending = [];
-        setPhase("ended");
+        setPane({ kind: "ended" });
 
         if (isAuto()) {say("type to start a new chat");}
-
-        const go = $<HTMLButtonElement>("[data-chat-go]");
-
-        if (go) {go.disabled = false;}
 
         break;
       }
@@ -463,26 +495,6 @@ const autoNote =
     }
   };
 
-  const checkTicket = (input: HTMLInputElement) => {
-    const raw = input.value.trim();
-    const found = findTicket(raw);
-    const note = $<HTMLElement>("[data-chat-ticket-note]");
-    const go = $<HTMLButtonElement>("[data-chat-go]");
-    let problem = "";
-
-    if (raw && !found) {
-      problem = "That isn't a whole ticket. Paste the full line minipaw printed.";
-    } else if (found?.ticket.ownRelay) {
-      problem = "This ticket names its own relay. The browser can only reach a minipaw on the default relay.";
-    }
-
-    if (note) {note.textContent = problem || (note.dataset.note ?? "");}
-
-    if (go) {go.disabled = chat !== undefined || !found || Boolean(problem);}
-
-    return problem ? undefined : found?.ticket;
-  };
-
   // Our line's row, with the "…" that becomes ✓ once it's printed.
   const ourLine = (text: string) => {
     peerLine = undefined;
@@ -499,8 +511,8 @@ const autoNote =
   };
 
   // Records where the session put a line, or that it didn't take it.
-  const queue = (item: HTMLElement, end: number | undefined) => {
-    if (end === undefined) {
+  const queue = (item: HTMLElement, end: Sent) => {
+    if (end === "closed" || end === "full") {
       const tick = item.querySelector(".tick");
 
       if (tick) {tick.textContent = "not sent";}
@@ -512,38 +524,40 @@ const autoNote =
   };
 
   const connect = async (ticket: Ticket) => {
-    $<HTMLButtonElement>("[data-chat-go]")?.setAttribute("disabled", "");
-    setPhase("active");
-
     // A fixed-ticket pane keeps its transcript across chats.
     if (!isAuto()) {$("[data-chat-log]")?.replaceChildren();}
 
     peerLine = undefined;
     $("[data-chat-peer]")?.replaceChildren(`· peer ${short(ticket.peerId)}`);
-    generation += 1;
-    leaving = false;
-    const mine = generation;
+    const mine: Pane = { kind: "importing", pending: [] };
+    setPane(mine);
 
     try {
       const { startChat } = await import("../lib/chat");
 
-      if (mine !== generation) {return;}
+      // Cancelled, or the visitor left, while it loaded: never start.
+      if (now !== mine) {return;}
 
-      // A session the page has let go of may still report; drop it.
+      // A session the page has let go of may still report; drop it. Its
+      // "loading" comes before startChat returns, while the pane is `mine`.
+      // oxlint-disable-next-line prefer-const -- the handlers need it before startChat returns.
+      let chat: Chat | undefined;
+
       const live =
         <T,>(handler: (value: T) => void) =>
         (value: T) => {
-          if (mine === generation) {handler(value);}
+          if (now === mine || (now.kind === "live" && now.chat === chat)) {handler(value);}
         };
 
       chat = startChat(ticket, { acked: live(onAcked), state: live(onState), text: live(onText) });
+      setPane({ chat, kind: "live", leaving: false, up: false });
 
       // The session buffers what it's given until its stream is up.
-      for (const { text, item } of pending) {queue(item, chat.send(`${text}\n`));}
+      for (const { text, item } of mine.pending) {queue(item, chat.send(`${text}\n`));}
 
-      pending = [];
+      mine.pending = [];
     } catch (error) {
-      if (mine === generation) {
+      if (now === mine) {
         onState({ kind: "ended", ok: false, reason: `couldn't load the chat: ${String(error)}` });
       }
     }
@@ -554,7 +568,7 @@ const autoNote =
     const fixed = pane()?.dataset.ticket;
     const ticket = fixed ? parseTicket(fixed) : undefined;
 
-    if (ticket && !chat && pane()?.dataset.phase !== "active") {void connect(ticket);}
+    if (ticket && !busy()) {void connect(ticket);}
   };
 
   const send = () => {
@@ -564,22 +578,30 @@ const autoNote =
 
     const text = input.value;
 
-    if (!chat) {
+    if (now.kind !== "live") {
       // A fixed-ticket pane takes the line now and sends it once connected.
       if (!isAuto()) {return;}
 
       input.value = "";
-      pending.push({ item: ourLine(text), text });
+      const item = ourLine(text);
       autoConnect();
+
+      if (now.kind === "importing") {now.pending.push({ item, text });}
 
       return;
     }
 
     // A terminal reads lines, so each message is one.
-    const end = chat.send(`${text}\n`);
+    const end = now.chat.send(`${text}\n`);
 
-    if (end === undefined) {
+    if (end === "full") {
       say("not sent: the other side isn't keeping up. Try again in a moment.", "bad");
+
+      return;
+    }
+
+    if (end === "closed") {
+      say("not sent: the chat is closed.", "bad");
 
       return;
     }
@@ -610,7 +632,7 @@ const autoNote =
     if (target.matches("[data-chat-connect]")) {
       event.preventDefault();
 
-      if (chat) {return;}
+      if (busy()) {return;}
 
       const fixed = pane()?.dataset.ticket;
       const input = $<HTMLInputElement>("[data-chat-ticket]");
@@ -628,36 +650,33 @@ const autoNote =
 
     if (!(target instanceof Element) || !target.closest("[data-chat-leave]")) {return;}
 
-    if (!chat) {
-      // Still loading lib/chat.ts: drop the pending connect, so it never starts.
-      if (pane()?.dataset.phase === "active") {
-        generation += 1;
-        onState({ kind: "ended", ok: true, reason: "connection cancelled" });
-      }
+    // Still loading lib/chat.ts: drop the pending connect, so it never starts.
+    if (now.kind === "importing") {
+      onState({ kind: "ended", ok: true, reason: "connection cancelled" });
 
       return;
     }
 
+    if (now.kind !== "live") {return;}
+
+    const { chat } = now;
     say("leaving; waiting for the other side to finish…");
-    leaving = true;
-    setComposing(false);
+    setPane({ ...now, leaving: true });
     chat.leave();
   });
 
   // Leaving the page ends the session at once, so the other side hears now
   // rather than after its 60 s resume window.
   const abandon = () => {
-    generation += 1;
-    chat?.close("closed the chat page");
+    const was = now;
 
-    // The session's own "ended" is dropped with its generation, so end the
-    // pane here: a page restored from the back/forward cache can connect
-    // again.
-    if (pane()?.dataset.phase === "active") {
+    // End the pane first, so the session's own "ended" is dropped, and a
+    // page restored from the back/forward cache can connect again.
+    if (was.kind === "importing" || was.kind === "live") {
       onState({ kind: "ended", ok: true, reason: "closed when you left the page" });
     }
 
-    chat = undefined;
+    if (was.kind === "live") {was.chat.close("closed the chat page");}
   };
 
   document.addEventListener("astro:before-swap", abandon);
