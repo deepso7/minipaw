@@ -294,6 +294,16 @@ impl Theme {
     }
 }
 
+/// Our side of the session.
+enum Input {
+    /// Lines we send go to the session through this.
+    Open(Sender<Vec<u8>>),
+    /// We ended it with Ctrl-D.
+    Ended,
+    /// The session stopped reading: it is ending.
+    Closed,
+}
+
 /// The chat's state.
 struct Chat {
     state: State,
@@ -302,8 +312,8 @@ struct Chat {
     /// The terminal's size when the box was last anchored.
     size: Option<(u16, u16)>,
     input: LineEdit,
-    /// Our side of the session; `None` once we ended it with Ctrl-D.
-    sender: Option<Sender<Vec<u8>>>,
+    /// Our side of the session.
+    sender: Input,
     splitter: LineSplitter,
     /// Set once reading terminal events failed for good and the session
     /// was stopped.
@@ -318,7 +328,7 @@ impl Chat {
             outbox: Vec::new(),
             size: term::size(),
             input: LineEdit::new(),
-            sender: Some(sender),
+            sender: Input::Open(sender),
             splitter: LineSplitter::new(),
             keys_failed: false,
             theme: Theme::new(color),
@@ -489,7 +499,8 @@ impl Chat {
             KeyCode::Char('c') if ctrl => term::interrupt(),
             KeyCode::Char('d') if ctrl => {
                 if self.input.is_empty() {
-                    if self.sender.take().is_some() {
+                    if matches!(self.sender, Input::Open(_)) {
+                        self.sender = Input::Ended;
                         self.push(
                             Who::Note,
                             "you ended your side; waiting for the peer…".to_owned(),
@@ -505,7 +516,7 @@ impl Chat {
             KeyCode::Char(c)
                 if !ctrl
                     && !key.modifiers.contains(KeyModifiers::ALT)
-                    && self.sender.is_some()
+                    && matches!(self.sender, Input::Open(_))
                     && !c.is_control() =>
             {
                 self.input.insert(c);
@@ -522,22 +533,26 @@ impl Chat {
         }
     }
 
-    /// Sends the input line to the peer and shows it.
+    /// Sends the input line to the peer and shows it. A line the session
+    /// no longer takes stays in the input.
     fn send(&mut self) {
-        let Some(sender) = &self.sender else {
+        let Input::Open(sender) = &self.sender else {
             return;
         };
         if self.input.is_empty() {
             return;
         }
-        let line = self.input.take();
-        let mut bytes = line.clone().into_bytes();
+        let mut bytes = self.input.text().into_bytes();
         bytes.push(b'\n');
         if sender.send(bytes).is_err() {
-            // The session stopped reading: it is ending.
-            self.sender = None;
+            self.sender = Input::Closed;
+            self.push(
+                Who::Warn,
+                "the session is ending; your line was not sent".to_owned(),
+            );
             return;
         }
+        let line = self.input.take();
         self.push(Who::You, sanitize_str(&line));
     }
 
@@ -545,7 +560,7 @@ impl Chat {
     /// side, what we are waiting for.
     fn draw_input_line(&self, frame: &mut Frame<'_>, inner: Rect) {
         let t = &self.theme;
-        if self.sender.is_none() {
+        if matches!(self.sender, Input::Ended) {
             let text = Span::styled(
                 "waiting for the peer to finish · Ctrl-C to quit now",
                 t.hint,
@@ -647,7 +662,7 @@ impl Chat {
         let wide = status_area.width >= INLINE_WIDE;
         let sep = || Span::styled(" · ", t.hint);
 
-        let open = self.sender.is_some();
+        let open = matches!(self.sender, Input::Open(_));
         let prompt = Span::styled("› ", if open { t.you } else { t.hint });
         frame.render_widget(Paragraph::new(prompt), input);
         let [_, text] =
@@ -813,6 +828,27 @@ mod tests {
             rows[2], "  ● connected · via relay · ↑ 0 B  ↓ 0 B · 0:00",
             "{rows:?}"
         );
+    }
+
+    #[test]
+    fn a_line_the_session_no_longer_takes_stays_in_the_input() {
+        let launch = Launch::new(None, minipaw::Config::default(), false);
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        let mut chat = Chat::new(State::new(&launch, Instant::now()), input_tx, false);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        chat.on_key(key(KeyCode::Char('a')));
+        chat.on_key(key(KeyCode::Enter));
+        assert_eq!(input_rx.try_recv().unwrap(), b"a\n");
+        assert!(chat.input.is_empty());
+
+        drop(input_rx);
+        chat.on_key(key(KeyCode::Char('b')));
+        chat.on_key(key(KeyCode::Enter));
+        assert!(matches!(chat.sender, Input::Closed));
+        assert_eq!(chat.input.text(), "b");
+        let last = chat.outbox.last().expect("a note");
+        assert!(matches!(last.who, Who::Warn), "{}", last.text);
+        assert!(last.text.contains("not sent"), "{}", last.text);
     }
 
     #[test]

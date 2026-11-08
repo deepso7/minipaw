@@ -91,13 +91,20 @@ pub fn choose_mode(quiet: bool, plain: bool) -> Mode {
     mode
 }
 
+/// What the session does.
+#[derive(Clone, Debug)]
+pub enum Target {
+    /// Listen for a dialer.
+    Listen,
+    /// Dial the listener behind this ticket.
+    Dial(Ticket),
+}
+
 /// Everything needed to start the session, whatever the mode.
 #[derive(Clone, Debug)]
 pub struct Launch {
-    /// Listening, or dialing [`ticket`](Self::ticket).
-    pub role: Role,
-    /// The ticket to dial; `None` when listening.
-    pub ticket: Option<Ticket>,
+    /// Listening, or dialing a ticket.
+    pub target: Target,
     /// Session settings.
     pub config: Config,
     /// `-v`: show the SDK's debug log.
@@ -110,23 +117,26 @@ impl Launch {
     /// A launch that dials `ticket`, or listens without one.
     pub fn new(ticket: Option<Ticket>, config: Config, verbose: bool) -> Self {
         Launch {
-            role: if ticket.is_some() {
-                Role::Dialer
-            } else {
-                Role::Listener
-            },
-            ticket,
+            target: ticket.map_or(Target::Listen, Target::Dial),
             config,
             verbose,
             input_len: stdin_len(),
         }
     }
 
+    /// Which end the session is.
+    pub fn role(&self) -> Role {
+        match self.target {
+            Target::Listen => Role::Listener,
+            Target::Dial(_) => Role::Dialer,
+        }
+    }
+
     /// The session, over `io`.
     pub fn session(&self, io: Io) -> Session {
-        match &self.ticket {
-            Some(ticket) => minipaw::dial(ticket.clone(), self.config.clone(), io),
-            None => minipaw::listen(self.config.clone(), io),
+        match &self.target {
+            Target::Listen => minipaw::listen(self.config.clone(), io),
+            Target::Dial(ticket) => minipaw::dial(ticket.clone(), self.config.clone(), io),
         }
     }
 }

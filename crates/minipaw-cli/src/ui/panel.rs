@@ -439,15 +439,17 @@ fn down_line(state: &State, paint: Paint) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::Target;
     use minipaw::{Config, Event, PathKind, PeerId, Progress};
     use ratatui::backend::TestBackend;
 
     const PEER: &str = "12D3KooWNAHhp6rp11SvCDA84zua3hhEYTLNjgKmEDmt1BddtLdf";
+    const TICKET: &str =
+        "mpAQDrKEuiH1EeUzlyYzX5zShnJgAkCAESIJXT0qGmgiYC5QMCzvVNIDiMmFduWCFl_Yuh1DfJ1h8B";
 
-    fn launch(role: Role, input_len: Option<u64>) -> Launch {
+    fn launch(target: Target, input_len: Option<u64>) -> Launch {
         Launch {
-            role,
-            ticket: None,
+            target,
             config: Config::default(),
             verbose: false,
             input_len,
@@ -482,7 +484,8 @@ mod tests {
 
     fn transferring(t0: Instant) -> State {
         let peer: PeerId = PEER.parse().expect("peer id");
-        let mut state = State::new(&launch(Role::Dialer, Some(10 << 20)), t0);
+        let target = Target::Dial(TICKET.parse().expect("ticket"));
+        let mut state = State::new(&launch(target, Some(10 << 20)), t0);
         state.apply_at(&Event::Connecting { peer: peer.clone() }, t0);
         let path = PathKind::Relayed;
         state.apply_at(&Event::Connected { peer, path }, t0);
@@ -518,7 +521,7 @@ mod tests {
     #[test]
     fn a_waiting_listener_points_at_the_ticket() {
         let t0 = Instant::now();
-        let mut state = State::new(&launch(Role::Listener, None), t0);
+        let mut state = State::new(&launch(Target::Listen, None), t0);
         // As after Event::Listening, which needs a real ticket.
         state.phase = Phase::Waiting;
         state.apply_at(&Event::ReservationSlow, t0);
