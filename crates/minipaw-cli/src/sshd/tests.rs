@@ -11,7 +11,7 @@
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream as StdStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
@@ -83,6 +83,8 @@ struct Server {
     shared: Arc<Shared>,
     stop: CancellationToken,
     conns: TaskTracker,
+    /// Shuts what its relays pass to the client.
+    valve: Arc<Valve>,
 }
 
 impl Server {
@@ -104,6 +106,7 @@ impl Server {
             }),
             stop: CancellationToken::new(),
             conns: TaskTracker::new(),
+            valve: Arc::default(),
         }
     }
 
@@ -119,7 +122,7 @@ impl Server {
         let cut = client.try_clone().expect("clone");
         let served = if relay {
             let (near, far) = StdStream::pair().expect("pair");
-            spawn_relay(stream(theirs), stream(near));
+            spawn_relay(stream(theirs), stream(near), self.valve.clone());
             far
         } else {
             theirs
@@ -171,16 +174,29 @@ fn stream(std: StdStream) -> UnixStream {
     UnixStream::from_std(std).expect("tokio stream")
 }
 
-/// A full-duplex relay with an unbounded queue each way, so it always keeps
-/// reading both sides.
-fn spawn_relay(a: UnixStream, b: UnixStream) {
-    let (ar, aw) = a.into_split();
-    let (br, bw) = b.into_split();
-    one_way(ar, bw);
-    one_way(br, aw);
+/// Drops what a relay sends the client (`a`) once shut, though the relay
+/// still reads it: the server sends on, but the client grants no window.
+#[derive(Default)]
+struct Valve {
+    shut: AtomicBool,
+    /// Bytes dropped.
+    dropped: AtomicUsize,
 }
 
-fn one_way(mut from: tokio::net::unix::OwnedReadHalf, mut to: tokio::net::unix::OwnedWriteHalf) {
+/// A full-duplex relay with an unbounded queue each way, so it always keeps
+/// reading both sides.
+fn spawn_relay(a: UnixStream, b: UnixStream, valve: Arc<Valve>) {
+    let (ar, aw) = a.into_split();
+    let (br, bw) = b.into_split();
+    one_way(ar, bw, None);
+    one_way(br, aw, Some(valve));
+}
+
+fn one_way(
+    mut from: tokio::net::unix::OwnedReadHalf,
+    mut to: tokio::net::unix::OwnedWriteHalf,
+    valve: Option<Arc<Valve>>,
+) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     tokio::spawn(async move {
         let mut buf = vec![0; 64 * 1024];
@@ -192,6 +208,12 @@ fn one_way(mut from: tokio::net::unix::OwnedReadHalf, mut to: tokio::net::unix::
     });
     tokio::spawn(async move {
         while let Some(data) = rx.recv().await {
+            if let Some(valve) = &valve
+                && valve.shut.load(Ordering::SeqCst)
+            {
+                valve.dropped.fetch_add(data.len(), Ordering::SeqCst);
+                continue;
+            }
             if to.write_all(&data).await.is_err() {
                 return;
             }
@@ -952,6 +974,48 @@ async fn input_past_the_cap_closes_only_that_channel() {
             collect(&mut read).await,
             [out("ok\n"), Ev::Status(0), Ev::Eof, Ev::Close]
         );
+        server.stop().await;
+    })
+    .await;
+}
+
+/// Input past the cap, then the client's close at once, while the client
+/// grants no window: the client closed the channel, so its program is
+/// ended at once rather than after the cap's message waits out its time
+/// for window that never comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_right_after_the_cap_ends_the_program_at_once() {
+    bounded(async {
+        let server = Server::new(keys());
+        let (handle, _cut) = server.login(true).await;
+        // `yes` dies of SIGPIPE at teardown; the shell's `sleep` waits for
+        // the group's end.
+        let (mut read, write) = run(&handle, "echo $$; yes & exec sleep 1000", false).await;
+        let pid = read_pid(&mut read).await;
+        tokio::spawn(async move { while read.wait().await.is_some() {} });
+        let write = Arc::new(write);
+        spawn_writer(write.clone(), config::INPUT_CAP, false)
+            .await
+            .expect("writer");
+        // The server's window for that input has reached the client.
+        handle.send_ping().await.expect("ping");
+        // The client grants no more window: the output uses up the rest.
+        server.valve.shut.store(true, Ordering::SeqCst);
+        let mut dropped = 0;
+        loop {
+            sleep(Duration::from_millis(300)).await;
+            let now = server.valve.dropped.load(Ordering::SeqCst);
+            if now == dropped {
+                break;
+            }
+            dropped = now;
+        }
+        // Past the cap, though the program's pipe took some, and within
+        // the client's window, at least half the server's 2 MiB.
+        write.data(&vec![0; MIB / 2][..]).await.expect("data");
+        write.close().await.expect("close");
+        assert!(ended(pid, Duration::from_secs(5)).await < Duration::from_secs(1));
+        none_running(&server).await;
         server.stop().await;
     })
     .await;

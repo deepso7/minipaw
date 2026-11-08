@@ -151,15 +151,40 @@ impl Input {
     }
 }
 
-/// Why a running channel is being torn down.
+/// Why the server tears a channel down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Reason {
-    /// The client closed it.
-    Closed,
+enum Cause {
     /// Its input passed the cap.
     Cap,
     /// The client broke the protocol (data after EOF).
     Violation,
+}
+
+/// A running channel's teardown, shared by its callbacks and supervisor.
+struct Teardown {
+    /// Cancelled to tear the program down, for any reason.
+    token: CancellationToken,
+    /// Cancelled once the client closed the channel, which russh answered,
+    /// or the connection ended: nothing more reaches the client on it.
+    gone: CancellationToken,
+    /// Set when the server tears it down; the first cause wins.
+    cause: OnceLock<Cause>,
+}
+
+impl Teardown {
+    fn new(connection: &CancellationToken) -> Teardown {
+        let gone = connection.child_token();
+        Teardown {
+            token: gone.child_token(),
+            gone,
+            cause: OnceLock::new(),
+        }
+    }
+
+    fn start(&self, cause: Cause) {
+        let _ = self.cause.set(cause);
+        self.token.cancel();
+    }
 }
 
 /// The connection's handler. russh drops it when the connection ends,
@@ -206,8 +231,7 @@ enum State {
         resize: watch::Sender<WinSize>,
         /// Set by the supervisor once the exit sequence sent `close`.
         finished: Arc<AtomicBool>,
-        reason: Arc<OnceLock<Reason>>,
-        teardown: CancellationToken,
+        teardown: Arc<Teardown>,
     },
     Finished,
 }
@@ -221,17 +245,6 @@ impl Chan {
             self.state = State::Finished;
         }
         &mut self.state
-    }
-
-    /// Tears the running program down for `why`.
-    fn tear_down(&self, why: Reason) {
-        if let State::Running {
-            reason, teardown, ..
-        } = &self.state
-        {
-            let _ = reason.set(why);
-            teardown.cancel();
-        }
     }
 }
 
@@ -350,14 +363,12 @@ impl Conn {
         }
         let (resize, resized) = watch::channel(size);
         let finished = Arc::new(AtomicBool::new(false));
-        let reason = Arc::new(OnceLock::new());
-        let teardown = token.child_token();
+        let teardown = Arc::new(Teardown::new(&token));
         chan.state = State::Running {
             pty,
             eof,
             resize,
             finished: finished.clone(),
-            reason: reason.clone(),
             teardown: teardown.clone(),
         };
         let supervisor = Supervisor {
@@ -367,7 +378,6 @@ impl Conn {
             input,
             resized,
             finished,
-            reason,
             teardown,
             connection: token,
             label,
@@ -601,14 +611,14 @@ impl server::Handler for Conn {
         };
         if eof {
             log::info!("ssh {label}: data after EOF; closing the channel");
-            return close(chan, Reason::Violation, session);
+            return close(chan, Cause::Violation, session);
         }
         if !chan.input.push(data) {
             log::info!(
                 "ssh {label}: input passed the {} MiB buffer; closing the channel",
                 INPUT_CAP >> 20
             );
-            return close(chan, Reason::Cap, session);
+            return close(chan, Cause::Cap, session);
         }
         Ok(())
     }
@@ -643,8 +653,8 @@ impl server::Handler for Conn {
         // russh has already replied. Our state goes when the supervisor
         // ends; a later close of ours never gets here (russh issue C).
         if let Some(chan) = self.chan(channel) {
-            if matches!(chan.state(), State::Running { .. }) {
-                chan.tear_down(Reason::Closed);
+            if let State::Running { teardown, .. } = chan.state() {
+                teardown.gone.cancel();
             } else {
                 chan.input.close();
                 self.chan = None;
@@ -656,18 +666,18 @@ impl server::Handler for Conn {
 
 /// Closes the channel for `why` from a callback: before the program runs,
 /// at once; after, through its supervisor.
-fn close(chan: &mut Chan, why: Reason, session: &mut Session) -> Result<(), russh::Error> {
+fn close(chan: &mut Chan, why: Cause, session: &mut Session) -> Result<(), russh::Error> {
     chan.input.close();
     match chan.state() {
         State::Configuring { .. } => {
             chan.state = State::Finished;
-            if why == Reason::Cap {
+            if why == Cause::Cap {
                 session.extended_data(chan.id, 1, CAP_MESSAGE.as_bytes().to_vec())?;
             }
             session.close(chan.id)
         }
-        State::Running { .. } => {
-            chan.tear_down(why);
+        State::Running { teardown, .. } => {
+            teardown.start(why);
             Ok(())
         }
         State::Finished => Ok(()),
@@ -681,6 +691,14 @@ enum Program {
     Sftp(sftp::Fs),
 }
 
+/// How a channel's program ended.
+enum End {
+    /// It exited, or SFTP ended, with this to report.
+    Exited(Exit),
+    /// It was torn down.
+    TornDown,
+}
+
 /// Runs a channel's program and reports its end to the client.
 struct Supervisor {
     id: ChannelId,
@@ -689,10 +707,9 @@ struct Supervisor {
     input: Arc<Input>,
     resized: watch::Receiver<WinSize>,
     finished: Arc<AtomicBool>,
-    reason: Arc<OnceLock<Reason>>,
-    /// Cancelled to tear the program down: the channel closing, its cap,
-    /// the connection ending, or the server stopping.
-    teardown: CancellationToken,
+    /// The program is torn down when the channel closes, for its cap or
+    /// data after EOF, or when the connection ends or the server stops.
+    teardown: Arc<Teardown>,
     /// Cancelled when the connection ends or the server stops.
     connection: CancellationToken,
     label: String,
@@ -742,16 +759,13 @@ impl Supervisor {
                 Ok(status) => process::exit_of(status),
                 Err(_) => Exit::Status(255),
             };
-            log::info!("ssh {}: {} ended: {exit:?}", self.label, self.what);
-            if !self.report(exit).await {
-                let why = self.ending().await;
-                self.close_after(why).await;
-            }
+            self.finish(End::Exited(exit), async {}).await;
         } else {
-            let why = self.ending().await;
-            process.end().await;
-            let _ = process.reap().await;
-            self.close_after(why).await;
+            let stop = async {
+                process.end().await;
+                let _ = process.reap().await;
+            };
+            self.finish(End::TornDown, stop).await;
         }
     }
 
@@ -763,102 +777,110 @@ impl Supervisor {
             let input = sftp::InputReader::new(self.input.clone());
             sftp::serve(&mut fs, input, &mut self.write.make_writer()).await
         };
-        let served = tokio::select! {
-            served = served => Some(served),
-            () = self.teardown.cancelled() => None,
-        };
-        // Its input closed under it (the cap, or data after EOF), which
-        // reads as EOF: the teardown that follows every such close decides.
-        let served = match served {
-            Some(_) if self.input.is_closed() => {
-                self.teardown.cancelled().await;
-                None
-            }
-            served => served,
+        let end = tokio::select! {
+            served = served => match served {
+                // Its input closed under it (the cap, or data after EOF),
+                // which reads as EOF: the teardown that follows every such
+                // close decides.
+                _ if self.input.is_closed() => {
+                    self.teardown.token.cancelled().await;
+                    End::TornDown
+                }
+                Ok(()) => End::Exited(Exit::Status(0)),
+                Err(e) => {
+                    log::info!("ssh {}: sftp: {e}", self.label);
+                    End::Exited(Exit::Status(1))
+                }
+            },
+            () = self.teardown.token.cancelled() => End::TornDown,
         };
         // Its files are closed in the background: close(2) may hang.
         fs.close_all();
         self.input.close();
-        match served {
-            Some(served) => {
-                let exit = match served {
-                    Ok(()) => Exit::Status(0),
-                    Err(e) => {
-                        log::info!("ssh {}: sftp: {e}", self.label);
-                        Exit::Status(1)
-                    }
-                };
-                log::info!("ssh {}: {} ended: {exit:?}", self.label, self.what);
-                if !self.report(exit).await {
-                    let why = self.ending().await;
-                    self.close_after(why).await;
-                }
-            }
-            None => {
-                let why = self.ending().await;
-                self.close_after(why).await;
-            }
-        }
+        self.finish(end, async {}).await;
     }
 
-    /// The normal end: exit status, EOF and close, each cut short by a
-    /// teardown; `false` if one was, so the caller finishes as a teardown
-    /// does, closing the channel if the server tore it down.
-    async fn report(&self, exit: Exit) -> bool {
-        let report = async {
-            let sent = match exit {
-                Exit::Status(code) => self.handle.exit_status_request(self.id, code).await,
-                Exit::Signal(name, core) => {
-                    let sig = Exit::sig(name);
-                    self.handle
-                        .exit_signal_request(self.id, sig, core, String::new(), String::new())
-                        .await
+    /// Reports a program's end; or, torn down, or with the report cut
+    /// short by a teardown, logs why, sends the cap's message if that is
+    /// why, `stop`s a program that has not exited, and closes the channel
+    /// if the server tore it down.
+    async fn finish(&self, end: End, stop: impl Future<Output = ()>) {
+        let stop = match end {
+            End::Exited(exit) => {
+                log::info!("ssh {}: {} ended: {exit:?}", self.label, self.what);
+                tokio::select! {
+                    () = self.report(exit) => return,
+                    () = self.teardown.token.cancelled() => None,
                 }
-            };
-            if sent.is_ok() && self.write.eof().await.is_ok() {
-                let _ = self.write.close().await;
+            }
+            End::TornDown => Some(stop),
+        };
+        let cause = self.ending().await;
+        if let Some(stop) = stop {
+            stop.await;
+        }
+        self.close_after(cause).await;
+    }
+
+    /// The normal end: exit status, EOF and close.
+    async fn report(&self, exit: Exit) {
+        let sent = match exit {
+            Exit::Status(code) => self.handle.exit_status_request(self.id, code).await,
+            Exit::Signal(name, core) => {
+                let sig = Exit::sig(name);
+                self.handle
+                    .exit_signal_request(self.id, sig, core, String::new(), String::new())
+                    .await
             }
         };
-        tokio::select! {
-            () = report => true,
-            () = self.teardown.cancelled() => false,
+        if sent.is_ok() && self.write.eof().await.is_ok() {
+            let _ = self.write.close().await;
         }
     }
 
     /// Logs why the program is being torn down and, if it is for the cap,
     /// sends the cap's message first, while the client still reads the
     /// channel.
-    async fn ending(&self) -> Option<Reason> {
-        let why = self.reason.get().copied();
+    async fn ending(&self) -> Option<Cause> {
+        let cause = self.teardown.cause.get().copied();
         log::info!(
             "ssh {}: ending {} ({})",
             self.label,
             self.what,
-            match why {
-                Some(Reason::Closed) => "the client closed the channel",
-                Some(Reason::Cap) => "too much input",
-                Some(Reason::Violation) => "data after EOF",
-                None => "the connection ended",
+            match cause {
+                Some(Cause::Cap) => "too much input",
+                Some(Cause::Violation) => "data after EOF",
+                None if self.connection.is_cancelled() => "the connection ended",
+                None => "the client closed the channel",
             }
         );
-        let say = async {
-            if why == Some(Reason::Cap) {
+        if cause == Some(Cause::Cap) {
+            self.send(async {
                 let mut stderr = self.write.make_writer_ext(Some(1));
                 let _ = stderr.write_all(CAP_MESSAGE.as_bytes()).await;
-            }
-        };
-        bounded(&self.connection, CAP_MESSAGE_TIMEOUT, say).await;
-        why
+            })
+            .await;
+        }
+        cause
     }
 
-    /// Closes the channel after a teardown the server started; the client's
-    /// own close was answered already.
-    async fn close_after(&self, why: Option<Reason>) {
-        if matches!(why, Some(Reason::Cap | Reason::Violation)) {
-            bounded(&self.connection, CAP_MESSAGE_TIMEOUT, async {
+    /// Closes the channel after a teardown the server started.
+    async fn close_after(&self, cause: Option<Cause>) {
+        if cause.is_some() {
+            self.send(async {
                 let _ = self.write.close().await;
             })
             .await;
+        }
+    }
+
+    /// Runs one send of a teardown for up to [`CAP_MESSAGE_TIMEOUT`], and
+    /// not at all once the client is gone: it closed the channel, which
+    /// russh answered, so it grants the channel no more window.
+    async fn send(&self, send: impl Future<Output = ()>) {
+        let gone = &self.teardown.gone;
+        if !gone.is_cancelled() {
+            bounded(gone, CAP_MESSAGE_TIMEOUT, send).await;
         }
     }
 
@@ -885,7 +907,7 @@ impl Supervisor {
         tokio::select! {
             () = done => true,
             () = feeding => unreachable!("feeding never ends"),
-            () = self.teardown.cancelled() => false,
+            () = self.teardown.token.cancelled() => false,
         }
     }
 
@@ -904,7 +926,7 @@ impl Supervisor {
         tokio::select! {
             () = done => true,
             () = feeding => unreachable!("feeding never ends"),
-            () = self.teardown.cancelled() => false,
+            () = self.teardown.token.cancelled() => false,
         }
     }
 }
