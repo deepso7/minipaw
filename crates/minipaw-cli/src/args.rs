@@ -353,7 +353,7 @@ fn config_with(args: &Args, env: impl Fn(&str) -> Option<OsString>) -> Result<Co
                 let addr: Multiaddr = raw
                     .parse()
                     .map_err(|e| format!("invalid MINIPAW_DIRECT '{raw}': {e}"))?;
-                PeerAddr::new(addr.clone(), ticket.peer().clone())
+                PeerAddr::new(addr.clone(), *ticket.peer())
                     .map_err(|e| format!("invalid MINIPAW_DIRECT '{raw}': {e}"))?;
                 config.direct = Some(addr);
             }

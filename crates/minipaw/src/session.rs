@@ -328,7 +328,7 @@ mod tests {
     fn a_dialer_checks_only_the_relay_it_uses() {
         let relay = config::parse_relay(UNREACHABLE_RELAY).expect("relay address");
         let ticket = Ticket {
-            peer: relay.peer_id().clone(),
+            peer: *relay.peer_id(),
             token: [7; 16],
             relay: Some(relay),
         };

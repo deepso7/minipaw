@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::pipe::{Link, LocalFailure, Pipe, SendError};
 use crate::session::{Outcome, Shared};
 use crate::wire::{Frame, PROTOCOL};
-use minip2p::{ConnectionId, PeerId, StreamId};
+use minip2p::{ConnectionId, PeerId, StreamKey};
 
 const AGENT: &str = concat!("minipaw/", env!("CARGO_PKG_VERSION"));
 
@@ -220,7 +220,9 @@ pub fn log_event(event: &EndpointEvent) {
         } => {
             log::debug!("disconnected from {peer_id} ({conn_id:?}): {reason:?}");
         }
-        EndpointEvent::ConnectionReplaced { peer_id, old, new } => {
+        EndpointEvent::ConnectionReplaced {
+            peer_id, old, new, ..
+        } => {
             log::debug!("connection to {peer_id} replaced ({old:?} -> {new:?})");
         }
         EndpointEvent::ConnectSettled { outcome, .. } => {
@@ -284,20 +286,12 @@ pub fn linger_and_close(mut endpoint: Endpoint, link: Option<Link>) {
             }
             match endpoint.wait(deadline) {
                 Ok(EndpointWaitOutcome::Event(
-                    EndpointEvent::StreamRemoteWriteClosed {
-                        peer_id,
-                        conn_id,
-                        stream_id,
-                    }
-                    | EndpointEvent::StreamClosed {
-                        peer_id,
-                        conn_id,
-                        stream_id,
-                    },
-                )) if link.is(&peer_id, conn_id, stream_id) => break,
+                    EndpointEvent::StreamRemoteWriteClosed { peer_id, stream }
+                    | EndpointEvent::StreamClosed { peer_id, stream },
+                )) if link.is(&peer_id, stream) => break,
                 Ok(EndpointWaitOutcome::Event(EndpointEvent::ConnectionClosed {
                     conn_id, ..
-                })) if conn_id == link.conn => break,
+                })) if conn_id == link.stream.conn_id() => break,
                 Ok(EndpointWaitOutcome::Deadline) | Err(_) => break,
                 // Other events, `Interrupted`, and any outcome added later.
                 Ok(_) => {}
@@ -333,10 +327,10 @@ pub struct Stop {
     message: &'static str,
     pub by: Instant,
     /// Streams the `Error` went out on.
-    told: Vec<(PeerId, ConnectionId, StreamId)>,
+    told: Vec<(PeerId, StreamKey)>,
     /// The stream that took part of the `Error`; the rest goes out before
     /// it is closed.
-    partial: Option<(ConnectionId, StreamId)>,
+    partial: Option<StreamKey>,
     /// The peer half-closed one of them: it read the `Error`.
     confirmed: bool,
     /// The last send hit backpressure; try again then, or once the link's
@@ -408,15 +402,8 @@ impl Stop {
     /// it does once it has read the `Error`. A reset is not confirmation: it
     /// discards what we queued.
     pub fn observe(&mut self, event: &EndpointEvent) {
-        if let EndpointEvent::StreamRemoteWriteClosed {
-            peer_id,
-            conn_id,
-            stream_id,
-        } = event
-            && self
-                .told
-                .iter()
-                .any(|(p, c, s)| p == peer_id && c == conn_id && s == stream_id)
+        if let EndpointEvent::StreamRemoteWriteClosed { peer_id, stream } = event
+            && self.told.iter().any(|(p, s)| p == peer_id && s == stream)
         {
             self.confirmed = true;
         }
@@ -440,7 +427,7 @@ impl Stop {
         let Some(link) = link else {
             return Ok(false);
         };
-        let key = (link.peer.clone(), link.conn, link.stream);
+        let key = (link.peer, link.stream);
         if self.told.contains(&key) {
             return Ok(false);
         }
@@ -450,12 +437,12 @@ impl Stop {
             return Ok(false);
         }
         self.retry_at = None;
-        let sent = if self.partial == Some((link.conn, link.stream)) {
+        let sent = if self.partial == Some(link.stream) {
             link.flush(endpoint)
         } else {
             link.try_send(endpoint, &Frame::Error(self.message.into()))
                 .and_then(|()| {
-                    self.partial = Some((link.conn, link.stream));
+                    self.partial = Some(link.stream);
                     link.flush(endpoint)
                 })
         };
@@ -590,29 +577,16 @@ fn abort(
             }
             match endpoint.wait(by) {
                 Ok(EndpointWaitOutcome::Event(
-                    EndpointEvent::StreamRemoteWriteClosed {
-                        peer_id,
-                        conn_id,
-                        stream_id,
-                    }
-                    | EndpointEvent::StreamClosed {
-                        peer_id,
-                        conn_id,
-                        stream_id,
-                    },
-                )) if told.iter().any(|l| l.is(&peer_id, conn_id, stream_id)) => break,
+                    EndpointEvent::StreamRemoteWriteClosed { peer_id, stream }
+                    | EndpointEvent::StreamClosed { peer_id, stream },
+                )) if told.iter().any(|l| l.is(&peer_id, stream)) => break,
                 Ok(EndpointWaitOutcome::Event(EndpointEvent::StreamReady {
                     peer_id,
-                    conn_id,
-                    stream_id,
+                    stream,
                     initiated_locally: false,
                     ..
                 })) if peer_id == peer => {
-                    tell(
-                        &mut endpoint,
-                        &mut told,
-                        Link::new(peer_id, conn_id, stream_id),
-                    );
+                    tell(&mut endpoint, &mut told, Link::new(peer_id, stream));
                 }
                 Ok(EndpointWaitOutcome::Deadline) | Err(_) => break,
                 // Other events, `Interrupted`, and any outcome added later.

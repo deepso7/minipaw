@@ -201,7 +201,7 @@ fn run(
         Some(identity) => identity.token(),
         None => net::random16().map_err(Error::from_internal)?,
     };
-    let ticket = Ticket::listener(endpoint.peer_id().clone(), token, Some(&relay));
+    let ticket = Ticket::listener(*endpoint.peer_id(), token, Some(&relay));
     shared.set_wake(endpoint.wait_handle());
     let host = ServeHost::new(
         accept,
@@ -210,7 +210,7 @@ fn run(
         shared.clone(),
         events,
     );
-    let relay = relay.peer_id().clone();
+    let relay = *relay.peer_id();
     let max = config.max_sessions;
     let mut server = ServerCore::new(endpoint, ticket, relay, config, shared, host, max);
     let exit = server.run();
@@ -278,7 +278,7 @@ impl Host for ServeHost {
         let accept = self.accept.clone();
         let sender = self.sender.clone();
         let wake = self.wake.clone();
-        let dialer = peer.clone();
+        let dialer = *peer;
         let spawned = thread::Builder::new()
             .name(format!("minipaw-accept-{id}"))
             .spawn(move || {
@@ -333,7 +333,7 @@ impl Host for ServeHost {
 
     fn refused(&mut self, peer: &PeerId, reason: &str) {
         (self.events)(ServeEvent::Refused {
-            peer: peer.clone(),
+            peer: *peer,
             reason: reason.to_owned(),
         });
     }
@@ -354,7 +354,7 @@ impl Host for ServeHost {
         let progress = self.shared.retire(id);
         (self.events)(ServeEvent::Ended {
             session: id,
-            peer: peer.clone(),
+            peer: *peer,
             result,
             progress,
         });

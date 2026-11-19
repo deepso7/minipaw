@@ -1,0 +1,9 @@
+# cargo deny (CI runs `check advisories`).
+
+[advisories]
+ignore = [
+    # russh's agent server signs with confirm-constrained keys without
+    # asking. minipaw never runs an SSH agent server, so it is unaffected;
+    # the fix is in russh 0.65, past the pin (docs/plans/builtin-ssh.md).
+    { id = "RUSTSEC-2026-0495", reason = "minipaw does not use russh's agent server; fixed only past the russh pin" },
+]

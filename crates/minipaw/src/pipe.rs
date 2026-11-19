@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use minip2p::{Bytes, ConnectionId, Endpoint, Error, PeerId, StreamId, WaitHandle};
+use minip2p::{Bytes, Endpoint, PeerId, SendOutcome, StreamKey, WaitHandle};
 
 use crate::window::{Inbound, Outbound};
 use crate::wire::{Frame, FrameReader, MAX_DATA};
@@ -53,8 +53,7 @@ pub enum SendError {
 /// The stream currently carrying the session.
 pub struct Link {
     pub peer: PeerId,
-    pub conn: ConnectionId,
-    pub stream: StreamId,
+    pub stream: StreamKey,
     pub reader: FrameReader,
     /// When the peer last sent anything on this stream.
     heard: Instant,
@@ -72,11 +71,10 @@ pub struct Link {
 }
 
 impl Link {
-    pub fn new(peer: PeerId, conn: ConnectionId, stream: StreamId) -> Self {
+    pub fn new(peer: PeerId, stream: StreamKey) -> Self {
         let now = Instant::now();
         Link {
             peer,
-            conn,
             stream,
             reader: FrameReader::default(),
             heard: now,
@@ -107,8 +105,8 @@ impl Link {
         self.sent.get() + PING_INTERVAL
     }
 
-    pub fn is(&self, peer: &PeerId, conn: ConnectionId, stream: StreamId) -> bool {
-        self.peer == *peer && self.conn == conn && self.stream == stream
+    pub fn is(&self, peer: &PeerId, stream: StreamKey) -> bool {
+        self.peer == *peer && self.stream == stream
     }
 
     /// Whether sends wait for the stream to take writes again.
@@ -145,9 +143,9 @@ impl Link {
         self.flush(endpoint)?;
         let data = Bytes::from(frame.encode());
         let len = data.len();
-        match endpoint.send_stream(self.conn, self.stream, data) {
-            Ok(()) => {}
-            Err(Error::Full { unsent, .. }) => {
+        match endpoint.try_send_stream(self.stream, data) {
+            Ok(SendOutcome::Accepted) => {}
+            Ok(SendOutcome::Full { unsent }) => {
                 let full = self.block();
                 if unsent.len() == len {
                     return Err(full);
@@ -166,9 +164,9 @@ impl Link {
         if data.is_empty() {
             return Ok(());
         }
-        match endpoint.send_stream(self.conn, self.stream, data) {
-            Ok(()) => Ok(()),
-            Err(Error::Full { unsent, .. }) => {
+        match endpoint.try_send_stream(self.stream, data) {
+            Ok(SendOutcome::Accepted) => Ok(()),
+            Ok(SendOutcome::Full { unsent }) => {
                 *self.unsent.borrow_mut() = unsent;
                 Err(self.block())
             }
@@ -187,7 +185,7 @@ impl Link {
                 self.unsent.borrow().len()
             );
         }
-        if let Err(e) = endpoint.close_stream_write(self.conn, self.stream) {
+        if let Err(e) = endpoint.close_stream_write(self.stream) {
             log::debug!("close stream: {e}");
         }
     }
@@ -202,7 +200,7 @@ impl Link {
 
     /// Drops the stream and any events still buffered for it.
     pub fn abandon(self, endpoint: &mut Endpoint) {
-        if let Err(e) = endpoint.abandon_stream(self.conn, self.stream) {
+        if let Err(e) = endpoint.abandon_stream(self.stream) {
             log::debug!("abandon stream {}: {e}", self.stream);
         }
     }

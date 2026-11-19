@@ -185,7 +185,7 @@ impl State {
             phase: Phase::Starting,
             peer: match &launch.target {
                 Target::Listen => None,
-                Target::Dial(ticket) => Some(ticket.peer().clone()),
+                Target::Dial(ticket) => Some(*ticket.peer()),
             },
             path: None,
             upgraded: false,
@@ -213,9 +213,9 @@ impl State {
                 self.warn("still no relay reservation; is the relay reachable over UDP?");
             }
             Event::ReservationLost => self.warn("lost the relay reservation; reacquiring"),
-            Event::Connecting { peer } => self.peer = Some(peer.clone()),
+            Event::Connecting { peer } => self.peer = Some(*peer),
             Event::Accepted { peer, path } | Event::Connected { peer, path } => {
-                self.peer = Some(peer.clone());
+                self.peer = Some(*peer);
                 self.path = Some(*path);
                 self.connected_at.get_or_insert(now);
             }

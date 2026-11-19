@@ -43,7 +43,7 @@ pub fn run(
         Some(identity) => identity.token(),
         None => net::random16().map_err(crate::Error::from_internal)?,
     };
-    let ticket = Ticket::listener(endpoint.peer_id().clone(), token, Some(&relay));
+    let ticket = Ticket::listener(*endpoint.peer_id(), token, Some(&relay));
     shared.set_wake(endpoint.wait_handle());
     let pipe = Pipe::new(&endpoint.wait_handle(), io, shared.stats.clone());
     let listener = Listener {
@@ -51,7 +51,7 @@ pub fn run(
         events,
         result: None,
     };
-    let relay = relay.peer_id().clone();
+    let relay = *relay.peer_id();
     let mut server = ServerCore::new(endpoint, ticket, relay, config, shared.clone(), listener, 1);
     let exit = server.run();
     let mut listener = server.close();

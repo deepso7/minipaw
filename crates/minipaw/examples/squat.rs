@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use minip2p::{ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, StreamId};
+use minip2p::{Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, SendOutcome, StreamKey};
 
 use minipaw::PROTOCOL;
 
@@ -71,7 +71,7 @@ fn main() -> Result<ExitCode> {
         .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")?
         .bind()?;
     endpoint.listen_all()?;
-    let peer = target.peer_id().clone();
+    let peer = *target.peer_id();
     endpoint.connect(target)?;
 
     let end = Instant::now() + Duration::from_secs(seconds);
@@ -151,10 +151,10 @@ fn talk(
     limit: Duration,
 ) -> Result<ExitCode> {
     let mut endpoint = bind()?;
-    let peer = target.peer_id().clone();
+    let peer = *target.peer_id();
     endpoint.connect(target.clone())?;
     let end = Instant::now() + limit;
-    let mut session: Option<(ConnectionId, StreamId)> = None;
+    let mut session: Option<StreamKey> = None;
     let mut reader = FrameReader::default();
     let mut welcomed: Option<Instant> = None;
     let mut leaving = false;
@@ -181,8 +181,7 @@ fn talk(
             }
             Some(EndpointEvent::StreamReady {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream,
                 initiated_locally: true,
                 ..
             }) if peer_id == peer => {
@@ -193,26 +192,25 @@ fn talk(
                         recv: 0,
                         resume: false,
                     };
-                    endpoint.send_stream(conn_id, stream_id, hello.encode())?;
-                    session = Some((conn_id, stream_id));
-                } else if let Some((conn, stream)) = session
+                    endpoint.send_stream(stream, hello.encode())?;
+                    session = Some(stream);
+                } else if let Some(stream) = session
                     && leaving
                     && ended.is_none()
                 {
                     // The second stream is up and says nothing; now end the
                     // session, as a client does on a stop.
                     let bye = Frame::Error("leaving".into()).encode();
-                    endpoint.send_stream(conn, stream, bye)?;
-                    endpoint.close_stream_write(conn, stream)?;
+                    endpoint.send_stream(stream, bye)?;
+                    endpoint.close_stream_write(stream)?;
                     ended = Some(Instant::now());
                 }
             }
             Some(EndpointEvent::StreamData {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream,
                 data,
-            }) if peer_id == peer && session == Some((conn_id, stream_id)) => {
+            }) if peer_id == peer && session == Some(stream) => {
                 reader.push(&data);
                 while let Some(frame) = reader.next()? {
                     match frame {
@@ -251,13 +249,13 @@ fn talk(
             }
             _ => {}
         }
-        let Some((conn, stream)) = session else {
+        let Some(stream) = session else {
             continue;
         };
         match (hold, welcomed) {
             (None, _) => {
                 // A full send buffer is fine: more goes out next time.
-                if endpoint.send_stream(conn, stream, chunk.clone()).is_ok() {
+                if let Ok(SendOutcome::Accepted) = endpoint.try_send_stream(stream, chunk.clone()) {
                     sent += wire::MAX_DATA;
                 }
             }
@@ -268,7 +266,7 @@ fn talk(
             }
             (Some(_), Some(_)) if !leaving && Instant::now() >= ping_at => {
                 // Keeps the session's stream alive meanwhile.
-                let _ = endpoint.send_stream(conn, stream, Frame::Ping.encode());
+                let _ = endpoint.send_stream(stream, Frame::Ping.encode());
                 ping_at = Instant::now() + Duration::from_secs(2);
             }
             _ => {}
