@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome, NatEvent, PeerId, StreamId,
+    ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome, NatEvent, PeerId, StreamKey,
 };
 
 use crate::config::Config;
@@ -44,7 +44,8 @@ const REFUSAL_GRACE: Duration = Duration::from_secs(1);
 /// How long a reservation may take before we say so.
 const RESERVE_WARNING: Duration = Duration::from_secs(15);
 
-type StreamKey = (PeerId, ConnectionId, StreamId);
+/// A stream not yet admitted to a session, and its peer.
+type PendingKey = (PeerId, StreamKey);
 /// A session: its dialer and the id it picked. Ids are random, so the pair
 /// names one dialer's run.
 type SlotKey = (PeerId, SessionId);
@@ -105,7 +106,7 @@ pub struct ServerCore<H> {
     relay: PeerId,
     max_sessions: usize,
     /// Not-yet-admitted streams and when they must have said `Hello`.
-    pending: HashMap<StreamKey, (FrameReader, Instant)>,
+    pending: HashMap<PendingKey, (FrameReader, Instant)>,
     /// Peers seen connecting, and when they are disconnected unless they
     /// have a session by then.
     admission: HashMap<PeerId, Admission>,
@@ -268,9 +269,8 @@ impl<H: Host> ServerCore<H> {
     /// reported ended by then.
     pub fn run(&mut self) -> Result<Exit, Box<dyn Error>> {
         self.started = Instant::now();
-        self.host.server_event(Event::Reserving {
-            relay: self.relay.clone(),
-        });
+        self.host
+            .server_event(Event::Reserving { relay: self.relay });
         loop {
             let outcome = match self.endpoint.wait(self.deadline()) {
                 Ok(outcome) => outcome,
@@ -372,10 +372,10 @@ impl<H: Host> ServerCore<H> {
             }
             EndpointEvent::StreamReady {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream,
                 protocol_id,
                 initiated_locally: false,
+                ..
             } if protocol_id == PROTOCOL => {
                 // The pool is small and expiring. When full, the oldest
                 // stream makes way: an honest dialer says Hello within a
@@ -384,41 +384,30 @@ impl<H: Host> ServerCore<H> {
                     self.evict_oldest_pending();
                 }
                 let deadline = Instant::now() + HELLO_TIMEOUT;
-                self.pending.insert(
-                    (peer_id, conn_id, stream_id),
-                    (FrameReader::default(), deadline),
-                );
+                self.pending
+                    .insert((peer_id, stream), (FrameReader::default(), deadline));
             }
             EndpointEvent::StreamData {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream,
                 data,
-            } => match self.slot_on(&peer_id, conn_id, stream_id) {
+            } => match self.slot_on(&peer_id, stream) {
                 Some(key) => self.on_slot_data(&key, &data),
-                None => self.on_pending_data((peer_id, conn_id, stream_id), &data),
+                None => self.on_pending_data((peer_id, stream), &data),
             },
-            EndpointEvent::StreamWritable {
-                peer_id,
-                conn_id,
-                stream_id,
-            } => {
+            EndpointEvent::StreamWritable { peer_id, stream } => {
                 if let Some(link) = self
                     .sessions
                     .values()
                     .filter_map(Slot::link)
-                    .find(|l| l.is(&peer_id, conn_id, stream_id))
+                    .find(|l| l.is(&peer_id, stream))
                 {
                     link.writable();
                 }
             }
-            EndpointEvent::StreamRemoteWriteClosed {
-                peer_id,
-                conn_id,
-                stream_id,
-            } => {
+            EndpointEvent::StreamRemoteWriteClosed { peer_id, stream } => {
                 // A lingering session's peer has finished too.
-                if let Some(key) = self.slot_on(&peer_id, conn_id, stream_id)
+                if let Some(key) = self.slot_on(&peer_id, stream)
                     && let Some(Slot {
                         state: State::Ending(_, ending),
                         ..
@@ -427,19 +416,12 @@ impl<H: Host> ServerCore<H> {
                     ending.linger = None;
                 }
             }
-            EndpointEvent::StreamClosed {
-                peer_id,
-                conn_id,
-                stream_id,
-            }
+            EndpointEvent::StreamClosed { peer_id, stream }
             | EndpointEvent::StreamWriteStopped {
-                peer_id,
-                conn_id,
-                stream_id,
-                ..
+                peer_id, stream, ..
             } => {
-                self.pending.remove(&(peer_id.clone(), conn_id, stream_id));
-                if let Some(key) = self.slot_on(&peer_id, conn_id, stream_id) {
+                self.pending.remove(&(peer_id, stream));
+                if let Some(key) = self.slot_on(&peer_id, stream) {
                     self.drop_link(&key, false, "stream closed");
                 }
             }
@@ -450,7 +432,9 @@ impl<H: Host> ServerCore<H> {
                 self.admission.remove(&peer_id);
                 self.drop_conn(&peer_id, conn_id, false);
             }
-            EndpointEvent::ConnectionReplaced { peer_id, old, new } => {
+            EndpointEvent::ConnectionReplaced {
+                peer_id, old, new, ..
+            } => {
                 self.drop_conn(&peer_id, old, net::is_upgrade(old, new));
             }
             _ => {}
@@ -458,13 +442,11 @@ impl<H: Host> ServerCore<H> {
     }
 
     /// The session whose current stream is the one named.
-    fn slot_on(&self, peer: &PeerId, conn: ConnectionId, stream: StreamId) -> Option<SlotKey> {
+    fn slot_on(&self, peer: &PeerId, stream: StreamKey) -> Option<SlotKey> {
         self.sessions
             .iter()
-            .find(|((p, _), slot)| {
-                p == peer && slot.link().is_some_and(|l| l.is(peer, conn, stream))
-            })
-            .map(|(key, _)| key.clone())
+            .find(|((p, _), slot)| p == peer && slot.link().is_some_and(|l| l.is(peer, stream)))
+            .map(|(key, _)| *key)
     }
 
     fn on_slot_data(&mut self, key: &SlotKey, data: &[u8]) {
@@ -519,7 +501,7 @@ impl<H: Host> ServerCore<H> {
     /// complete, then admits or refuses it. Nothing about a session changes
     /// until the stream is fully set up, so a refused or failed admission
     /// leaves every session and link as they were.
-    fn on_pending_data(&mut self, key: StreamKey, data: &[u8]) {
+    fn on_pending_data(&mut self, key: PendingKey, data: &[u8]) {
         let Some((reader, _)) = self.pending.get_mut(&key) else {
             return;
         };
@@ -533,8 +515,8 @@ impl<H: Host> ServerCore<H> {
             .remove(&key)
             .map(|(reader, _)| reader)
             .unwrap_or_default();
-        let (peer, conn, stream) = key;
-        let mut link = Link::new(peer, conn, stream);
+        let (peer, stream) = key;
+        let mut link = Link::new(peer, stream);
         link.reader = reader;
         let (token, session, recv, resume) = match hello {
             Ok(Some(Frame::Hello {
@@ -557,7 +539,7 @@ impl<H: Host> ServerCore<H> {
     /// client never got the `Welcome` we sent. Otherwise only a client
     /// starting out gets a new session.
     fn admit(&mut self, link: Link, session: SessionId, recv: u64, resume: bool) {
-        let key = (link.peer.clone(), session);
+        let key = (link.peer, session);
         if let Some(slot) = self.sessions.get_mut(&key) {
             match &mut slot.state {
                 State::Connecting(held) => {
@@ -589,7 +571,7 @@ impl<H: Host> ServerCore<H> {
             Err(reason) => self.refuse(link, &reason),
             Ok(None) => {
                 let state = State::Connecting(Some((link, recv)));
-                self.sessions.insert(key.clone(), Slot { id, state });
+                self.sessions.insert(key, Slot { id, state });
                 self.check_early(&key);
             }
             Ok(Some(pipe)) => self.start(key, id, pipe, link, recv),
@@ -602,7 +584,7 @@ impl<H: Host> ServerCore<H> {
             .sessions
             .iter()
             .find(|(_, slot)| slot.id == id && matches!(slot.state, State::Connecting(_)))
-            .map(|(key, _)| key.clone());
+            .map(|(key, _)| *key);
         let Some(key) = key else {
             if let Ok(pipe) = result {
                 self.host.unused(id, pipe);
@@ -699,7 +681,7 @@ impl<H: Host> ServerCore<H> {
         self.host.session_event(
             id,
             Event::Accepted {
-                peer: key.0.clone(),
+                peer: key.0,
                 path: PathKind::from_direct(direct),
             },
         );
@@ -713,7 +695,7 @@ impl<H: Host> ServerCore<H> {
         };
         let attached = live.pipe.attach(recv);
         self.sessions.insert(
-            key.clone(),
+            key,
             Slot {
                 id,
                 state: State::Running(live),
@@ -834,7 +816,7 @@ impl<H: Host> ServerCore<H> {
     fn readmit(&mut self, peer: &PeerId) {
         if *peer != self.relay && !self.has_session(peer) {
             self.admission
-                .entry(peer.clone())
+                .entry(*peer)
                 .or_insert_with(|| Admission::new(Instant::now(), self.admission_timeout));
         }
     }
@@ -848,27 +830,27 @@ impl<H: Host> ServerCore<H> {
             .pending
             .iter()
             .min_by_key(|(_, (_, deadline))| *deadline)
-            .map(|(key, _)| key.clone());
-        if let Some((peer, conn, stream)) = oldest {
+            .map(|(key, _)| *key);
+        if let Some((peer, stream)) = oldest {
             log::debug!("dropping a stream from {peer}: too many pending");
-            self.pending.remove(&(peer.clone(), conn, stream));
-            Link::new(peer, conn, stream).abandon(&mut self.endpoint);
+            self.pending.remove(&(peer, stream));
+            Link::new(peer, stream).abandon(&mut self.endpoint);
         }
     }
 
     /// Drops pending streams that never presented a `Hello`.
     fn expire_pending(&mut self) {
         let now = Instant::now();
-        let expired: Vec<StreamKey> = self
+        let expired: Vec<PendingKey> = self
             .pending
             .iter()
             .filter(|(_, (_, deadline))| now >= *deadline)
-            .map(|(key, _)| key.clone())
+            .map(|(key, _)| *key)
             .collect();
-        for (peer, conn, stream) in expired {
+        for (peer, stream) in expired {
             log::debug!("dropping a stream from {peer}: no Hello in time");
-            self.pending.remove(&(peer.clone(), conn, stream));
-            Link::new(peer, conn, stream).abandon(&mut self.endpoint);
+            self.pending.remove(&(peer, stream));
+            Link::new(peer, stream).abandon(&mut self.endpoint);
         }
     }
 
@@ -880,7 +862,7 @@ impl<H: Host> ServerCore<H> {
             .admission
             .iter()
             .filter(|(_, admission)| now >= admission.by)
-            .map(|(peer, _)| peer.clone())
+            .map(|(peer, _)| *peer)
             .collect();
         for peer in expired {
             self.admission.remove(&peer);
@@ -888,15 +870,15 @@ impl<H: Host> ServerCore<H> {
                 continue;
             }
             log::debug!("disconnecting {peer}: no session in time");
-            let streams: Vec<StreamKey> = self
+            let streams: Vec<PendingKey> = self
                 .pending
                 .keys()
-                .filter(|(p, _, _)| *p == peer)
+                .filter(|(p, _)| *p == peer)
                 .cloned()
                 .collect();
-            for (peer, conn, stream) in streams {
-                self.pending.remove(&(peer.clone(), conn, stream));
-                Link::new(peer, conn, stream).abandon(&mut self.endpoint);
+            for (peer, stream) in streams {
+                self.pending.remove(&(peer, stream));
+                Link::new(peer, stream).abandon(&mut self.endpoint);
             }
             if let Err(e) = self.endpoint.disconnect(&peer) {
                 log::debug!("disconnect {peer}: {e}");
@@ -908,12 +890,15 @@ impl<H: Host> ServerCore<H> {
     /// a relayed circuit replaced by a direct connection is moving over,
     /// so its loss is not reported.
     fn drop_conn(&mut self, peer: &PeerId, conn: ConnectionId, upgrade: bool) {
-        self.pending.retain(|(p, c, _), _| p != peer || *c != conn);
+        self.pending
+            .retain(|(p, s), _| p != peer || s.conn_id() != conn);
         let keys: Vec<SlotKey> = self
             .sessions
             .iter()
-            .filter(|((p, _), slot)| p == peer && slot.link().is_some_and(|l| l.conn == conn))
-            .map(|(key, _)| key.clone())
+            .filter(|((p, _), slot)| {
+                p == peer && slot.link().is_some_and(|l| l.stream.conn_id() == conn)
+            })
+            .map(|(key, _)| *key)
             .collect();
         let reason = if upgrade {
             "moving to the direct connection"
@@ -1135,7 +1120,7 @@ impl<H: Host> ServerCore<H> {
         // The endpoint stays up for others; the peer goes unless it has
         // more in flight. Streams it opened meanwhile must lead to a
         // session in time.
-        if self.pending.keys().any(|(p, _, _)| p == peer) {
+        if self.pending.keys().any(|(p, _)| p == peer) {
             self.readmit(peer);
         } else if !self.has_session(peer)
             && *peer != self.relay

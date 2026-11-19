@@ -486,7 +486,7 @@ mod tests {
         let peer: PeerId = PEER.parse().expect("peer id");
         let target = Target::Dial(TICKET.parse().expect("ticket"));
         let mut state = State::new(&launch(target, Some(10 << 20)), t0);
-        state.apply_at(&Event::Connecting { peer: peer.clone() }, t0);
+        state.apply_at(&Event::Connecting { peer }, t0);
         let path = PathKind::Relayed;
         state.apply_at(&Event::Connected { peer, path }, t0);
         state.apply_at(&Event::Upgraded, t0);

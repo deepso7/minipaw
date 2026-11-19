@@ -176,7 +176,7 @@ mod tests {
 
         for relay in [None, Some(relay)] {
             let ticket = Ticket {
-                peer: peer.clone(),
+                peer,
                 token: [3; 16],
                 relay,
             };

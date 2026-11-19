@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use minip2p::{
     ConnectId, ConnectOutcome, ConnectionId, Endpoint, EndpointEvent, EndpointWaitOutcome,
-    NatEvent, PeerAddr, PeerId, StreamId,
+    NatEvent, PeerAddr, PeerId, StreamKey,
 };
 
 use crate::config::Config;
@@ -41,8 +41,7 @@ enum Attempt {
         id: ConnectId,
     },
     Opening {
-        conn: ConnectionId,
-        stream: StreamId,
+        stream: StreamKey,
         since: Instant,
     },
     /// Hello sent, waiting for Welcome.
@@ -88,14 +87,13 @@ pub fn run(
     shared: Arc<Shared>,
     events: Events,
 ) -> Result<Outcome, crate::Error> {
-    let direct = match &config.direct {
-        Some(addr) => Some(
-            PeerAddr::new(addr.clone(), ticket.peer.clone()).map_err(|e| {
+    let direct =
+        match &config.direct {
+            Some(addr) => Some(PeerAddr::new(addr.clone(), ticket.peer).map_err(|e| {
                 crate::Error::Config(format!("invalid direct address '{addr}': {e}"))
-            })?,
-        ),
-        None => None,
-    };
+            })?),
+            None => None,
+        };
     let endpoint = net::bind(&relay, false, config).map_err(crate::Error::from_internal)?;
     let session = net::random16().map_err(crate::Error::from_internal)?;
     shared.set_wake(endpoint.wait_handle());
@@ -120,7 +118,7 @@ pub fn run(
 
     let exit = client.drive();
     let link = client.take_link();
-    let server = client.hello_sent.then(|| client.ticket.peer.clone());
+    let server = client.hello_sent.then_some(client.ticket.peer);
     net::finish(client.endpoint, &mut client.pipe, link, server, exit)
 }
 
@@ -303,14 +301,12 @@ impl Client {
         }
         let attempt = match &self.direct {
             Some(addr) => self.endpoint.connect(addr.clone()),
-            None => self.endpoint.connect(self.ticket.peer.clone()),
+            None => self.endpoint.connect(self.ticket.peer),
         };
         match attempt {
             Ok(id) => {
                 log::debug!("connecting to {}", self.peer());
-                self.events.emit(Event::Connecting {
-                    peer: self.peer().clone(),
-                });
+                self.events.emit(Event::Connecting { peer: *self.peer() });
                 self.set_attempt(Attempt::Connecting { id });
             }
             Err(e) => self.retry(&format!("connect: {e}")),
@@ -318,11 +314,10 @@ impl Client {
     }
 
     fn open(&mut self) {
-        let peer = self.peer().clone();
+        let peer = *self.peer();
         match self.endpoint.open_stream(&peer, PROTOCOL) {
-            Ok((conn, stream)) => {
+            Ok(stream) => {
                 self.set_attempt(Attempt::Opening {
-                    conn,
                     stream,
                     since: Instant::now(),
                 });
@@ -354,15 +349,14 @@ impl Client {
             }
             EndpointEvent::StreamReady {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream,
                 initiated_locally: true,
                 ..
-            } if matches!(self.phase, LinkState::Down(_, Attempt::Opening { conn, stream, .. })
-                    if conn == conn_id && stream == stream_id)
+            } if matches!(self.phase, LinkState::Down(_, Attempt::Opening { stream: opening, .. })
+                    if opening == stream)
                 && peer_id == *self.peer() =>
             {
-                let mut link = Link::new(peer_id, conn_id, stream_id);
+                let mut link = Link::new(peer_id, stream);
                 if let Some(after) = self.dead_after {
                     link = link.with_dead_after(after);
                 }
@@ -388,40 +382,28 @@ impl Client {
             }
             EndpointEvent::StreamData {
                 peer_id,
-                conn_id,
-                stream_id,
+                stream,
                 data,
-            } => self.on_data(&peer_id, conn_id, stream_id, &data)?,
-            EndpointEvent::StreamWritable {
-                peer_id,
-                conn_id,
-                stream_id,
-            } => {
+            } => self.on_data(&peer_id, stream, &data)?,
+            EndpointEvent::StreamWritable { peer_id, stream } => {
                 if let Some(link) = self.link()
-                    && link.is(&peer_id, conn_id, stream_id)
+                    && link.is(&peer_id, stream)
                 {
                     link.writable();
                 }
             }
-            EndpointEvent::StreamClosed {
-                peer_id,
-                conn_id,
-                stream_id,
-            }
+            EndpointEvent::StreamClosed { peer_id, stream }
             | EndpointEvent::StreamWriteStopped {
-                peer_id,
-                conn_id,
-                stream_id,
-                ..
-            } if self.carries(&peer_id, conn_id, Some(stream_id)) => self.lose("stream closed"),
+                peer_id, stream, ..
+            } if self.carries_stream(&peer_id, stream) => self.lose("stream closed"),
             EndpointEvent::ConnectionClosed {
                 peer_id, conn_id, ..
-            } if self.carries(&peer_id, conn_id, None) => {
+            } if self.carries_conn(&peer_id, conn_id) => {
                 self.lose("connection closed");
             }
-            EndpointEvent::ConnectionReplaced { peer_id, old, new }
-                if self.carries(&peer_id, old, None) =>
-            {
+            EndpointEvent::ConnectionReplaced {
+                peer_id, old, new, ..
+            } if self.carries_conn(&peer_id, old) => {
                 if net::is_upgrade(old, new) {
                     self.hand_over();
                 } else {
@@ -450,14 +432,13 @@ impl Client {
     fn on_data(
         &mut self,
         peer: &PeerId,
-        conn: ConnectionId,
-        stream: StreamId,
+        stream: StreamKey,
         data: &[u8],
     ) -> Result<(), Box<dyn Error>> {
         let Some(link) = self.link_mut() else {
             return Ok(());
         };
-        if !link.is(peer, conn, stream) {
+        if !link.is(peer, stream) {
             return Ok(());
         }
         link.push(data);
@@ -484,7 +465,7 @@ impl Client {
                         let direct = net::is_direct(&self.endpoint, &self.ticket.peer);
                         self.told_direct = direct;
                         self.events.emit(Event::Connected {
-                            peer: self.ticket.peer.clone(),
+                            peer: self.ticket.peer,
                             path: PathKind::from_direct(direct),
                         });
                     } else if resumed {
@@ -514,31 +495,26 @@ impl Client {
 
     fn phase_conn(&self) -> Option<ConnectionId> {
         match &self.phase {
-            LinkState::Down(_, Attempt::Opening { conn, .. }) => Some(*conn),
+            LinkState::Down(_, Attempt::Opening { stream, .. }) => Some(stream.conn_id()),
             LinkState::Down(_, Attempt::Idle { .. } | Attempt::Connecting { .. }) => None,
-            _ => self.link().map(|link| link.conn),
+            _ => self.link().map(|link| link.stream.conn_id()),
         }
     }
 
-    /// Whether the current stream (or, with no `stream`, its connection)
-    /// is the one named.
-    fn carries(&self, peer: &PeerId, conn: ConnectionId, stream: Option<StreamId>) -> bool {
+    /// Whether the current stream is the one named.
+    fn carries_stream(&self, peer: &PeerId, stream: StreamKey) -> bool {
         if peer != self.peer() {
             return false;
         }
-        match (&self.phase, stream) {
-            (
-                LinkState::Down(
-                    _,
-                    Attempt::Opening {
-                        conn: c, stream: s, ..
-                    },
-                ),
-                Some(stream),
-            ) => *c == conn && *s == stream,
-            (_, Some(stream)) => self.link().is_some_and(|link| link.is(peer, conn, stream)),
-            (_, None) => self.phase_conn() == Some(conn),
+        match &self.phase {
+            LinkState::Down(_, Attempt::Opening { stream: s, .. }) => *s == stream,
+            _ => self.link().is_some_and(|link| link.is(peer, stream)),
         }
+    }
+
+    /// Whether the current stream's connection is the one named.
+    fn carries_conn(&self, peer: &PeerId, conn: ConnectionId) -> bool {
+        peer == self.peer() && self.phase_conn() == Some(conn)
     }
 
     /// Drops the current stream, if any, and schedules a fresh one.
@@ -555,8 +531,8 @@ impl Client {
     fn drop_stream(&mut self, reason: &str, handover: bool) {
         let now = Instant::now();
         match self.phase.lose(now, handover, Attempt::Idle { at: now }) {
-            Lost::Attempt(Attempt::Opening { conn, stream, .. }) => {
-                if let Err(e) = self.endpoint.abandon_stream(conn, stream) {
+            Lost::Attempt(Attempt::Opening { stream, .. }) => {
+                if let Err(e) = self.endpoint.abandon_stream(stream) {
                     log::debug!("abandon stream: {e}");
                 }
             }
