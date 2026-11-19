@@ -11,13 +11,13 @@
     "fix": "ultracite fix"
   },
   "dependencies": {
-    "@minip2p/web": "0.11.6",
-    "blume": "^2.2.6"
+    "@minip2p/web": "0.12.0",
+    "blume": "^2.2.7"
   },
   "devDependencies": {
-    "oxfmt": "^0.77.0",
-    "oxlint": "^1.92.0",
-    "ultracite": "8.1.1"
+    "oxfmt": "^0.79.0",
+    "oxlint": "^1.94.0",
+    "ultracite": "8.3.0"
   },
   "packageManager": "pnpm@12.11.2"
 }
