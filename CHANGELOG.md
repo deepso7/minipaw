@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/deepso7/minipaw/compare/v0.1.3...v0.1.4) - 2026-11-19
+
+### Other
+
+- bump minip2p-rs to 0.12.0 and the Rust lockfile to latest
+
 ## [0.1.3](https://github.com/deepso7/minipaw/compare/v0.1.2...v0.1.3) - 2026-11-08
 
 ### Fixed
